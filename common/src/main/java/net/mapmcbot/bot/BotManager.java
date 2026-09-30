@@ -1,0 +1,304 @@
+package net.mapmcbot.bot;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import net.mapmcbot.chunk.ChunkChannel;
+import net.mapmcbot.chunk.ChunkKey;
+import net.mapmcbot.chunk.ChunkProtocol;
+
+/**
+ * The mineflayer bots, all in one node process (the fleet, fleet.js) running from a folder in the
+ * run directory. The fleet connects back to a local socket; bots are spawned and quit, and their
+ * chunks reported, over it with {@link ChunkProtocol} frames. That socket is the registry's
+ * {@link ChunkChannel}.
+ *
+ * The scripts ship inside the jar and are unpacked there because npm needs a real folder to install
+ * into. The first bot started does the setup (unpack, npm install when mineflayer is missing, start
+ * the fleet), on its own thread so the game never waits on it.
+ */
+public final class BotManager implements ChunkChannel {
+	private static final String[] RESOURCES = {"fleet.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
+
+	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
+
+	private final File directory;
+
+	/** The bots spawned and not yet gone; the start threads and the fleet reader touch it too. */
+	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+	private final Object writeLock = new Object();
+
+	private volatile ChunkChannel.Listener listener;
+	private volatile boolean closing;
+	private volatile Process fleet;
+	private volatile OutputStream out;
+	private volatile Thread reader;
+
+	public BotManager(File directory) {
+		this.directory = directory;
+		Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "mapmcbot-fleet-shutdown"));
+	}
+
+	public Set<String> getBots() {
+		return Collections.unmodifiableSet(bots);
+	}
+
+	/** Starts a bot that joins host:port as `name`, in the background. */
+	public void create(final String name, final String host, final int port) {
+		final Thread thread = new Thread(() -> {
+			try {
+				startFleet();
+			} catch (IOException e) {
+				throw new UncheckedIOException(name + " could not start: no bot fleet", e);
+			} catch (InterruptedException e) {
+				throw new IllegalStateException(name + " could not start: interrupted", e);
+			}
+
+			if (!bots.add(name)) {
+				throw new IllegalStateException("a bot named " + name + " is already running");
+			}
+
+			send(ChunkProtocol.spawn(name, host, port));
+		}, "mapmcbot-start-" + name);
+
+		thread.setDaemon(true);
+		thread.start();
+	}
+
+	/** The bot walks to x,y,z, or next to it when another bot holds that block. */
+	public void formation(final String name, final int x, final int y, final int z) {
+		if (!bots.contains(name)) {
+			throw new IllegalStateException("formation for " + name + ": no such bot");
+		}
+
+		send(ChunkProtocol.formation(name, x, y, z));
+	}
+
+	/** Each bot leaves; its chunks are released when the fleet reports it gone. The fleet stays up. */
+	public void stopAll() {
+		for (String bot : bots) {
+			send(ChunkProtocol.quit(bot));
+		}
+
+		bots.clear();
+	}
+
+	@Override
+	public void setListener(ChunkChannel.Listener listener) {
+		if (this.listener != null) {
+			throw new IllegalStateException("the bot fleet already has a chunk listener");
+		}
+
+		this.listener = listener;
+	}
+
+	@Override
+	public void requestChunk(String bot, ChunkKey key, int claim) {
+		send(ChunkProtocol.requestChunk(bot, key, claim));
+	}
+
+	private void send(byte[] frame) {
+		synchronized (writeLock) {
+			if (out == null) {
+				throw new IllegalStateException("the bot fleet is not running");
+			}
+
+			try {
+				out.write(frame);
+				out.flush();
+			} catch (IOException e) {
+				throw new UncheckedIOException("could not write to the bot fleet", e);
+			}
+		}
+	}
+
+	/** Once per manager; synchronized so bots started together wait on the one setup. */
+	private synchronized void startFleet() throws IOException, InterruptedException {
+		if (fleet != null) {
+			return;
+		}
+
+		extractScripts();
+
+		if (!new File(directory, "node_modules/mineflayer").isDirectory() || !new File(directory, "node_modules/mineflayer-pathfinder").isDirectory()) {
+			System.out.println("[mapmcbot] installing mineflayer in " + directory);
+			final int exit = new ProcessBuilder(WINDOWS ? "npm.cmd" : "npm", "install", "--no-audit", "--no-fund")
+					.directory(directory).inheritIO().start().waitFor();
+
+			if (exit != 0) {
+				throw new IOException("npm install failed (exit " + exit + ")");
+			}
+		}
+
+		final ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+		final Process process = new ProcessBuilder("node", "fleet.js", Integer.toString(server.getLocalPort()))
+				.directory(directory).redirectErrorStream(true).start();
+		pump(process, server);
+
+		final Socket socket;
+
+		// The pump closes the server socket if node dies first, which ends this accept.
+		try {
+			socket = server.accept();
+		} finally {
+			server.close();
+		}
+
+		socket.setTcpNoDelay(true);
+		final InputStream in = new BufferedInputStream(socket.getInputStream());
+		out = new BufferedOutputStream(socket.getOutputStream());
+		fleet = process;
+
+		reader = new Thread(() -> read(in), "mapmcbot-fleet-reader");
+		reader.setDaemon(true);
+		reader.start();
+	}
+
+	/** Fleet output to the game log; the fleet exiting on its own is a failure. */
+	private void pump(final Process process, final ServerSocket server) {
+		final Thread pump = new Thread(() -> {
+			try (BufferedReader lines = new BufferedReader(
+					new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+				String line;
+
+				while ((line = lines.readLine()) != null) {
+					System.out.println("[mapmcbot fleet] " + line);
+				}
+
+				server.close();
+			} catch (IOException e) {
+				throw new UncheckedIOException("lost the bot fleet's output", e);
+			}
+
+			final int exit;
+
+			try {
+				exit = process.waitFor();
+			} catch (InterruptedException e) {
+				throw new IllegalStateException("interrupted waiting for the bot fleet", e);
+			}
+
+			if (!closing) {
+				throw new IllegalStateException("the bot fleet exited on its own (exit " + exit + ")");
+			}
+		}, "mapmcbot-fleet-output");
+
+		pump.setDaemon(true);
+		pump.start();
+	}
+
+	private void read(InputStream in) {
+		IOException failure = null;
+
+		try {
+			byte[] frame;
+
+			while ((frame = ChunkProtocol.readFrame(in)) != null) {
+				if (frame[0] == ChunkProtocol.BOT_GONE) {
+					bots.remove(ChunkProtocol.botGoneName(frame));
+				}
+
+				ChunkProtocol.dispatch(frame, listener());
+			}
+		} catch (IOException e) {
+			failure = e;
+		}
+
+		// Every bot went with the fleet, on purpose or not.
+		bots.clear();
+		listener().onClosed();
+
+		if (closing) {
+			return;
+		}
+
+		if (failure != null) {
+			throw new UncheckedIOException("lost the connection to the bot fleet", failure);
+		}
+
+		throw new IllegalStateException("the bot fleet closed its connection");
+	}
+
+	private ChunkChannel.Listener listener() {
+		final ChunkChannel.Listener current = listener;
+
+		if (current == null) {
+			throw new IllegalStateException("the bot fleet has no chunk listener");
+		}
+
+		return current;
+	}
+
+	/** JVM exit: kill the fleet and wait for the reader to hand every chunk to its snapshot. */
+	private void shutdown() {
+		closing = true;
+		final Process process = fleet;
+
+		if (process == null) {
+			return;
+		}
+
+		process.destroy();
+
+		try {
+			reader.join();
+		} catch (InterruptedException e) {
+			throw new IllegalStateException("interrupted waiting for the bot fleet reader", e);
+		}
+	}
+
+	/** Overwrites only what changed, so a mod update reaches the scripts without touching the rest. */
+	private void extractScripts() throws IOException {
+		if (!directory.isDirectory() && !directory.mkdirs()) {
+			throw new IOException("cannot create " + directory);
+		}
+
+		for (String resource : RESOURCES) {
+			final byte[] bytes;
+
+			try (InputStream in = BotManager.class.getResourceAsStream("/bot/" + resource)) {
+				if (in == null) {
+					throw new IOException("missing /bot/" + resource + " in the jar");
+				}
+
+				bytes = readAll(in);
+			}
+
+			final File target = new File(directory, resource);
+
+			if (!target.isFile() || !Arrays.equals(Files.readAllBytes(target.toPath()), bytes)) {
+				Files.write(target.toPath(), bytes);
+			}
+		}
+	}
+
+	private static byte[] readAll(InputStream in) throws IOException {
+		final ByteArrayOutputStream out = new ByteArrayOutputStream();
+		final byte[] buffer = new byte[8192];
+		int read;
+
+		while ((read = in.read(buffer)) != -1) {
+			out.write(buffer, 0, read);
+		}
+
+		return out.toByteArray();
+	}
+}

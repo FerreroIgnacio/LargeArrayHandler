@@ -1,0 +1,26 @@
+pluginManagement {
+	repositories {
+		maven {
+			name = "Fabric"
+			url = "https://maven.fabricmc.net/"
+		}
+		maven {
+			name = "legacy-fabric"
+			url = "https://maven.legacyfabric.net/"
+		}
+		mavenCentral()
+		gradlePluginPortal()
+	}
+
+	// Declared once here so every version folder applies the same loom without repeating it.
+	plugins {
+		id "net.fabricmc.fabric-loom-remap" version loom_version
+		id "legacy-looming" version loom_version
+	}
+}
+
+rootProject.name = "MapMcBot"
+
+// common: everything that does not touch Minecraft. versions/<mc>: the mod for one Minecraft version.
+include "common"
+include "versions:1.12.2"

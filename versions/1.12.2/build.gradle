@@ -1,0 +1,70 @@
+plugins {
+	id "net.fabricmc.fabric-loom-remap"
+	id "legacy-looming"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = "mapmcbot-${project.minecraft_version}"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings(legacy.yarn(project.minecraft_version, project.yarn_build))
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.legacyfabric.legacy-fabric-api:legacy-fabric-api:${project.fabric_version}"
+
+	implementation project(":common")
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": inputs.properties.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.encoding = "UTF-8"
+	it.options.release = 8
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_1_8
+	targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+// common is not a mod of its own: its classes and the bot script ship inside this jar.
+jar {
+	from project(":common").sourceSets.main.output
+}
+
+// --- debug autostart (runClient only, never in the jar): opens the world, LAN and Bot2..Bot8.
+// To remove: delete src/debug and this block.
+sourceSets {
+	debug {
+		compileClasspath += main.compileClasspath + main.output
+		runtimeClasspath += main.runtimeClasspath + main.output
+	}
+}
+
+loom {
+	mods {
+		mapmcbot {
+			sourceSet sourceSets.main
+		}
+		mapmcbot_debug {
+			sourceSet sourceSets.debug
+		}
+	}
+
+	runs {
+		client {
+			source sourceSets.debug
+		}
+	}
+}
+// --- end debug autostart

@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "mapmcbot",
+  "version": "${version}",
+  "name": "MapMcBot",
+  "description": "Areas and mineflayer bots.",
+  "authors": [
+    "nacho"
+  ],
+  "license": "MIT",
+  "icon": "assets/mapmcbot/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "net.mapmcbot.client.MapMcBotClient"
+    ]
+  },
+  "mixins": [
+    "mapmcbot.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.12.2",
+    "legacy-fabric-keybinding-api-v1": "*",
+    "legacy-fabric-lifecycle-events-v1": "*"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.mapmcbot.mixin",
+  "compatibilityLevel": "JAVA_8",
+  "client": [
+    "InteractionMixin",
+    "WorldRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

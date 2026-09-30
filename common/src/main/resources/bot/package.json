@@ -1,0 +1,11 @@
+{
+  "name": "mapmcbot-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "mineflayer bot driven by the MapMcBot Minecraft mod",
+  "main": "bot.js",
+  "dependencies": {
+    "mineflayer": "^4.20.0",
+    "mineflayer-pathfinder": "^2.4.5"
+  }
+}

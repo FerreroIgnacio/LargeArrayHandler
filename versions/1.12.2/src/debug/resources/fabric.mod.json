@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "mapmcbot_debug",
+  "version": "0.0.0",
+  "name": "MapMcBot debug autostart",
+  "description": "runClient only: opens the first world, opens it to LAN and adds Bot2 to Bot8.",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "net.mapmcbot.debug.AutoStart"
+    ]
+  },
+  "depends": {
+    "mapmcbot": "*"
+  }
+}
