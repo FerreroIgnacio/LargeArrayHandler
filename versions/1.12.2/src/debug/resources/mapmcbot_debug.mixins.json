@@ -4,6 +4,7 @@
   "package": "net.mapmcbot.debug.mixin",
   "compatibilityLevel": "JAVA_8",
   "client": [
+    "BotSkinMixin",
     "ChatHistoryMixin"
   ],
   "injectors": {

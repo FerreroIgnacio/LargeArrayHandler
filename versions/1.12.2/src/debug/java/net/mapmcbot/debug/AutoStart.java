@@ -43,8 +43,15 @@ public class AutoStart implements ClientModInitializer {
 	private int nextBot;
 	private int port;
 
+	/** The skin BotSkinMixin puts on every bot; a missing one would only show as the purple checkerboard. */
+	private static final String BOT_SKIN = "/assets/mapmcbot_debug/textures/entity/bot_skin.png";
+
 	@Override
 	public void onInitializeClient() {
+		if (AutoStart.class.getResource(BOT_SKIN) == null) {
+			throw new IllegalStateException("missing the bots' skin: put a 64x64 skin png at src/debug/resources" + BOT_SKIN);
+		}
+
 		ClientTickEvents.END_CLIENT_TICK.register(this::tick);
 	}
 
