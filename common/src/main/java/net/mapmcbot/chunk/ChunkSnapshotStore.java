@@ -33,9 +33,16 @@ public final class ChunkSnapshotStore {
 
 	private final File root;
 
+	/**
+	 * Outdated snapshots go on a thread of their own: with thousands of files the sweep would hold up
+	 * whoever opens the store (the game's thread). Saving meanwhile is safe: the sweep only deletes
+	 * snapshots of another format version, and only whole .chunk files, never the .tmp being written.
+	 */
 	public ChunkSnapshotStore(File root) {
 		this.root = root;
-		discardOutdated();
+		final Thread sweep = new Thread(this::discardOutdated, "mapmcbot-snapshot-sweep");
+		sweep.setDaemon(true);
+		sweep.start();
 	}
 
 	/** Written to a temporary file and moved over the old one, so a crash never leaves half a snapshot. */

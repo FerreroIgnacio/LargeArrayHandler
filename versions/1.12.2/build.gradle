@@ -42,7 +42,7 @@ jar {
 	from project(":common").sourceSets.main.output
 }
 
-// --- debug autostart (runClient only, never in the jar): opens the world, LAN and Bot2..Bot8.
+// --- debug autostart (runClient only, never in the jar): opens the world, LAN and the bots (PandaBot2..).
 // To remove: delete src/debug and this block.
 sourceSets {
 	debug {

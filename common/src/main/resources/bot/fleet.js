@@ -143,8 +143,12 @@ function onReport (thread, report) {
   }
 }
 
+// The pool: a thread per core at most, each started when a bot needs it rather than all at once,
+// so their start (each loads mineflayer and minecraft-data) never takes every core together.
 const threads = []
-for (let i = 0; i < os.cpus().length; i++) {
+const MAX_THREADS = os.cpus().length
+
+function startThread () {
   const { port1, port2 } = new MessageChannel()
   const signal = new SharedArrayBuffer(4)
   const thread = { bots: 0, chunkPort: port1, signal: new Int32Array(signal) }
@@ -157,6 +161,7 @@ for (let i = 0; i < os.cpus().length; i++) {
   thread.worker.on('exit', code => { throw new Error(`pool thread exited (code ${code})`) })
   port1.on('message', request => onChunkRequest(thread, request))
   threads.push(thread)
+  return thread
 }
 
 let closing = false
@@ -173,8 +178,9 @@ socket.on('data', protocol.frames(frame => {
   switch (message.type) {
     case protocol.TYPES.SPAWN: {
       if (bots.has(message.bot)) throw new Error(`a bot named ${message.bot} is already running`)
-      // The thread running the fewest bots.
-      const thread = threads.reduce((least, t) => t.bots < least.bots ? t : least)
+      // The thread running the fewest bots; a new one while every thread has some and the pool has room.
+      const least = threads.reduce((l, t) => !l || t.bots < l.bots ? t : l, null)
+      const thread = !least || (least.bots > 0 && threads.length < MAX_THREADS) ? startThread() : least
       thread.bots++
       bots.set(message.bot, thread)
       thread.worker.postMessage({ type: 'spawn', name: message.bot, host: message.host, port: message.port })

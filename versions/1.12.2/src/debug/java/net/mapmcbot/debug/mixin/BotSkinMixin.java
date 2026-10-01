@@ -2,6 +2,7 @@ package net.mapmcbot.debug.mixin;
 
 import com.mojang.authlib.GameProfile;
 
+import net.mapmcbot.debug.AutoStart;
 import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.util.Identifier;
 import org.spongepowered.asm.mixin.Mixin;
@@ -11,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * Debug only (src/debug, remove with it): every bot (a player named Bot...) wears
+ * Debug only (src/debug, remove with it): every bot (a player named AutoStart.BOT_PREFIX...) wears
  * textures/entity/bot_skin.png of this source set, in the slim (thin-arm) model. Client side
  * only: the bots join offline, with no skin of their own, and only this client sees it.
  */
@@ -37,6 +38,6 @@ public abstract class BotSkinMixin {
 	}
 
 	private boolean mapmcbot$isBot() {
-		return getProfile().getName().startsWith("Bot");
+		return getProfile().getName().startsWith(AutoStart.BOT_PREFIX);
 	}
 }

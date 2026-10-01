@@ -19,11 +19,14 @@ import net.minecraft.world.GameMode;
 /**
  * Debug only, loaded by runClient alone (its own source set, never in the mod's jar): clicks through
  * Singleplayer and the first world as a player would, opens it to LAN in survival as soon as it is
- * up, then adds Bot2 to Bot32 on the LAN port. Removing it is deleting src/debug and its block in
+ * up, then adds PandaBot2 to PandaBot128 on the LAN port. Removing it is deleting src/debug and its block in
  * build.gradle.
  */
 public class AutoStart implements ClientModInitializer {
-	private static final String[] BOTS = IntStream.rangeClosed(2, 128).mapToObj(i -> "Bot" + i).toArray(String[]::new);
+	/** Every bot's name starts with it; BotSkinMixin tells the bots apart by it. */
+	public static final String BOT_PREFIX = "PandaBot";
+
+	private static final String[] BOTS = IntStream.rangeClosed(2, 128).mapToObj(i -> BOT_PREFIX + i).toArray(String[]::new);
 
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
 	private static final int MAX_PLAYERS = 128;
