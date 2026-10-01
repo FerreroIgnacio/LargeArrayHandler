@@ -13,6 +13,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -21,44 +22,41 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.LocalTime;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import net.mapmcbot.chunk.ChunkChannel;
 import net.mapmcbot.chunk.ChunkKey;
-import net.mapmcbot.chunk.ChunkProtocol;
+import net.mapmcbot.chunk.ChunkListener;
+import net.mapmcbot.fleet.FleetChannel;
+import net.mapmcbot.fleet.FleetProtocol;
 
 /**
  * The mineflayer bots, all in one node process (the fleet, fleet.js) on a pool of threads sharing their chunks, running from a folder in the
  * run directory. The fleet connects back to a local socket; bots are spawned and quit, and their
- * chunks reported, over it with {@link ChunkProtocol} frames. That socket is the registry's
- * {@link ChunkChannel}.
+ * chunks reported, over it with {@link FleetProtocol} frames. That socket is the {@link FleetChannel}:
+ * this class only runs the process and the socket, what the fleet reports goes to the chunk and
+ * bot listeners (ChunkRegistry, BotRegistry). The chunks' blocks go through columns.bin in that
+ * folder instead, made anew with the manager and mapped by the fleet and the chunk registry.
  *
  * The scripts ship inside the jar and are unpacked there because npm needs a real folder to install
  * into. The first bot started does the setup (unpack, npm install when mineflayer is missing, start
  * the fleet), on its own thread so the game never waits on it.
+ *
+ * SINGLETON: one fleet per game; a second manager throws.
  */
-public final class BotManager implements ChunkChannel {
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "pathThread.js", "pathClient.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
+public final class BotManager implements FleetChannel {
+	private static final AtomicBoolean CREATED = new AtomicBoolean();
+
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "pathThread.js", "pathClient.js", "bot.js", "protocol.js", "states.js", "package.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
 	private final File directory;
-
-	/** The bots spawned and not yet gone; the start threads and the fleet reader touch it too. */
-	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-
-	/** The bots in the world (BOT_SPAWNED) and not yet gone. */
-	private final Set<String> spawned = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-
-	/** The path each walking bot is on, from its PATH frames. */
-	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
+	private final File columns;
 
 	private final Object writeLock = new Object();
 
-	private volatile ChunkChannel.Listener listener;
+	private volatile ChunkListener chunkListener;
+	private volatile BotListener botListener;
 	private volatile boolean closing;
 	private volatile Process fleet;
 	private volatile OutputStream out;
@@ -78,85 +76,93 @@ public final class BotManager implements ChunkChannel {
 	private int socketLogPending;
 
 	public BotManager(File directory) {
+		if (!CREATED.compareAndSet(false, true)) {
+			throw new IllegalStateException("BotManager is a singleton: one was already created");
+		}
+
 		this.directory = directory;
+		this.columns = new File(directory, "columns.bin");
+		createColumns();
 		Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "mapmcbot-fleet-shutdown"));
 	}
 
-	public Set<String> getBots() {
-		return Collections.unmodifiableSet(bots);
-	}
-
-	/** connecting, idle or walking. */
-	public String getStatus(String bot) {
-		if (!spawned.contains(bot)) {
-			return "connecting";
+	@Override
+	public void setChunkListener(ChunkListener listener) {
+		if (chunkListener != null) {
+			throw new IllegalStateException("the bot fleet already has a chunk listener");
 		}
 
-		return paths.containsKey(bot) ? "walking" : "idle";
+		chunkListener = listener;
 	}
 
-	/** The paths being walked, by bot: {target x, y, z, node x, y, z, ...}. */
-	public Map<String, int[]> getPaths() {
-		return Collections.unmodifiableMap(paths);
+	@Override
+	public void setBotListener(BotListener listener) {
+		if (botListener != null) {
+			throw new IllegalStateException("the bot fleet already has a bot listener");
+		}
+
+		botListener = listener;
 	}
 
-	/** Starts a bot that joins host:port as `name`, in the background. */
-	public void create(final String name, final String host, final int port) {
+	/** In the background: the first bot starts the fleet, on its own thread so the game never waits on it. */
+	@Override
+	public void spawn(final String bot, final String host, final int port) {
 		final Thread thread = new Thread(() -> {
 			try {
 				startFleet();
 			} catch (IOException e) {
-				throw new UncheckedIOException(name + " could not start: no bot fleet", e);
+				throw new UncheckedIOException(bot + " could not start: no bot fleet", e);
 			} catch (InterruptedException e) {
-				throw new IllegalStateException(name + " could not start: interrupted", e);
+				throw new IllegalStateException(bot + " could not start: interrupted", e);
 			}
 
-			if (!bots.add(name)) {
-				throw new IllegalStateException("a bot named " + name + " is already running");
-			}
-
-			send(ChunkProtocol.spawn(name, host, port));
-		}, "mapmcbot-start-" + name);
+			send(FleetProtocol.spawn(bot, host, port));
+		}, "mapmcbot-start-" + bot);
 
 		thread.setDaemon(true);
 		thread.start();
 	}
 
-	/**
-	 * The bot walks to x,y,z, or next to it when another bot holds that block. `id` is the
-	 * formation's, the same for every bot sent to it and higher than any before.
-	 */
-	public void formation(final String name, final int id, final int x, final int y, final int z) {
-		if (!bots.contains(name)) {
-			throw new IllegalStateException("formation for " + name + ": no such bot");
-		}
-
-		send(ChunkProtocol.formation(name, id, x, y, z));
-	}
-
-	/** Each bot leaves; its chunks are released when the fleet reports it gone. The fleet stays up. */
-	public void stopAll() {
-		for (String bot : bots) {
-			send(ChunkProtocol.quit(bot));
-		}
-
-		bots.clear();
-		spawned.clear();
-		paths.clear();
+	@Override
+	public void quit(String bot) {
+		send(FleetProtocol.quit(bot));
 	}
 
 	@Override
-	public void setListener(ChunkChannel.Listener listener) {
-		if (this.listener != null) {
-			throw new IllegalStateException("the bot fleet already has a chunk listener");
-		}
-
-		this.listener = listener;
+	public void formation(String bot, int id, int x, int y, int z) {
+		send(FleetProtocol.formation(bot, id, x, y, z));
 	}
 
 	@Override
-	public void requestChunk(String bot, ChunkKey key, int claim) {
-		send(ChunkProtocol.requestChunk(bot, key, claim));
+	public File columns() {
+		return columns;
+	}
+
+	@Override
+	public void release(String bot, int slot) {
+		send(FleetProtocol.release(bot, slot));
+	}
+
+	@Override
+	public void loaded(ChunkKey key, int slot, String mcVersion) {
+		send(FleetProtocol.loaded(key, slot, mcVersion));
+	}
+
+	/** Every slot zeros, the last game's columns gone. */
+	private void createColumns() {
+		if (!directory.isDirectory() && !directory.mkdirs()) {
+			throw new IllegalStateException("cannot create " + directory);
+		}
+
+		try {
+			Files.deleteIfExists(columns.toPath());
+
+			try (RandomAccessFile file = new RandomAccessFile(columns, "rw")) {
+				file.setLength((long) FleetProtocol.COLUMN_SLOTS * FleetProtocol.COLUMN_SLOT_SIZE);
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException("could not create " + columns, e);
+		}
 	}
 
 	private void send(byte[] frame) {
@@ -183,7 +189,8 @@ public final class BotManager implements ChunkChannel {
 
 		extractScripts();
 
-		if (!new File(directory, "node_modules/mineflayer").isDirectory() || !new File(directory, "node_modules/mineflayer-pathfinder").isDirectory()) {
+		if (!new File(directory, "node_modules/mineflayer").isDirectory() || !new File(directory, "node_modules/mineflayer-pathfinder").isDirectory()
+				|| !new File(directory, "node_modules/mmap-io").isDirectory()) {
 			System.out.println("[mapmcbot] installing mineflayer in " + directory);
 			final int exit = new ProcessBuilder(WINDOWS ? "npm.cmd" : "npm", "install", "--no-audit", "--no-fund")
 					.directory(directory).inheritIO().start().waitFor();
@@ -195,7 +202,7 @@ public final class BotManager implements ChunkChannel {
 
 		socketLog = new PrintWriter(new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory, "socket.log"), false), StandardCharsets.UTF_8), 1 << 16));
 		final ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
-		final Process process = new ProcessBuilder("node", "fleet.js", Integer.toString(server.getLocalPort()))
+		final Process process = new ProcessBuilder("node", "fleet.js", Integer.toString(server.getLocalPort()), columns.getAbsolutePath())
 				.directory(directory).redirectErrorStream(true).start();
 		pump(process, server);
 
@@ -223,7 +230,7 @@ public final class BotManager implements ChunkChannel {
 	 * (the game log can drown in a map's own output); the fleet exiting on its own is a failure.
 	 * Written out line by line: the fleet says little, and its last words matter most.
 	 */
-	private void pump(final Process process, final ServerSocket server) {
+		private void pump(final Process process, final ServerSocket server) {
 		final Thread pump = new Thread(() -> {
 			try (BufferedReader lines = new BufferedReader(
 					new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
@@ -266,37 +273,9 @@ public final class BotManager implements ChunkChannel {
 		try {
 			byte[] frame;
 
-			while ((frame = ChunkProtocol.readFrame(in)) != null) {
+			while ((frame = FleetProtocol.readFrame(in)) != null) {
 				logFrame("<-", frame, 0);
-
-				// The path being walked is for the renderer only; the registry never sees it.
-				if (frame[0] == ChunkProtocol.PATH) {
-					final String bot = ChunkProtocol.botGoneName(frame);
-					final int[] path = ChunkProtocol.pathOf(frame);
-
-					if (path == null) {
-						paths.remove(bot);
-					} else {
-						paths.put(bot, path);
-					}
-
-					continue;
-				}
-
-				// Status only; the registry never sees it either.
-				if (frame[0] == ChunkProtocol.BOT_SPAWNED) {
-					spawned.add(ChunkProtocol.botGoneName(frame));
-					continue;
-				}
-
-				if (frame[0] == ChunkProtocol.BOT_GONE) {
-					final String gone = ChunkProtocol.botGoneName(frame);
-					bots.remove(gone);
-					spawned.remove(gone);
-					paths.remove(gone);
-				}
-
-				ChunkProtocol.dispatch(frame, listener());
+				FleetProtocol.dispatch(frame, chunkListener(), botListener());
 			}
 		} catch (IOException e) {
 			failure = e;
@@ -305,10 +284,8 @@ public final class BotManager implements ChunkChannel {
 		flushSocketLog();
 
 		// Every bot went with the fleet, on purpose or not.
-		bots.clear();
-		spawned.clear();
-		paths.clear();
-		listener().onClosed();
+		botListener().onClosed();
+		chunkListener().onClosed();
 
 		if (closing) {
 			return;
@@ -347,11 +324,21 @@ public final class BotManager implements ChunkChannel {
 		}
 	}
 
-	private ChunkChannel.Listener listener() {
-		final ChunkChannel.Listener current = listener;
+	private ChunkListener chunkListener() {
+		final ChunkListener current = chunkListener;
 
 		if (current == null) {
 			throw new IllegalStateException("the bot fleet has no chunk listener");
+		}
+
+		return current;
+	}
+
+	private BotListener botListener() {
+		final BotListener current = botListener;
+
+		if (current == null) {
+			throw new IllegalStateException("the bot fleet has no bot listener");
 		}
 
 		return current;

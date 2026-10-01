@@ -7,7 +7,7 @@ import java.util.Map;
 import com.mojang.blaze3d.platform.GlStateManager;
 import net.mapmcbot.area.Area;
 import net.mapmcbot.area.AreaStore;
-import net.mapmcbot.bot.BotManager;
+import net.mapmcbot.bot.BotRegistry;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.Tessellator;
@@ -44,8 +44,8 @@ public final class AreaRenderer {
 
 		final AreaStore store = MapMcBotClient.areas();
 		final BlockPos target = AreaPick.isActive() ? AreaPick.target(client) : null;
-		final BotManager botManager = MapMcBotClient.botsOrNull();
-		final Map<String, int[]> paths = botManager == null ? Collections.<String, int[]>emptyMap() : botManager.getPaths();
+		final BotRegistry bots = MapMcBotClient.botsOrNull();
+		final Map<String, int[]> paths = bots == null ? Collections.<String, int[]>emptyMap() : bots.getPaths();
 
 		if ((store == null || store.getAreas().isEmpty()) && target == null && paths.isEmpty()) {
 			return;

@@ -2,13 +2,18 @@
 // fleet to write to the mod, and the fleet's orders for them come back here. Their chunk columns
 // are shared with every other thread (see sharedChunks.js); their paths are searched on the
 // fleet's path threads (see pathThread.js, pathClient.js).
+//
+// Everything for the fleet (frames, reports, the columns taken and let go) goes over one port, the
+// chunk port, so the fleet gets it all in the order it happened here.
 const { parentPort, workerData } = require('worker_threads')
 const startBot = require('./bot')
-const { sharedChunks } = require('./sharedChunks')
+const { sharedChunks, openColumns } = require('./sharedChunks')
 const { pathClient } = require('./pathClient')
 
-const chunks = sharedChunks(workerData.chunkPort, new Int32Array(workerData.signal))
-const paths = pathClient(workerData.pathPorts)
+openColumns(workerData.columnsFile)
+const port = workerData.chunkPort
+const chunks = sharedChunks(port, new Int32Array(workerData.signal), post)
+const paths = pathClient(workerData.pathPorts, new Int32Array(workerData.pathPending))
 const bots = new Map()
 
 // The frames of one turn of the event loop, every bot's in the order sent, go to the fleet as one
@@ -34,14 +39,16 @@ function flush () {
   }
   frames = []
   size = 0
-  parentPort.postMessage({ frames: buffer }, [buffer])
+  port.postMessage({ frames: buffer }, [buffer])
 }
 
 // Anything else for the fleet goes after the frames sent before it.
-function report (message) {
+function post (message) {
   flush()
-  parentPort.postMessage(message)
+  port.postMessage(message)
 }
+
+const report = post
 
 parentPort.on('message', message => {
   if (message.type === 'spawn') {
@@ -69,9 +76,6 @@ parentPort.on('message', message => {
   switch (message.type) {
     case 'quit':
       bot.quit()
-      break
-    case 'sendChunk':
-      bot.sendChunk(message.key, message.claim)
       break
     case 'candidates':
       report({ bot: message.bot, formation: message.formation, candidates: bot.formationCandidates(message.target, message.needed) })

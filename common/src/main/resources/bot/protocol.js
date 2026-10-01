@@ -1,18 +1,22 @@
-// The binary frames between the fleet and the mod, mirrored by net.mapmcbot.chunk.ChunkProtocol:
+// The binary frames between the fleet and the mod, mirrored by net.mapmcbot.fleet.FleetProtocol:
 // u32 length, u8 type, payload; big-endian; strings are a u16 byte length and UTF-8. Chunk messages
-// start with the header: bot, server (host:port), dimension, chunk x, chunk z.
+// start with the header: bot, server (host:port), dimension, chunk x, chunk z. The columns' blocks
+// never go through here: the mod reads them off their slot of columns.bin (see sharedChunks.js).
 const TYPES = {
   // fleet -> mod
   CLAIM: 1,
-  CHUNK_DATA: 2,
-  BLOCK_UPDATE: 3,
+  READY: 2,
+  CHANGED: 3,
   BLOCK_ENTITY_UPDATE: 4,
   UNLOAD: 5,
   BOT_GONE: 6,
   PATH: 7,
   BOT_SPAWNED: 8,
+  STATE_NAMES: 9,
+  LOAD: 10,
   // mod -> fleet
-  REQUEST_CHUNK: 16,
+  RELEASE: 16,
+  LOADED: 20,
   SPAWN: 17,
   QUIT: 18,
   FORMATION: 19
@@ -20,7 +24,9 @@ const TYPES = {
 
 class Writer {
   constructor (type) {
-    this.parts = []
+    // The length goes first, filled in by frame(): the frame is put together in one copy.
+    this.length = Buffer.allocUnsafe(4)
+    this.parts = [this.length]
     this.u8(type)
   }
 
@@ -67,10 +73,9 @@ class Writer {
   }
 
   frame () {
-    const body = Buffer.concat(this.parts)
-    const length = Buffer.allocUnsafe(4)
-    length.writeUInt32BE(body.length)
-    return Buffer.concat([length, body])
+    const frame = Buffer.concat(this.parts)
+    frame.writeUInt32BE(frame.length - 4, 0)
+    return frame
   }
 }
 
@@ -113,56 +118,47 @@ class Reader {
   }
 }
 
-function claim (bot, key, id) {
+// id: this load's claim id; slot: its slot in columns.bin, the mod's until it releases it.
+function claim (bot, key, id, slot, mcVersion) {
   const w = new Writer(TYPES.CLAIM)
+  w.header(bot, key)
+  w.i32(id)
+  w.i32(slot)
+  w.str(mcVersion)
+  return w.frame()
+}
+
+// The column claimed as `id` is loaded into its slot.
+function ready (bot, key, id) {
+  const w = new Writer(TYPES.READY)
   w.header(bot, key)
   w.i32(id)
   return w.frame()
 }
 
-// data: { minY, height, sections: [{ palette: [string], indices: Uint16Array(4096) }],
-//         blockEntities: [{ x, y, z (local), type, nbt: Buffer }] }
-function chunkData (bot, key, mcVersion, data) {
-  const w = new Writer(TYPES.CHUNK_DATA)
+// The readied column's blocks or block entities changed: the mod snapshots it again.
+function changed (bot, key) {
+  const w = new Writer(TYPES.CHANGED)
   w.header(bot, key)
-  w.str(mcVersion)
-  w.i32(data.minY)
-  w.i32(data.height)
-  for (const section of data.sections) {
-    const size = section.palette.length
-    if (size < 1 || size > 0xffff) throw new Error(`section palette of ${size} states`)
-    w.u16(size)
-    for (const state of section.palette) w.str(state)
-    if (size === 1) continue
-    const wide = size > 256
-    const indices = Buffer.allocUnsafe(section.indices.length * (wide ? 2 : 1))
-    for (let i = 0; i < section.indices.length; i++) {
-      if (wide) indices.writeUInt16BE(section.indices[i], i * 2)
-      else indices[i] = section.indices[i]
-    }
-    w.raw(indices)
-  }
-  w.i32(data.blockEntities.length)
-  for (const entity of data.blockEntities) {
-    w.u8(entity.x)
-    w.i32(entity.y)
-    w.u8(entity.z)
-    w.str(entity.type)
-    w.bytes(entity.nbt)
-  }
   return w.frame()
 }
 
-// changes: [{ x, y, z (world), state }]
-function blockUpdate (bot, key, changes) {
-  const w = new Writer(TYPES.BLOCK_UPDATE)
-  w.header(bot, key)
-  w.i32(changes.length)
-  for (const change of changes) {
-    w.i32(change.x)
-    w.i32(change.y)
-    w.i32(change.z)
-    w.str(change.state)
+// Asks the mod to read the column's snapshot into the slot; answered with LOADED. No bot: an empty name.
+function load (key, slot) {
+  const w = new Writer(TYPES.LOAD)
+  w.header('', key)
+  w.i32(slot)
+  return w.frame()
+}
+
+// names: [[state id, name]], every state id a slot may hold. No bot: an empty name.
+function stateNames (names) {
+  const w = new Writer(TYPES.STATE_NAMES)
+  w.str('')
+  w.i32(names.length)
+  for (const [id, name] of names) {
+    w.u16(id)
+    w.str(name)
   }
   return w.frame()
 }
@@ -210,11 +206,14 @@ function path (bot, target, nodes) {
     w.i32(target.y)
     w.i32(target.z)
     w.i32(nodes.length)
-    for (const n of nodes) {
-      w.i32(Math.floor(n.x))
-      w.i32(Math.floor(n.y))
-      w.i32(Math.floor(n.z))
-    }
+    // One buffer for every node: a path is sent on each of its updates.
+    const coords = Buffer.allocUnsafe(nodes.length * 12)
+    nodes.forEach((n, i) => {
+      coords.writeInt32BE(Math.floor(n.x), i * 12)
+      coords.writeInt32BE(Math.floor(n.y), i * 12 + 4)
+      coords.writeInt32BE(Math.floor(n.z), i * 12 + 8)
+    })
+    w.raw(coords)
   }
   return w.frame()
 }
@@ -225,8 +224,13 @@ function decode (frame) {
   const type = r.u8()
   let message
   switch (type) {
-    case TYPES.REQUEST_CHUNK:
-      message = { type, bot: r.str(), key: r.key(), claim: r.i32() }
+    case TYPES.RELEASE:
+      message = { type, bot: r.str(), slot: r.i32() }
+      break
+    case TYPES.LOADED:
+      // version: the snapshot's Minecraft version, null when the mod has none.
+      message = { type, bot: r.str(), key: r.key(), slot: r.i32() }
+      message.version = r.u8() ? r.str() : null
       break
     case TYPES.SPAWN:
       message = { type, bot: r.str(), host: r.str(), port: r.i32() }
@@ -259,4 +263,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, chunkData, blockUpdate, blockEntityUpdate, unload, botGone, botSpawned, path, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load,stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, decode, frames }

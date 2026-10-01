@@ -1,13 +1,13 @@
-// One mineflayer bot inside the fleet, and its chunks reported to the mod's registry: a claim per
-// column loaded, the column serialized when the registry asks for it, then its block and block
-// entity changes, and the unload.
+// One mineflayer bot inside the fleet, and the block entities it sees reported to the mod's
+// registry. The columns themselves are claimed, readied and unloaded once for the whole fleet, as
+// they come and go from its shared index, their blocks read by the mod straight off their slot
+// (see sharedChunks.js, fleet.js).
 const mineflayer = require('mineflayer')
 const nbt = require('prismarine-nbt')
 const { Vec3 } = require('vec3')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
-const serialize = require('./serializer')
 
 // A spot no bot of the fleet has loaded is walked to in hops of this many blocks toward it, each
 // inside what the bot sees (the server sends at least two chunks around it), trying the spot
@@ -25,47 +25,70 @@ const LOG_SEARCH_NODES = 1000
 module.exports = function startBot ({ name, host, port, chunks, paths, send, report, onEnd }) {
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
-  chunks.attach(bot, name, server)
   const log = line => console.log(`[${name}] ${line}`)
-
-  // "cx,cz" -> { key, claim }: the columns claimed and not unloaded, with the dimension they were claimed in.
-  const columns = new Map()
-  let nextClaim = 1
-
-  const out = send
-
-  // Block updates of one event loop turn, per column, sent as one message (a multi block change is
-  // many updates in one packet). Flushed before anything else goes out, to keep the order.
-  const batches = new Map()
-  let flushQueued = false
-  function flush () {
-    for (const { key, changes } of batches.values()) out(protocol.blockUpdate(name, key, changes))
-    batches.clear()
-  }
-
-  let tools
-  const blockStates = () => (tools ??= states(bot.registry))
 
   function dimension () {
     const d = bot.game.dimension
     return d.includes(':') ? d : `minecraft:${d}`
   }
 
-  // Where the bot is: "server|dimension".
+  // Where the bot is: "server|dimension", as the shared columns, the paths and the formations are keyed.
   const world = () => `${server}|${dimension()}`
 
+  // "cx,cz" -> the registry's key of the column: the columns loaded, with the dimension they were loaded in.
+  const columns = new Map()
+
+  const out = send
+
+  let tools
+  const blockStates = () => (tools ??= states(bot.registry))
+
   function held (x, z) {
-    const column = columns.get(`${x >> 4},${z >> 4}`)
-    if (!column) throw new Error(`${name}: change at ${x},${z} in a column it never claimed`)
-    return column
+    const key = columns.get(`${x >> 4},${z >> 4}`)
+    if (!key) throw new Error(`${name}: change at ${x},${z} in a column it never loaded`)
+    return key
   }
+
+  // Columns changed in this microtask ("server|dimension|cx,cz"): the fleet has the mod snapshot
+  // each again (see fleet.js), once whatever the number of changes in them.
+  const changed = new Set()
+  function reportChanged () {
+    for (const column of changed) report({ changed: column })
+    changed.clear()
+  }
+  function markChanged (x, z) {
+    const key = held(x, z)
+    if (changed.size === 0) queueMicrotask(reportChanged)
+    changed.add(`${key.server}|${key.dimension}|${key.x},${key.z}`)
+  }
+  // Before the column is released (sharedChunks.js, which listens first): the fleet hears of a
+  // change only while some bot holds the column.
+  bot.prependListener('chunkColumnUnload', reportChanged)
+  bot.prependListener('end', reportChanged)
+
+  // The block entity at location (world), tag its NBT or null once removed, to the registry.
+  function reportBlockEntity (location, tag) {
+    const key = held(location.x, location.z)
+    if (!tag) {
+      out(protocol.blockEntityUpdate(name, key, location, null))
+      return
+    }
+    const { stateName, stateIdOf } = blockStates()
+    out(protocol.blockEntityUpdate(name, key, location, {
+      type: states.blockName(stateName(stateIdOf(bot.blockAt(new Vec3(location.x, location.y, location.z))))),
+      nbt: nbt.writeUncompressed({ ...tag, name: tag.name ?? '' })
+    }))
+  }
+
+  // Those of the map_chunk packets this bot loaded into the shared column.
+  chunks.attach(bot, name, world, tag => reportBlockEntity({ x: tag.value.x.value, y: tag.value.y.value, z: tag.value.z.value }, tag))
 
   bot.loadPlugin(pathfinder)
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
     // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns
     // are. The fleet starts a formation's other bots once its first one has its path (see fleet.js).
-    bot.pathfinder.getPathTo = paths.planner(bot, () => `${server}|${bot.game.dimension}`, goal => report({ planned: goal }))
+    bot.pathfinder.getPathTo = paths.planner(bot, world, goal => report({ planned: goal }))
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -109,61 +132,29 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('error', err => log('error: ' + err.message))
 
   bot.on('chunkColumnLoad', point => {
-    flush()
-    const id = `${point.x >> 4},${point.z >> 4}`
-    // The server sent the column again: drop the old claim and start over.
-    if (columns.has(id)) out(protocol.unload(name, columns.get(id).key))
-    const column = { key: { server, dimension: dimension(), x: point.x >> 4, z: point.z >> 4 }, claim: nextClaim++ }
-    columns.set(id, column)
-    out(protocol.claim(name, column.key, column.claim))
+    columns.set(`${point.x >> 4},${point.z >> 4}`, { server, dimension: dimension(), x: point.x >> 4, z: point.z >> 4 })
   })
 
   bot.on('chunkColumnUnload', point => {
-    flush()
     const id = `${point.x >> 4},${point.z >> 4}`
-    const column = columns.get(id)
-    if (!column) throw new Error(`${name}: unloaded column ${id} it never claimed`)
-    columns.delete(id)
-    out(protocol.unload(name, column.key))
-  })
-
-  bot.on('blockUpdate', (oldBlock, newBlock) => {
-    const p = newBlock.position
-    const column = held(p.x, p.z)
-    const { stateName, stateIdOf } = blockStates()
-    // The column is shared: the first bot of the fleet to get the change already wrote it there,
-    // and reported it. The rest see no change, and the registry hears it once instead of once per bot.
-    if (stateIdOf(oldBlock) === stateIdOf(newBlock)) return
-    const id = `${column.key.x},${column.key.z}`
-    let batch = batches.get(id)
-    if (!batch) batches.set(id, (batch = { key: column.key, changes: [] }))
-    batch.changes.push({ x: p.x, y: p.y, z: p.z, state: stateName(stateIdOf(newBlock)) })
-    if (!flushQueued) {
-      flushQueued = true
-      queueMicrotask(() => {
-        flushQueued = false
-        flush()
-      })
-    }
+    if (!columns.delete(id)) throw new Error(`${name}: unloaded column ${id} it never loaded`)
   })
 
   bot._client.on('tile_entity_data', packet => {
     if (!packet.location) throw new Error(`${name}: tile_entity_data without a location`)
-    const { x, y, z } = packet.location
+    const { x, z } = packet.location
     // mineflayer drops it too: no column there, nothing holds it.
     if (!bot.world.getColumn(x >> 4, z >> 4)) return
-    flush()
-    const column = held(x, z)
-    const tag = packet.nbtData
-    if (!tag) {
-      out(protocol.blockEntityUpdate(name, column.key, packet.location, null))
-      return
-    }
-    const { stateName, stateIdOf } = blockStates()
-    out(protocol.blockEntityUpdate(name, column.key, packet.location, {
-      type: states.blockName(stateName(stateIdOf(bot.blockAt(new Vec3(x, y, z))))),
-      nbt: nbt.writeUncompressed({ ...tag, name: tag.name ?? '' })
-    }))
+    reportBlockEntity(packet.location, packet.nbtData)
+    markChanged(x, z)
+  })
+
+  bot.on('blockUpdate', (oldBlock, newBlock) => {
+    // The column is shared: the first bot of the fleet to get the change already wrote it there.
+    // The rest see no change, and the column is snapshotted once instead of once per bot.
+    const { stateIdOf } = blockStates()
+    if (stateIdOf(oldBlock) === stateIdOf(newBlock)) return
+    markChanged(newBlock.position.x, newBlock.position.z)
   })
 
   bot.on('end', reason => {
@@ -171,7 +162,6 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     // shared columns, this bot no longer holds.
     bot.stopDigging()
     log('disconnected: ' + reason)
-    flush()
     columns.clear()
     out(protocol.botGone(name))
     onEnd()
@@ -234,17 +224,6 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     goto (spot) {
       formationSpot = spot
       walk()
-    },
-
-    // The registry wants the blocks of the column claimed as `claim`; a claim since unloaded is
-    // already reported, and the registry asks the next holder instead.
-    sendChunk (key, claim) {
-      const column = columns.get(`${key.x},${key.z}`)
-      if (!column || column.claim !== claim) return
-      flush()
-      const raw = bot.world.getColumn(key.x, key.z)
-      if (!raw) throw new Error(`${name}: claimed column ${key.x},${key.z} is not loaded`)
-      out(protocol.chunkData(name, column.key, bot.version, serialize(raw, blockStates().stateName)))
     }
   }
 }

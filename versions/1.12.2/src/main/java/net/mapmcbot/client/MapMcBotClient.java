@@ -9,6 +9,7 @@ import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.mapmcbot.area.AreaStore;
 import net.mapmcbot.bot.BotManager;
+import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
 import net.minecraft.client.MinecraftClient;
@@ -38,7 +39,7 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	private static AreaStore areas;
 	private static String areasWorldId;
-	private static BotManager bots;
+	private static BotRegistry bots;
 	private static ChunkRegistry chunks;
 
 	@Override
@@ -170,18 +171,19 @@ public class MapMcBotClient implements ClientModInitializer {
 		return areas;
 	}
 
-	public static BotManager bots() {
+	public static BotRegistry bots() {
 		if (bots == null) {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
-			bots = new BotManager(new File(directory, "bot"));
-			chunks = new ChunkRegistry(bots, new ChunkSnapshotStore(new File(directory, "chunks")));
+			final BotManager fleet = new BotManager(new File(directory, "bot"));
+			bots = new BotRegistry(fleet);
+			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
 		}
 
 		return bots;
 	}
 
 	/** The bots, or null while none was ever started. */
-	public static BotManager botsOrNull() {
+	public static BotRegistry botsOrNull() {
 		return bots;
 	}
 

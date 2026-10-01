@@ -1,13 +1,18 @@
 // Every mineflayer bot in one process, spread over a pool of worker threads (poolThread.js) that
 // share their chunk columns (sharedChunks.js), driven by the mod over one local socket (see protocol.js).
 // Their paths are searched on path threads of their own (pathThread.js), which see every column.
-// Usage: node fleet.js <mod port>
+// The columns' blocks are not sent: they live in columns.bin, mapped by the threads and the mod.
+// Usage: node fleet.js <mod port> <columns.bin>
 const net = require('net')
 const os = require('os')
 const path = require('path')
 const { Worker, MessageChannel } = require('worker_threads')
 const protocol = require('./protocol')
-const { SIZE } = require('./sharedChunks')
+const states = require('./states')
+const { HEADER, SLOTS, loadedHeader } = require('./sharedChunks')
+
+const columnsFile = process.argv[3]
+if (!columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin>')
 
 // Bot name -> the thread running it.
 const bots = new Map()
@@ -91,8 +96,16 @@ function formationOrder (name, order) {
 const PATH_THREADS = 3
 const pathThreads = []
 for (let i = 0; i < PATH_THREADS; i++) {
-  const worker = new Worker(path.join(__dirname, 'pathThread.js'), { workerData: { index: i } })
+  const worker = new Worker(path.join(__dirname, 'pathThread.js'), { workerData: { index: i, columnsFile } })
   worker.on('message', message => {
+    if (message.dropped !== undefined) {
+      settleSlot(message.dropped, worker)
+      return
+    }
+    if (message.wanted !== undefined) {
+      wantSnapshots(worker, message.wanted.ticket, message.wanted.world, message.wanted.ids)
+      return
+    }
     if (!message.path) throw new Error('unknown message from a path thread')
     for (const other of pathThreads) {
       if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, nodes: message.path.nodes })
@@ -102,30 +115,252 @@ for (let i = 0; i < PATH_THREADS; i++) {
   worker.on('exit', code => { throw new Error(`path thread exited (code ${code})`) })
   pathThreads.push(worker)
 }
+// Requests sent to each path thread and not answered yet, counted by every pool thread (see pathClient.js).
+const pathPending = new SharedArrayBuffer(4 * PATH_THREADS)
 
-// The shared columns: "server|dimension|cx,cz" -> { buffer, threads holding it }. Gone once no thread does.
+// The columns in a slot of columns.bin: "server|dimension|cx,cz" -> { header, slot, threads holding
+// it, chunk, claim, version, modHolds, ready }. Every path thread sees them all.
+//
+// Held ones (some thread holds them) are what the mod's registry holds: a column is claimed there
+// (CLAIM, chunk being its key there, with its slot) when the fleet's first bot gets it, readied
+// (READY) once that bot loaded it into the slot and unloaded (UNLOAD) when its last lets it go, once
+// for the whole fleet however many bots hold it. `claim` is this load's id there. The mod snapshots
+// it to disk on the UNLOAD and releases the slot (RELEASE); `modHolds` until then.
+//
+// The rest are cached: let go by every bot, or read off their snapshot by the mod for a search that
+// wanted them (see wantSnapshots). They stay for the path threads until slots run short.
 const columns = new Map()
+let nextClaim = 1
+// The cached columns, oldest first: the first to be evicted (see makeRoom).
+const cached = new Map()
+// Slot -> its column, for every column in `columns`.
+const slotColumns = new Map()
+// Columns the mod is reading off their snapshot: key -> slot.
+const loading = new Map()
+// Keys the mod has no snapshot of; forgotten once one is unloaded (its snapshot made then).
+const noSnapshot = new Set()
+// Held columns changed this turn of the event loop: key -> a bot that saw it. Sent once the turn is
+// done (CHANGED), the mod snapshotting each again.
+const changed = new Map()
+
+function sendChanged () {
+  for (const [key, bot] of changed) send(protocol.changed(bot, columns.get(key).chunk))
+  changed.clear()
+}
+
+// Slots kept free for the bots: the cache gives way below this, and no snapshot is read into them.
+const RESERVE = 256
+
+// The slots of columns.bin no column has, taken from the end. An evicted column's slot stays out of
+// it, its blocks untouched, until the mod released it (RELEASE) and every path thread dropped it: a
+// path thread takes the drop between searches, so none still reads the slot, and a search through
+// a column evicted mid-way never sees another column loaded over it.
+const freeSlots = Array.from({ length: SLOTS }, (_, i) => SLOTS - 1 - i)
+// Slots evicted -> { mod: waiting on its RELEASE, paths: the path threads yet to drop it }.
+const evicting = new Map()
+
+// The mod (worker undefined) or a path thread is done with the evicted slot.
+function settleSlot (slot, worker) {
+  const pending = evicting.get(slot)
+  if (!pending) throw new Error(`slot ${slot} settled, but it was not evicted`)
+  if (worker === undefined) {
+    if (!pending.mod) throw new Error(`the mod released slot ${slot} twice`)
+    pending.mod = false
+  } else if (!pending.paths.delete(worker)) {
+    throw new Error(`a path thread dropped slot ${slot} twice`)
+  }
+  if (pending.mod || pending.paths.size > 0) return
+  evicting.delete(slot)
+  freeSlots.push(slot)
+  loadSnapshots()
+}
+
+// A cached column out of its slot: the path threads drop it, the slot is free once they all did (see settleSlot).
+function evict (key, column) {
+  if (column.threads.size > 0) throw new Error(`column ${key} evicted while a thread holds it`)
+  cached.delete(key)
+  columns.delete(key)
+  slotColumns.delete(column.slot)
+  evicting.set(column.slot, { mod: column.modHolds, paths: new Set(pathThreads) })
+  for (const worker of pathThreads) worker.postMessage({ type: 'drop', key, slot: column.slot })
+}
+
+// The oldest cached columns go until the free slots, with those on their way back, are RESERVE again.
+function makeRoom () {
+  for (const [key, column] of cached) {
+    if (freeSlots.length + evicting.size >= RESERVE) return
+    evict(key, column)
+  }
+}
+
+// A slot for a column a bot got.
+function takeSlot (key) {
+  if (freeSlots.length === 0) throw new Error(`no free slot in columns.bin for ${key}: all ${SLOTS} are held or being evicted`)
+  const slot = freeSlots.pop()
+  makeRoom()
+  return slot
+}
+
+// Columns waited on by a path search, to read off their snapshot: key -> the searches waiting on it,
+// each { worker, ticket, keys it still waits on }.
+const waitedColumns = new Map()
+// Columns to read off their snapshot once a slot is to spare, in order.
+const toLoad = new Set()
+
+// Columns of `world` ("cx,cz") the path thread's search (ticket) looked for and the fleet does not
+// have in memory: read off their snapshot by the mod, the search told once each is in or has none
+// (see pathThread.js).
+function wantSnapshots (worker, ticket, world, ids) {
+  const search = { worker, ticket, keys: new Set() }
+  for (const id of ids) {
+    const key = `${world}|${id}`
+    // In since the search looked (its 'column' is ahead of the answer), or known to have no snapshot.
+    if (columns.has(key) || noSnapshot.has(key)) continue
+    search.keys.add(key)
+    let searches = waitedColumns.get(key)
+    if (!searches) waitedColumns.set(key, (searches = new Set()))
+    searches.add(search)
+    if (!loading.has(key)) toLoad.add(key)
+  }
+  if (search.keys.size === 0) worker.postMessage({ type: 'wanted', ticket })
+  loadSnapshots()
+}
+
+// The searches waiting on the column hear it is in, or has no snapshot to read.
+function settleWanted (key) {
+  const searches = waitedColumns.get(key)
+  if (!searches) return
+  waitedColumns.delete(key)
+  for (const search of searches) {
+    search.keys.delete(key)
+    if (search.keys.size === 0) search.worker.postMessage({ type: 'wanted', ticket: search.ticket })
+  }
+}
+
+// Asks the mod for the snapshots to read while slots are to spare past RESERVE. Short of them, cached
+// columns give way, their slots coming back once dropped (settleSlot calls this again). With none to
+// give way and none coming back, the searches go on without the rest.
+function loadSnapshots () {
+  for (const key of toLoad) {
+    if (columns.has(key)) {
+      toLoad.delete(key)
+      settleWanted(key)
+      continue
+    }
+    if (freeSlots.length > RESERVE) {
+      toLoad.delete(key)
+      const slot = freeSlots.pop()
+      loading.set(key, slot)
+      send(protocol.load(chunkOf(key), slot))
+      continue
+    }
+    if (evicting.size < toLoad.size && cached.size > 0) {
+      const [[oldest, column]] = cached
+      evict(oldest, column)
+      continue
+    }
+    if (evicting.size > 0 || loading.size > 0) return
+    for (const rest of toLoad) settleWanted(rest)
+    toLoad.clear()
+    return
+  }
+}
+
+// The mod read the column into the slot (version: its snapshot's Minecraft version), or has no snapshot of it (null).
+function onLoaded (key, slot, version) {
+  if (loading.get(key) !== slot) throw new Error(`the mod loaded ${key} into slot ${slot}, which it was not asked for`)
+  loading.delete(key)
+  if (version === null) noSnapshot.add(key)
+  // No snapshot, or a bot got the column meanwhile: the slot was never anyone's.
+  if (version === null || columns.has(key)) {
+    freeSlots.push(slot)
+  } else {
+    const column = { header: loadedHeader(), slot, threads: new Set(), chunk: chunkOf(key), claim: null, version, modHolds: false, ready: true }
+    columns.set(key, column)
+    slotColumns.set(slot, column)
+    cached.set(key, column)
+    for (const worker of pathThreads) worker.postMessage({ type: 'column', key, version, header: column.header, slot })
+  }
+  settleWanted(key)
+  loadSnapshots()
+}
+
+// The mod released the slot of an unloaded column: cached, or evicted already.
+function onRelease (slot) {
+  if (evicting.has(slot)) {
+    settleSlot(slot)
+    return
+  }
+  const column = slotColumns.get(slot)
+  if (!column || column.threads.size > 0 || !column.modHolds) throw new Error(`the mod released slot ${slot}, which no unloaded column has`)
+  column.modHolds = false
+}
+
+// "server|dimension|cx,cz" -> the registry's key: { server, dimension, x, z }.
+function chunkOf (key) {
+  const parts = key.split('|')
+  if (parts.length !== 3) throw new Error(`column key ${key} is not server|dimension|cx,cz`)
+  const [x, z] = parts[2].split(',').map(Number)
+  if (!Number.isInteger(x) || !Number.isInteger(z)) throw new Error(`column key ${key} has no chunk x,z`)
+  return { server: parts[0], dimension: parts[1], x, z }
+}
+
+// What a pool thread sends, in the order it happened there (see poolThread.js).
+function onThreadMessage (thread, message) {
+  if (message.acquire !== undefined || message.release !== undefined || message.ready !== undefined || message.changed !== undefined) {
+    onChunkRequest(thread, message)
+  } else {
+    onReport(thread, message)
+  }
+}
 
 function onChunkRequest (thread, request) {
   if (request.acquire !== undefined) {
     let column = columns.get(request.acquire)
+    // Cached (let go before, or off its snapshot): the bot loads it anew, into a slot of its own.
+    if (column && column.threads.size === 0) {
+      evict(request.acquire, column)
+      column = undefined
+    }
     const load = !column
     if (load) {
-      columns.set(request.acquire, (column = { buffer: new SharedArrayBuffer(SIZE), threads: new Set() }))
-      for (const worker of pathThreads) worker.postMessage({ type: 'column', key: request.acquire, version: request.version, buffer: column.buffer })
+      const slot = takeSlot(request.acquire)
+      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: true, ready: false }
+      columns.set(request.acquire, column)
+      slotColumns.set(slot, column)
+      for (const worker of pathThreads) worker.postMessage({ type: 'column', key: request.acquire, version: request.version, header: column.header, slot: column.slot })
+      send(protocol.claim(request.bot, column.chunk, column.claim, column.slot, request.version))
     }
     column.threads.add(thread)
     // The thread waits on the signal, then takes the answer straight off its port.
-    thread.chunkPort.postMessage({ buffer: column.buffer, load })
+    thread.chunkPort.postMessage({ header: column.header, slot: column.slot, load })
     Atomics.store(thread.signal, 0, 1)
     Atomics.notify(thread.signal, 0)
   } else if (request.release !== undefined) {
     const column = columns.get(request.release)
     if (!column || !column.threads.delete(thread)) throw new Error(`a thread released column ${request.release} it does not hold`)
     if (column.threads.size === 0) {
-      columns.delete(request.release)
-      for (const worker of pathThreads) worker.postMessage({ type: 'drop', key: request.release })
+      // Cached: the path threads keep seeing it; the mod snapshots it and releases the slot.
+      cached.set(request.release, column)
+      // The mod snapshots it once more as it goes: the changes of this turn not sent yet go with it.
+      changed.delete(request.release)
+      send(protocol.unload(request.bot, column.chunk))
     }
+  } else if (request.ready !== undefined) {
+    // Its first bot loaded it into the slot: the mod reads it from here on, and snapshots it.
+    const column = columns.get(request.ready)
+    if (!column || !column.threads.has(thread)) throw new Error(`a thread readied column ${request.ready} it does not hold`)
+    column.ready = true
+    noSnapshot.delete(request.ready)
+    send(protocol.ready(request.bot, column.chunk, column.claim))
+  } else if (request.changed !== undefined) {
+    const column = columns.get(request.changed)
+    if (!column || !column.threads.has(thread)) throw new Error(`a thread changed column ${request.changed} it does not hold`)
+    // Readied later: snapshotted then, change and all.
+    if (!column.ready) return
+    // Once per column and turn, however many bots and threads saw changes in it.
+    if (changed.size === 0) setImmediate(sendChanged)
+    changed.set(request.changed, request.bot)
   } else {
     throw new Error('unknown chunk request from a pool thread')
   }
@@ -188,13 +423,13 @@ function startThread () {
     return channel.port1
   })
   thread.worker = new Worker(path.join(__dirname, 'poolThread.js'), {
-    workerData: { chunkPort: port2, signal, pathPorts },
+    workerData: { chunkPort: port2, signal, pathPorts, pathPending, columnsFile },
     transferList: [port2, ...pathPorts]
   })
-  thread.worker.on('message', report => onReport(thread, report))
+  thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
   thread.worker.on('error', err => { throw err })
   thread.worker.on('exit', code => { throw new Error(`pool thread exited (code ${code})`) })
-  port1.on('message', request => onChunkRequest(thread, request))
+  port1.on('message', message => onThreadMessage(thread, message))
   threads.push(thread)
   return thread
 }
@@ -207,6 +442,9 @@ socket.on('error', err => { throw err })
 
 // Once closing the mod is gone: what the bots still report on their way out has nowhere to go.
 const send = frame => { if (!closing) socket.write(frame) }
+
+// First of all: the names of the state ids the slots hold.
+send(protocol.stateNames(states.legacyNames()))
 
 socket.on('data', protocol.frames(frame => {
   const message = protocol.decode(frame)
@@ -225,9 +463,12 @@ socket.on('data', protocol.frames(frame => {
       // Already gone: its BOT_GONE is on the way to the mod.
       bots.get(message.bot)?.worker.postMessage({ type: 'quit', bot: message.bot })
       break
-    case protocol.TYPES.REQUEST_CHUNK:
-      // Same: the registry hands the chunk to another holder once BOT_GONE lands.
-      bots.get(message.bot)?.worker.postMessage({ type: 'sendChunk', bot: message.bot, key: message.key, claim: message.claim })
+    case protocol.TYPES.RELEASE:
+      // The mod has the snapshot of an unloaded column: done with its slot.
+      onRelease(message.slot)
+      break
+    case protocol.TYPES.LOADED:
+      onLoaded(`${message.key.server}|${message.key.dimension}|${message.key.x},${message.key.z}`, message.slot, message.version)
       break
     case protocol.TYPES.FORMATION:
       // Same: a bot already gone has no spot to take. Its old spot goes once it takes the new one.

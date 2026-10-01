@@ -1,9 +1,16 @@
-// Chunk columns shared by every bot of the fleet, across the pool's threads. A column's blocks,
-// light and biomes live in one SharedArrayBuffer, handed out by the fleet's index (see fleet.js):
-// the first bot to get a column parses it into the buffer, every other bot, on any thread, sees
-// that same buffer. Each bot still has its own mineflayer World holding the column, so its events
+// Chunk columns shared by every bot of the fleet, across the pool's threads and with the mod. A
+// column's blocks and biomes live in one slot of a file every thread maps (columns.bin, made by the
+// mod, which reads the slots straight off it), handed out by the fleet's index (see fleet.js): the
+// first bot to get a column parses it into its slot, every other bot, on any thread, sees that same
+// slot. Whether it is loaded yet and its sections live in a small SharedArrayBuffer of the column:
+// Atomics.wait does not work on a mapped file. Each bot still has its own mineflayer World holding the column, so its events
 // (chunkColumnLoad, blockUpdate...) stay its own. Pre-flattening columns only (1.9 to 1.12).
+//
+// Light is read off the packet and dropped: neither mineflayer's movement nor pathfinder looks at
+// it, and it was a third of every column. Every block reads as fully lit.
+const fs = require('fs')
 const { receiveMessageOnPort } = require('worker_threads')
+const mmap = require('mmap-io')
 const { SmartBuffer } = require('smart-buffer')
 const { Vec3 } = require('vec3')
 const BitArray = require('prismarine-chunk/src/pc/common/BitArray')
@@ -16,42 +23,70 @@ const VOLUME = 4096
 // Section palettes up to this many bits; past it the data holds global state ids.
 const MAX_BITS_PER_BLOCK = 8
 
-// Buffer layout: header (i32 ready, i32 section mask, i32 sky light sent), the state id of every
-// block (u16, index y << 8 | z << 4 | x), block light and sky light (a nibble each), biomes (u8, z << 4 | x).
+// Slot layout, little-endian, mirrored by net.mapmcbot.fleet.FleetProtocol: a header (unused, the
+// column's SharedArrayBuffer holds it), the state id of every block (u16, index y << 8 | z << 4 | x),
+// biomes (u8, z << 4 | x). A section the column lacks is zeros (air), as the mod reads it.
+const STATES = 16
+const BIOMES = STATES + SECTIONS * VOLUME * 2
+const SIZE = BIOMES + 256
+const SLOTS = 4096
+// The column's SharedArrayBuffer: i32 ready, i32 section mask.
 const READY = 0
 const MASK = 1
-const SKY = 2
-const STATES = 16
-const BLOCK_LIGHT = STATES + SECTIONS * VOLUME * 2
-const SKY_LIGHT = BLOCK_LIGHT + SECTIONS * VOLUME / 2
-const BIOMES = SKY_LIGHT + SECTIONS * VOLUME / 2
-const SIZE = BIOMES + 256
+const HEADER = 8
+
+// The header of a column read into its slot whole (off its snapshot, by the mod): ready, every section there.
+function loadedHeader () {
+  const header = new SharedArrayBuffer(HEADER)
+  const fields = new Int32Array(header)
+  Atomics.store(fields, MASK, 0xffff)
+  Atomics.store(fields, READY, 1)
+  return header
+}
+
+// This thread's map of columns.bin, once openColumns took it.
+let mapped = null
+
+function openColumns (file) {
+  if (mapped) throw new Error(`columns already mapped on this thread, asked again for ${file}`)
+  const fd = fs.openSync(file, 'r+')
+  const size = fs.fstatSync(fd).size
+  if (size !== SLOTS * SIZE) throw new Error(`${file} is ${size} bytes, not ${SLOTS} slots of ${SIZE}`)
+  mapped = mmap.map(size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, fd, 0)
+}
 
 const index = pos => (pos.y << 8) | (pos.z << 4) | pos.x
-
-function nibble (array, i) {
-  return (array[i >> 1] >> ((i & 1) << 2)) & 15
-}
-
-function setNibble (array, i, value) {
-  const shift = (i & 1) << 2
-  array[i >> 1] = (array[i >> 1] & ~(15 << shift)) | ((value & 15) << shift)
-}
 
 // prismarine-chunk's 1.9 ChunkColumn API over a shared buffer.
 function columnClass (registry) {
   const Block = require('prismarine-block')(registry)
+  const Biome = require('prismarine-biome')(registry)
   const maxBitsPerBlock = neededBits(Object.values(registry.blocks).reduce((high, block) => Math.max(high, block.maxStateId), 0))
 
+  // State id -> a Block built once, copied for each getBlock: Block's constructor walks the block's
+  // variations and properties, on every one of the many blocks physics and the path searches read.
+  const templates = new Map()
+  function blockOf (stateId, biome) {
+    let template = templates.get(stateId)
+    if (!template) templates.set(stateId, (template = new Block(stateId >> 4, 0, stateId & 15)))
+    const block = Object.assign(Object.create(Block.prototype), template)
+    // Its own: getProperties merges computedStates into _properties.
+    block._properties = { ...template._properties }
+    block.computedStates = {}
+    block.biome = Biome(biome)
+    return block
+  }
+
   return class SharedColumn extends CommonChunkColumn {
-    constructor (buffer) {
+    // header: the column's SharedArrayBuffer; slot: its slot in columns.bin.
+    constructor (header, slot) {
       super(registry)
-      this.buffer = buffer
-      this.header = new Int32Array(buffer, 0, 3)
-      this.states = new Uint16Array(buffer, STATES, SECTIONS * VOLUME)
-      this.blockLight = new Uint8Array(buffer, BLOCK_LIGHT, SECTIONS * VOLUME / 2)
-      this.skyLight = new Uint8Array(buffer, SKY_LIGHT, SECTIONS * VOLUME / 2)
-      this.biomes = new Uint8Array(buffer, BIOMES, 256)
+      if (!mapped) throw new Error('columns.bin is not mapped on this thread (openColumns)')
+      if (!Number.isInteger(slot) || slot < 0 || slot >= SLOTS) throw new Error(`column slot ${slot} outside 0..${SLOTS - 1}`)
+      const base = mapped.byteOffset + slot * SIZE
+      this.header = new Int32Array(header, 0, 2)
+      this.states = new Uint16Array(mapped.buffer, base + STATES, SECTIONS * VOLUME)
+      this.biomes = new Uint8Array(mapped.buffer, base + BIOMES, 256)
     }
 
     // Loaded: the bots waiting on it can read it.
@@ -85,9 +120,9 @@ function columnClass (registry) {
     }
 
     getBlock (pos) {
-      const block = new Block(this.getBlockType(pos), this.getBiome(pos), this.getBlockData(pos))
-      block.light = this.getBlockLight(pos)
-      block.skyLight = this.getSkyLight(pos)
+      const block = blockOf(this.getBlockStateId(pos), this.getBiome(pos))
+      block.light = 15
+      block.skyLight = 15
       block.entity = this.getBlockEntity(pos)
       return block
     }
@@ -96,8 +131,6 @@ function columnClass (registry) {
       if (block.type !== undefined) this.setBlockType(pos, block.type)
       if (block.metadata !== undefined) this.setBlockData(pos, block.metadata)
       if (block.biome !== undefined) this.setBiome(pos, block.biome.id)
-      if (block.skyLight !== undefined && Atomics.load(this.header, SKY)) this.setSkyLight(pos, block.skyLight)
-      if (block.light !== undefined) this.setBlockLight(pos, block.light)
       if (block.entity) this.setBlockEntity(pos, block.entity)
       else this.removeBlockEntity(pos)
     }
@@ -114,13 +147,13 @@ function columnClass (registry) {
       return this.getBlockStateId(pos) & 15
     }
 
+    // Light is not kept (see the top of the file).
     getBlockLight (pos) {
-      return this.has(pos.y) ? nibble(this.blockLight, index(pos)) : 15
+      return 15
     }
 
     getSkyLight (pos) {
-      if (!this.has(pos.y)) return 15
-      return Atomics.load(this.header, SKY) ? nibble(this.skyLight, index(pos)) : 0
+      return 15
     }
 
     getBiome (pos) {
@@ -145,13 +178,9 @@ function columnClass (registry) {
       this.setBlockStateId(pos, (this.getBlockType(pos) << 4) | data)
     }
 
-    setBlockLight (pos, light) {
-      if (this.has(pos.y)) setNibble(this.blockLight, index(pos), light)
-    }
+    setBlockLight (pos, light) {}
 
-    setSkyLight (pos, light) {
-      if (this.has(pos.y) && Atomics.load(this.header, SKY)) setNibble(this.skyLight, index(pos), light)
-    }
+    setSkyLight (pos, light) {}
 
     setBiome (pos, biome) {
       this.biomes[(pos.z << 4) | pos.x] = biome
@@ -160,7 +189,8 @@ function columnClass (registry) {
     // A map_chunk packet's data, as prismarine-chunk's 1.9 load reads it.
     load (data, bitMap = 0xffff, skyLightSent = true, fullChunk = true) {
       const reader = SmartBuffer.fromBuffer(data)
-      Atomics.store(this.header, SKY, skyLightSent ? 1 : 0)
+      // Block light, and sky light when sent: a nibble per block each, skipped.
+      const light = (skyLightSent ? 2 : 1) * VOLUME / 2
 
       for (let y = 0; y < SECTIONS; y++) {
         if (!((bitMap >> y) & 1)) continue
@@ -180,15 +210,15 @@ function columnClass (registry) {
           bitsPerValue: bitsPerBlock > MAX_BITS_PER_BLOCK ? maxBitsPerBlock : bitsPerBlock,
           capacity: VOLUME
         }).readBuffer(reader, varInt.read(reader) * 2)
-        const blockLight = new BitArray({ bitsPerValue: 4, capacity: VOLUME }).readBuffer(reader)
-        const skyLight = skyLightSent ? new BitArray({ bitsPerValue: 4, capacity: VOLUME }).readBuffer(reader) : null
+        if (reader.remaining() < light) throw new Error(`map_chunk section ${y} is missing its light`)
+        reader.readOffset += light
 
+        // Plain writes: the bots waiting on the column read it after ready(), which publishes them.
+        const states = this.states
         const base = y * VOLUME
         for (let i = 0; i < VOLUME; i++) {
           const value = blocks.get(i)
-          Atomics.store(this.states, base + i, palette ? palette[value] : value)
-          setNibble(this.blockLight, base + i, blockLight.get(i))
-          if (skyLight) setNibble(this.skyLight, base + i, skyLight.get(i))
+          states[base + i] = palette ? palette[value] : value
         }
         Atomics.or(this.header, MASK, 1 << y)
       }
@@ -206,7 +236,11 @@ function columnClass (registry) {
 
 // One pool thread's side: its bots' columns, asked of the fleet over `port`, the answer waited on
 // with `signal` (an Int32Array on a SharedArrayBuffer the fleet sets once it posted the answer).
-function sharedChunks (port, signal) {
+// `post(message)` sends to the fleet over that same port after the thread's frames so far: the
+// fleet claims, readies and unloads each column in the mod as the fleet's first bot gets it, has
+// loaded it and its last lets it go, so those have to land in order with the block entities the
+// thread's bots report.
+function sharedChunks (port, signal, post) {
   // key -> { column, holders }: the columns some bot of this thread holds, and those bots.
   const columns = new Map()
   const classes = new Map()
@@ -219,18 +253,23 @@ function sharedChunks (port, signal) {
     if (!entry) {
       Atomics.store(signal, 0, 0)
       // The version too: the fleet hands every new column to the path threads (see pathThread.js).
-      port.postMessage({ acquire: key, version: registry.version.minecraftVersion })
+      post({ acquire: key, version: registry.version.minecraftVersion, bot: name })
       Atomics.wait(signal, 0, 0)
       const reply = receiveMessageOnPort(port)
       if (!reply) throw new Error(`the fleet signalled column ${key} without an answer`)
       const version = registry.version.minecraftVersion
       let Column = classes.get(version)
       if (!Column) classes.set(version, (Column = columnClass(registry)))
-      entry = { column: new Column(reply.message.buffer), holders: new Set() }
+      entry = { column: new Column(reply.message.header, reply.message.slot), holders: new Set() }
       columns.set(key, entry)
       load = reply.message.load
-      if (load) entry.column.biomes.fill(1)
-      else entry.column.waitReady()
+      // The slot may hold a column the mod let go: what the packet leaves out reads as air.
+      if (load) {
+        entry.column.states.fill(0)
+        entry.column.biomes.fill(1)
+      } else {
+        entry.column.waitReady()
+      }
     }
     entry.holders.add(name)
     return { column: entry.column, load }
@@ -241,12 +280,19 @@ function sharedChunks (port, signal) {
     if (!entry || !entry.holders.delete(name)) throw new Error(`${name} released column ${key} it does not hold`)
     if (entry.holders.size > 0) return
     columns.delete(key)
-    port.postMessage({ release: key })
+    post({ release: key, bot: name })
   }
 
   return {
+    // The thread's column for the key, undefined when no bot of the thread holds it.
+    get (key) {
+      return columns.get(key)?.column
+    },
+
     // Takes over the bot's map_chunk handling (mineflayer's blocks plugin) once it is injected.
-    attach (bot, name, server) {
+    // world(): the bot's "server|dimension"; blockEntity(tag) gets each block entity of a packet
+    // this bot wrote into the column, once the column is in its world, for the mod.
+    attach (bot, name, world, blockEntity) {
       // "cx,cz" -> key: the columns in the bot's world.
       const held = new Map()
 
@@ -258,9 +304,10 @@ function sharedChunks (port, signal) {
           return
         }
         const id = `${x},${z}`
-        const key = `${server}|${bot.game.dimension}|${id}`
+        const key = `${world()}|${id}`
         let column
         let load
+        let first = false
         if (held.get(id) === key) {
           // Sent again: over the one there.
           column = columns.get(key).column
@@ -268,17 +315,26 @@ function sharedChunks (port, signal) {
         } else {
           if (held.has(id)) throw new Error(`${name}: column ${id} still held from ${held.get(id)}`)
           ;({ column, load } = acquire(key, bot.registry, name))
+          first = load
           held.set(id, key)
         }
         // A partial column updates the shared one, whoever loaded it.
-        if (load || packet.groundUp === false) {
+        const wrote = load || packet.groundUp === false
+        if (wrote) {
           column.load(packet.chunkData, packet.bitMap, bot.game.dimension === 'overworld', packet.groundUp)
           column.ready()
         }
-        for (const tag of packet.blockEntities ?? []) {
+        const tags = packet.blockEntities ?? []
+        for (const tag of tags) {
           column.setBlockEntity(new Vec3(tag.value.x.value & 0xf, tag.value.y.value, tag.value.z.value & 0xf), tag)
         }
         bot.world.setColumn(x, z, column)
+        // The blocks reach the mod through the slot; the block entities of what this bot wrote do not.
+        if (wrote) for (const tag of tags) blockEntity(tag)
+        // After those (post sends the frames so far first): the mod reads the slot from here on and
+        // snapshots it, block entities and all. Written over since: snapshotted again.
+        if (first) post({ ready: key, bot: name })
+        else if (wrote) post({ changed: key, bot: name })
       }
 
       bot.once('inject_allowed', () => {
@@ -307,4 +363,4 @@ function sharedChunks (port, signal) {
   }
 }
 
-module.exports = { sharedChunks, columnClass, SIZE }
+module.exports = { sharedChunks, columnClass, openColumns, loadedHeader, HEADER, SLOTS }

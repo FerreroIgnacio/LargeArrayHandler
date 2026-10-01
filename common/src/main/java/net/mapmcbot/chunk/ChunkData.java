@@ -119,7 +119,7 @@ public final class ChunkData {
 		return ((long) y << 8) | (z << 4) | x;
 	}
 
-	private static String blockName(String state) {
+	static String blockName(String state) {
 		final int bracket = state.indexOf('[');
 		return bracket < 0 ? state : state.substring(0, bracket);
 	}

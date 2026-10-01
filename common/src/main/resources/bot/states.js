@@ -52,3 +52,13 @@ module.exports.blockName = state => {
   const bracket = state.indexOf('[')
   return bracket < 0 ? state : state.slice(0, bracket)
 }
+
+// [[state id, name]] of every pre-flattening state (id << 4 | meta), as stateName names them: the
+// same for every version the shared columns know (1.9 to 1.12), for the mod to name a slot's ids.
+module.exports.legacyNames = () => Object.entries(minecraftData.legacy.pc.blocks).map(([idMeta, flattened]) => {
+  const [id, meta] = idMeta.split(':').map(Number)
+  if (!Number.isInteger(id) || id < 0 || id > 4095 || !Number.isInteger(meta) || meta < 0 || meta > 15) {
+    throw new Error(`legacy block ${idMeta} is not an id:meta state id`)
+  }
+  return [(id << 4) | meta, sorted(flattened)]
+})

@@ -26,7 +26,7 @@ public class AutoStart implements ClientModInitializer {
 	/** Every bot's name starts with it; BotSkinMixin tells the bots apart by it. */
 	public static final String BOT_PREFIX = "PandaBot";
 
-	private static final String[] BOTS = IntStream.rangeClosed(2, 128).mapToObj(i -> BOT_PREFIX + i).toArray(String[]::new);
+	private static final String[] BOTS = IntStream.rangeClosed(2, 32).mapToObj(i -> BOT_PREFIX + i).toArray(String[]::new);
 
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
 	private static final int MAX_PLAYERS = 128;

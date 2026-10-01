@@ -5,24 +5,51 @@
 // walking to (pathfinder drops its path when a block near it changes, when the bot gets stuck or
 // fails to dig), the bot keeps walking what is left of its path until the new one comes. A goal no
 // search found a path to is not searched again until the bot is RETRY_AFTER blocks from where it was.
+// Each request goes to the path thread with the fewest waiting, counted across the whole fleet.
 const RETRY_AFTER = 4
+// Entities go with a request only inside the box of its start and goal widened by this many blocks
+// (half communalPaths.js's SEARCH_RADIUS, as far as a search strays to either side), and only
+// those pathfinder's Movements counts: a bot in a crowd sees every other bot of the fleet.
+const ENTITY_MARGIN = 32
 const { Vec3 } = require('vec3')
 const Move = require('mineflayer-pathfinder/lib/move')
 const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
 
-// `ports`: one per path thread, from the fleet.
-function pathClient (ports) {
+// `ports`: one per path thread, from the fleet. `pending`: per path thread, the requests sent to it
+// and not answered yet, shared by every pool thread: one more as a request goes, one less as its
+// answer (or its cancel) comes, every request getting exactly one.
+function pathClient (ports, pending) {
+  if (pending.length !== ports.length) throw new Error(`${pending.length} pending counts for ${ports.length} path threads`)
   // Request id -> what to do with its answer.
   const waiting = new Map()
   let nextId = 1
-  let nextPort = 0
-  for (const port of ports) {
+  // Where the search for the least busy starts, turning, so ties do not all land on the first.
+  let first = 0
+  ports.forEach((port, i) => {
     port.on('message', answer => {
       const onAnswer = waiting.get(answer.id)
       if (!onAnswer) throw new Error(`a path thread answered request ${answer.id}, which no bot is waiting on`)
       waiting.delete(answer.id)
+      if (Atomics.sub(pending, i, 1) <= 0) throw new Error(`path thread ${i} answered more requests than it was sent`)
       onAnswer(answer)
     })
+  })
+
+  // The path thread with the fewest requests waiting, counted as one more.
+  function leastBusy () {
+    let best = -1
+    let fewest = Infinity
+    for (let k = 0; k < ports.length; k++) {
+      const i = (first + k) % ports.length
+      const count = Atomics.load(pending, i)
+      if (count < fewest) {
+        fewest = count
+        best = i
+      }
+    }
+    first = (first + 1) % ports.length
+    Atomics.add(pending, best, 1)
+    return ports[best]
   }
 
   // getPathTo(movements, goal) for the bot; `world()` is its "server|dimension" as the shared
@@ -142,7 +169,7 @@ function pathClient (ports) {
           return { ...failed.result, path: [] }
         }
         cancel()
-        const job = { goal, id: nextId++, port: ports[nextPort++ % ports.length], cancelled: false, began: performance.now(), start: from }
+        const job = { goal, id: nextId++, port: leastBusy(), cancelled: false, began: performance.now(), start: from }
         const self = bot.entity
         waiting.set(job.id, answer => {
           if (job.cancelled) return
@@ -168,17 +195,29 @@ function pathClient (ports) {
           // Still the goal: pathfinder asks again, and gets it.
           if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(goal)
         })
+        const target = goalOf(goal)
+        const minX = Math.min(from.x, target.x) - ENTITY_MARGIN
+        const maxX = Math.max(from.x, target.x) + ENTITY_MARGIN
+        const minZ = Math.min(from.z, target.z) - ENTITY_MARGIN
+        const maxZ = Math.max(from.z, target.z) + ENTITY_MARGIN
+        const entities = []
+        for (const id in bot.entities) {
+          const e = bot.entities[id]
+          if (e === self || !e.position) continue
+          if (movements.passableEntities.has(e.name) && !movements.entitiesToAvoid.has(e.name)) continue
+          const { x, y, z } = e.position
+          if (x < minX || x > maxX || z < minZ || z > maxZ) continue
+          entities.push({ name: e.name, width: e.width, height: e.height, position: { x, y, z } })
+        }
         job.port.postMessage({
           id: job.id,
           world: world(),
           version: bot.version,
           start: from,
-          goal: goalOf(goal),
+          goal: target,
           items: bot.inventory.items().map(item => ({ type: item.type, nbt: item.nbt })),
           effects: self.effects,
-          entities: Object.values(bot.entities)
-            .filter(e => e !== self && e.position)
-            .map(e => ({ name: e.name, width: e.width, height: e.height, position: { x: e.position.x, y: e.position.y, z: e.position.z } }))
+          entities
         })
         running = job
       }

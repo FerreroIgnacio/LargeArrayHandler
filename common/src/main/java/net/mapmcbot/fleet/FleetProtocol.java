@@ -1,4 +1,4 @@
-package net.mapmcbot.chunk;
+package net.mapmcbot.fleet;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -13,29 +13,49 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
+import net.mapmcbot.bot.BotListener;
+import net.mapmcbot.chunk.ChunkData;
+import net.mapmcbot.chunk.ChunkKey;
+import net.mapmcbot.chunk.ChunkListener;
+
 /**
- * The binary messages between the mod and the bot fleet, mirrored by bot/protocol.js.
+ * The binary messages between the mod and the bot fleet, mirrored by bot/protocol.js, and the
+ * layout of columns.bin, mirrored by bot/sharedChunks.js.
  *
  * A frame is a u32 length followed by that many bytes: a u8 type and its payload. Everything is
- * big-endian; a string is a u16 byte length and UTF-8. Chunk messages start with a header: bot
- * name, server (host:port), dimension, chunk x, chunk z (i32 each).
+ * big-endian; a string is a u16 byte length and UTF-8. Every message starts with the bot's name;
+ * chunk messages go on with the rest of their header: server (host:port), dimension, chunk x,
+ * chunk z (i32 each).
  *
- * Chunk data: i32 minY, i32 height, then height/16 sections bottom up, each a u16 palette size, the
- * palette strings and, unless the palette has a single state, 4096 indices (u8 while the palette
- * fits in 256, u16 past that) in y, z, x order. Then i32 block entity count, each u8 x, i32 y, u8 z
- * (local), type string, i32 NBT length and the NBT.
+ * The columns' blocks never go through the socket: the fleet loads each into a slot of columns.bin,
+ * which the mod maps. A slot is COLUMN_SLOT_SIZE bytes, little-endian: a header (unused), the state
+ * id (u16, id << 4 | meta) of every block at COLUMN_STATES + 2 * (y << 8 | z << 4 | x), the biomes
+ * (u8, z << 4 | x) at COLUMN_BIOMES. A section the column lacks is zeros (air).
+ *
+ * Chunk data (snapshots): i32 minY, i32 height, then height/16 sections bottom up, each a u16
+ * palette size, the palette strings and, unless the palette has a single state, 4096 indices (u8
+ * while the palette fits in 256, u16 past that) in y, z, x order. Then i32 block entity count, each
+ * u8 x, i32 y, u8 z (local), type string, i32 NBT length and the NBT.
  */
-public final class ChunkProtocol {
+public final class FleetProtocol {
+	public static final int COLUMN_SLOTS = 4096;
+	public static final int COLUMN_STATES = 16;
+	public static final int COLUMN_BIOMES = COLUMN_STATES + 16 * ChunkData.SECTION_VOLUME * 2;
+	public static final int COLUMN_SLOT_SIZE = COLUMN_BIOMES + 256;
+
 	// Fleet to mod.
-	/** header, i32 claim id. */
+	/**
+	 * header, i32 claim id, i32 slot, mcVersion string: the fleet's first bot got the column (the
+	 * header's bot), once for the whole fleet, and loads it into the slot.
+	 */
 	public static final int CLAIM = 1;
-	/** header, mcVersion string, chunk data. */
-	public static final int CHUNK_DATA = 2;
-	/** header, i32 count, each i32 x, y, z (world) and the state string. */
-	public static final int BLOCK_UPDATE = 3;
+	/** header, i32 claim id: the column is in its slot, to be read from now on. */
+	public static final int READY = 2;
+	/** header: the readied column's blocks or block entities changed. */
+	public static final int CHANGED = 3;
 	/** header, i32 x, y, z (world), u8 present; when present the type string, i32 NBT length and the NBT. */
 	public static final int BLOCK_ENTITY_UPDATE = 4;
-	/** header. */
+	/** header: the fleet's last bot let the column go; its slot waits on a RELEASE. */
 	public static final int UNLOAD = 5;
 	/** bot name. */
 	public static final int BOT_GONE = 6;
@@ -43,10 +63,16 @@ public final class ChunkProtocol {
 	public static final int PATH = 7;
 	/** bot name: in the world, ready for orders. */
 	public static final int BOT_SPAWNED = 8;
+	/** bot name (empty), i32 count, each u16 state id and its name. Once, first of all. */
+	public static final int STATE_NAMES = 9;
+	/** bot name (empty), key, i32 slot: read the column's snapshot into the free slot; answered with LOADED. */
+	public static final int LOAD = 10;
 
 	// Mod to fleet.
-	/** header, i32 claim id. */
-	public static final int REQUEST_CHUNK = 16;
+	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
+	public static final int RELEASE = 16;
+	/** bot name (empty), key, i32 slot, u8 found; when found the snapshot's mcVersion string. */
+	public static final int LOADED = 20;
 	/** bot name, host string, i32 port. */
 	public static final int SPAWN = 17;
 	/** bot name. */
@@ -59,7 +85,7 @@ public final class ChunkProtocol {
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
-	private ChunkProtocol() {
+	private FleetProtocol() {
 	}
 
 	/** The next frame without its length, or null when the stream ends cleanly between frames. */
@@ -82,52 +108,84 @@ public final class ChunkProtocol {
 		return frame;
 	}
 
-	/** Decodes a fleet-to-mod frame and hands it to the listener. */
-	public static void dispatch(byte[] frame, ChunkChannel.Listener listener) {
+	/** Decodes a fleet-to-mod frame and hands it to the listener of its domain: chunks or bots. */
+	public static void dispatch(byte[] frame, ChunkListener chunks, BotListener bots) {
 		try {
 			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame));
 			final int type = in.readUnsignedByte();
-
-			if (type == BOT_GONE) {
-				final String bot = readString(in);
-				end(in, type);
-				listener.onBotGone(bot);
-				return;
-			}
-
 			final String bot = readString(in);
-			final ChunkKey key = readKey(in);
 
 			switch (type) {
 				case CLAIM: {
+					final ChunkKey key = readKey(in);
+					final int claim = in.readInt();
+					final int slot = in.readInt();
+					final String mcVersion = readString(in);
+					end(in, type);
+
+					if (slot < 0 || slot >= COLUMN_SLOTS) {
+						throw new IOException(key + " claimed into slot " + slot + ", outside 0.." + (COLUMN_SLOTS - 1));
+					}
+
+					chunks.onClaim(bot, key, claim, slot, mcVersion);
+					break;
+				}
+
+				case CHANGED: {
+					final ChunkKey key = readKey(in);
+					end(in, type);
+					chunks.onChanged(bot, key);
+					break;
+				}
+
+				case LOAD: {
+					final ChunkKey key = readKey(in);
+					final int slot = in.readInt();
+					end(in, type);
+
+					if (slot < 0 || slot >= COLUMN_SLOTS) {
+						throw new IOException(key + " to be loaded into slot " + slot + ", outside 0.." + (COLUMN_SLOTS - 1));
+					}
+
+					chunks.onLoadSnapshot(key, slot);
+					break;
+				}
+
+				case READY: {
+					final ChunkKey key = readKey(in);
 					final int claim = in.readInt();
 					end(in, type);
-					listener.onClaim(bot, key, claim);
+					chunks.onReady(bot, key, claim);
 					break;
 				}
 
-				case CHUNK_DATA: {
-					final String mcVersion = readString(in);
-					final ChunkData data = readData(in);
-					end(in, type);
-					listener.onChunkData(bot, key, mcVersion, data);
-					break;
-				}
-
-				case BLOCK_UPDATE: {
+				case STATE_NAMES: {
 					final int count = in.readInt();
-					final List<BlockChange> changes = new ArrayList<BlockChange>(count);
+
+					if (count < 0 || count > 0x10000) {
+						throw new IOException("bad state name count " + count);
+					}
+
+					final String[] names = new String[0x10000];
 
 					for (int i = 0; i < count; i++) {
-						changes.add(new BlockChange(in.readInt(), in.readInt(), in.readInt(), readString(in)));
+						final int id = in.readUnsignedShort();
+						final String name = readString(in);
+
+						if (names[id] != null) {
+							throw new IOException("state id " + id + " named twice: " + names[id] + ", " + name);
+						}
+
+						names[id] = name;
 					}
 
 					end(in, type);
-					listener.onBlockUpdate(bot, key, changes);
+					chunks.onStateNames(names);
 					break;
 				}
 
 				case BLOCK_ENTITY_UPDATE: {
+					final ChunkKey key = readKey(in);
 					final int x = in.readInt();
 					final int y = in.readInt();
 					final int z = in.readInt();
@@ -136,17 +194,41 @@ public final class ChunkProtocol {
 						final String entityType = readString(in);
 						final byte[] nbt = readBytes(in);
 						end(in, type);
-						listener.onBlockEntityUpdate(bot, key, x, y, z, entityType, nbt);
+						chunks.onBlockEntityUpdate(bot, key, x, y, z, entityType, nbt);
 					} else {
 						end(in, type);
-						listener.onBlockEntityRemove(bot, key, x, y, z);
+						chunks.onBlockEntityRemove(bot, key, x, y, z);
 					}
 					break;
 				}
 
-				case UNLOAD:
+				case UNLOAD: {
+					final ChunkKey key = readKey(in);
 					end(in, type);
-					listener.onUnload(bot, key);
+					chunks.onUnload(bot, key);
+					break;
+				}
+
+				case BOT_GONE:
+					end(in, type);
+					bots.onGone(bot);
+					break;
+
+				case PATH:
+					if (!in.readBoolean()) {
+						end(in, type);
+						bots.onPathCleared(bot);
+						break;
+					}
+
+					final int[] path = readPath(in);
+					end(in, type);
+					bots.onPath(bot, path);
+					break;
+
+				case BOT_SPAWNED:
+					end(in, type);
+					bots.onSpawned(bot);
 					break;
 
 				default:
@@ -157,58 +239,55 @@ public final class ChunkProtocol {
 		}
 	}
 
-	/** The bot of a BOT_GONE frame. */
-	public static String botGoneName(byte[] frame) {
-		try {
-			return readString(new DataInputStream(new ByteArrayInputStream(frame, 1, frame.length - 1)));
-		} catch (IOException e) {
-			throw new UncheckedIOException("truncated BOT_GONE message", e);
+	/** {target x, y, z, node x, y, z, ...}. */
+	private static int[] readPath(DataInput in) throws IOException {
+		final int tx = in.readInt();
+		final int ty = in.readInt();
+		final int tz = in.readInt();
+		final int count = in.readInt();
+
+		if (count < 0) {
+			throw new IOException("bad path length " + count);
 		}
+
+		final int[] result = new int[3 + 3 * count];
+		result[0] = tx;
+		result[1] = ty;
+		result[2] = tz;
+
+		for (int i = 3; i < result.length; i++) {
+			result[i] = in.readInt();
+		}
+
+		return result;
 	}
 
-	/** The path of a PATH frame: {target x, y, z, node x, y, z, ...}, or null when not walking one. */
-	public static int[] pathOf(byte[] frame) {
+	/** mcVersion: the snapshot's, null when there is none. */
+	public static byte[] loaded(ChunkKey key, int slot, String mcVersion) {
+		final Frame frame = new Frame(LOADED);
+
 		try {
-			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame, 1, frame.length - 1));
-			readString(in);
+			writeString(frame.out, "");
+			writeKey(frame.out, key);
+			frame.out.writeInt(slot);
+			frame.out.writeBoolean(mcVersion != null);
 
-			if (!in.readBoolean()) {
-				end(in, PATH);
-				return null;
+			if (mcVersion != null) {
+				writeString(frame.out, mcVersion);
 			}
-
-			final int tx = in.readInt();
-			final int ty = in.readInt();
-			final int tz = in.readInt();
-			final int count = in.readInt();
-
-			if (count < 0) {
-				throw new IOException("bad path length " + count);
-			}
-
-			final int[] result = new int[3 + 3 * count];
-			result[0] = tx;
-			result[1] = ty;
-			result[2] = tz;
-
-			for (int i = 3; i < result.length; i++) {
-				result[i] = in.readInt();
-			}
-
-			end(in, PATH);
-			return result;
 		} catch (IOException e) {
-			throw new UncheckedIOException("truncated PATH message", e);
+			throw new UncheckedIOException(e);
 		}
+
+		return frame.bytes();
 	}
 
-	public static byte[] requestChunk(String bot, ChunkKey key, int claim) {
-		final Frame frame = new Frame(REQUEST_CHUNK);
+	public static byte[] release(String bot, int slot) {
+		final Frame frame = new Frame(RELEASE);
 
 		try {
 			writeString(frame.out, bot);
-			writeKey(frame.out, key);
-			frame.out.writeInt(claim);
+			frame.out.writeInt(slot);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}
@@ -293,8 +372,9 @@ public final class ChunkProtocol {
 			out.writeInt(entity.getY());
 			out.writeByte(entity.getZ());
 			writeString(out, entity.getType());
-			out.writeInt(entity.nbt().length);
-			out.write(entity.nbt());
+			final byte[] nbt = entity.getNbt();
+			out.writeInt(nbt.length);
+			out.write(nbt);
 		}
 	}
 

@@ -9,23 +9,36 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import net.mapmcbot.fleet.FleetProtocol;
 
 /**
  * The last state of every chunk that left the registry, one file each under
  * root/server/dimension/x.z.chunk: magic, format version, save time (epoch ms), mcVersion, server,
- * dimension, chunk x, chunk z, then the data as {@link ChunkProtocol#writeData} writes it.
+ * dimension, chunk x, chunk z, then the data as {@link FleetProtocol#writeData} writes it.
  *
  * FORMAT_VERSION goes up with every change to this layout or to the data; snapshots of any other
  * version are deleted when the store opens.
+ *
+ * SINGLETON: one per game, the registry's; a second store throws.
  */
 public final class ChunkSnapshotStore {
+	private static final AtomicBoolean CREATED = new AtomicBoolean();
+
 	public static final int FORMAT_VERSION = 1;
 
 	private static final int MAGIC = 0x4D434348; // "MCCH"
@@ -39,10 +52,92 @@ public final class ChunkSnapshotStore {
 	 * snapshots of another format version, and only whole .chunk files, never the .tmp being written.
 	 */
 	public ChunkSnapshotStore(File root) {
+		if (!CREATED.compareAndSet(false, true)) {
+			throw new IllegalStateException("ChunkSnapshotStore is a singleton: one was already created");
+		}
+
 		this.root = root;
 		final Thread sweep = new Thread(this::discardOutdated, "mapmcbot-snapshot-sweep");
 		sweep.setDaemon(true);
 		sweep.start();
+	}
+
+	/**
+	 * The chunk in `slot` of the fleet's columns file (see FleetProtocol), its state ids named by
+	 * `names`. Only the block entities still on a block of their type are kept: the block changed
+	 * since drops them, as the game does.
+	 */
+	public void saveSlot(ChunkKey key, String mcVersion, ByteBuffer columns, int slot, String[] names,
+			Collection<ChunkData.BlockEntity> blockEntities) {
+		final int base = slot * FleetProtocol.COLUMN_SLOT_SIZE + FleetProtocol.COLUMN_STATES;
+		final int sectionCount = 16;
+		final List<ChunkData.Section> sections = new ArrayList<ChunkData.Section>(sectionCount);
+		// State id -> its index in the palette of the section being read, -1 while not in it.
+		final int[] indexOf = new int[0x10000];
+		Arrays.fill(indexOf, -1);
+
+		for (int s = 0; s < sectionCount; s++) {
+			final List<Integer> ids = new ArrayList<Integer>();
+			final char[] indices = new char[ChunkData.SECTION_VOLUME];
+
+			for (int i = 0; i < ChunkData.SECTION_VOLUME; i++) {
+				final int id = columns.getShort(base + 2 * (s * ChunkData.SECTION_VOLUME + i)) & 0xFFFF;
+
+				if (indexOf[id] < 0) {
+					indexOf[id] = ids.size();
+					ids.add(id);
+				}
+
+				indices[i] = (char) indexOf[id];
+			}
+
+			// Two ids may name the same state (legacy metadata the flattening drops): one entry each name.
+			final List<String> palette = new ArrayList<String>();
+			final Map<String, Integer> lookup = new HashMap<String, Integer>();
+			final char[] remap = new char[ids.size()];
+
+			for (int k = 0; k < ids.size(); k++) {
+				final String name = stateName(names, ids.get(k), key);
+				Integer entry = lookup.get(name);
+
+				if (entry == null) {
+					entry = palette.size();
+					palette.add(name);
+					lookup.put(name, entry);
+				}
+
+				remap[k] = (char) entry.intValue();
+				indexOf[ids.get(k)] = -1;
+			}
+
+			for (int i = 0; i < indices.length; i++) {
+				indices[i] = remap[indices[i]];
+			}
+
+			sections.add(new ChunkData.Section(palette, indices));
+		}
+
+		final ChunkData data = new ChunkData(0, sectionCount * ChunkData.SECTION_HEIGHT, sections,
+				new ArrayList<ChunkData.BlockEntity>());
+
+		for (ChunkData.BlockEntity entity : blockEntities) {
+			if (ChunkData.blockName(data.getState(entity.getX(), entity.getY(), entity.getZ())).equals(entity.getType())) {
+				data.putBlockEntity(entity);
+			}
+		}
+
+		save(key, mcVersion, data);
+	}
+
+	static String stateName(String[] names, int id, ChunkKey key) {
+		final String name = names[id];
+
+		if (name == null) {
+			throw new IllegalStateException(key + " holds state id " + id + " (" + (id >> 4) + ":" + (id & 15)
+					+ "), which has no name");
+		}
+
+		return name;
 	}
 
 	/** Written to a temporary file and moved over the old one, so a crash never leaves half a snapshot. */
@@ -61,12 +156,12 @@ public final class ChunkSnapshotStore {
 				out.writeInt(MAGIC);
 				out.writeInt(FORMAT_VERSION);
 				out.writeLong(System.currentTimeMillis());
-				ChunkProtocol.writeString(out, mcVersion);
-				ChunkProtocol.writeString(out, key.getServer());
-				ChunkProtocol.writeString(out, key.getDimension());
+				FleetProtocol.writeString(out, mcVersion);
+				FleetProtocol.writeString(out, key.getServer());
+				FleetProtocol.writeString(out, key.getDimension());
 				out.writeInt(key.getX());
 				out.writeInt(key.getZ());
-				ChunkProtocol.writeData(out, data);
+				FleetProtocol.writeData(out, data);
 			}
 
 			Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -86,15 +181,15 @@ public final class ChunkSnapshotStore {
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
 			readVersion(in, file);
 			final Instant savedAt = Instant.ofEpochMilli(in.readLong());
-			final String mcVersion = ChunkProtocol.readString(in);
-			final ChunkKey stored = new ChunkKey(ChunkProtocol.readString(in), ChunkProtocol.readString(in),
+			final String mcVersion = FleetProtocol.readString(in);
+			final ChunkKey stored = new ChunkKey(FleetProtocol.readString(in), FleetProtocol.readString(in),
 					in.readInt(), in.readInt());
 
 			if (!stored.equals(key)) {
 				throw new IllegalStateException(file + " holds " + stored + ", not " + key);
 			}
 
-			final ChunkData data = ChunkProtocol.readData(in);
+			final ChunkData data = FleetProtocol.readData(in);
 
 			if (in.read() != -1) {
 				throw new IllegalStateException("stray bytes at the end of " + file);

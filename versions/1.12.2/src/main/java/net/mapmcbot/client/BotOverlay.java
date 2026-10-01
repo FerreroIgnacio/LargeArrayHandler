@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import net.mapmcbot.bot.BotManager;
+import net.mapmcbot.bot.BotRegistry;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.util.Window;
 
@@ -16,7 +16,7 @@ public final class BotOverlay {
 	}
 
 	public static void render() {
-		final BotManager bots = MapMcBotClient.botsOrNull();
+		final BotRegistry bots = MapMcBotClient.botsOrNull();
 
 		if (bots == null || bots.getBots().isEmpty()) {
 			return;
