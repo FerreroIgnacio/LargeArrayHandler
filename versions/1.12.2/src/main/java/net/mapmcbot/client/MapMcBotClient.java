@@ -33,6 +33,9 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	private static KeyBinding areasKey;
 
+	/** The id of the last #formation sent; each one gets the next. */
+	private static int lastFormation;
+
 	private static AreaStore areas;
 	private static String areasWorldId;
 	private static BotManager bots;
@@ -118,9 +121,10 @@ public class MapMcBotClient implements ClientModInitializer {
 		final int x = (int) Math.floor(client.player.x);
 		final int y = (int) Math.floor(client.player.y);
 		final int z = (int) Math.floor(client.player.z);
+		final int id = ++lastFormation;
 
 		for (String bot : bots().getBots()) {
-			bots().formation(bot, x, y, z);
+			bots().formation(bot, id, x, y, z);
 		}
 
 		return true;

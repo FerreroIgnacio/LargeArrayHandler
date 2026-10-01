@@ -10,14 +10,70 @@ const { SIZE } = require('./sharedChunks')
 
 // Bot name -> the thread running it.
 const bots = new Map()
+// Bot name -> where it is ("server|dimension"), from its spawns; unknown until it is in the world.
+const worldOf = new Map()
 // Formation spots: "server|dimension|x,y,z" -> bot standing there, and bot -> its spot. One bot per block.
 const spots = new Map()
 const spotOf = new Map()
-function release (name) {
+function leaveSpot (name) {
   const key = spotOf.get(name)
   if (key === undefined) return
   spots.delete(key)
   spotOf.delete(name)
+}
+
+// The formations of the latest #formation, one per world its bots are in: "id|world|x,y,z" ->
+// { leader, candidates, queue, released }. The spots around the target are worked out once, by
+// its first bot in the world (the leader). The leader walks first; the rest wait for its path,
+// so each of them finds it in its thread's book and joins it (see communalPaths.js).
+const formations = new Map()
+let latestFormation = -Infinity
+// The bots ordered into the latest formation before they were in the world: bot -> { id, target }.
+const waiting = new Map()
+
+function joinFormation (name, { id, target }) {
+  const key = `${id}|${worldOf.get(name)}|${target.x},${target.y},${target.z}`
+  const formation = formations.get(key)
+  if (!formation) {
+    formations.set(key, { leader: name, candidates: null, queue: [name], released: false })
+    bots.get(name).worker.postMessage({ type: 'candidates', bot: name, formation: key, target })
+  } else if (formation.released) {
+    goto(formation, name)
+  } else {
+    formation.queue.push(name)
+  }
+}
+
+// The spot nearest the target that no other bot stands on.
+function goto (formation, name) {
+  const thread = bots.get(name)
+  if (!thread) return
+  const taken = formation.candidates.find(({ key }) => !spots.has(key) || spots.get(key) === name)
+  if (!taken) throw new Error(`${name}: every block to stand on around its formation target is taken`)
+  leaveSpot(name)
+  spots.set(taken.key, name)
+  spotOf.set(name, taken.key)
+  if (name === formation.leader) formation.leaderSpot = taken.spot
+  thread.worker.postMessage({ type: 'goto', bot: name, spot: taken.spot })
+}
+
+// The rest of the formation walks.
+function releaseFormation (formation) {
+  formation.released = true
+  for (const name of formation.queue.splice(0)) {
+    if (name !== formation.leader) goto(formation, name)
+  }
+}
+
+function formationOrder (name, order) {
+  if (order.id < latestFormation) return
+  if (order.id > latestFormation) {
+    latestFormation = order.id
+    formations.clear()
+    waiting.clear()
+  }
+  if (worldOf.has(name)) joinFormation(name, order)
+  else waiting.set(name, order)
 }
 
 // The shared columns: "server|dimension|cx,cz" -> { buffer, threads holding it }. Gone once no thread does.
@@ -43,20 +99,43 @@ function onChunkRequest (thread, request) {
 }
 
 function onReport (thread, report) {
-  if (report.frame) {
-    send(Buffer.from(report.frame.buffer, report.frame.byteOffset, report.frame.byteLength))
+  if (report.frames) {
+    send(Buffer.from(report.frames))
+  } else if (report.world) {
+    worldOf.set(report.bot, report.world)
+    const order = waiting.get(report.bot)
+    if (order) {
+      waiting.delete(report.bot)
+      joinFormation(report.bot, order)
+    }
   } else if (report.candidates) {
-    // Its nearest spot no other bot stands on.
-    const name = report.bot
-    const taken = report.candidates.find(({ key }) => !spots.has(key) || spots.get(key) === name)
-    if (!taken) throw new Error(`${name}: every block to stand on around its formation target is taken`)
-    release(name)
-    spots.set(taken.key, name)
-    spotOf.set(name, taken.key)
-    thread.worker.postMessage({ type: 'goto', bot: name, spot: taken.spot })
+    // Gone with an older formation: nothing waits on these.
+    const formation = formations.get(report.formation)
+    if (!formation) return
+    formation.candidates = report.candidates
+    if (bots.has(formation.leader)) goto(formation, formation.leader)
+    else releaseFormation(formation)
+  } else if (report.planned !== undefined) {
+    // A leader with its path to its spot (or none to find): the rest of its formation walks.
+    for (const formation of formations.values()) {
+      const spot = formation.leaderSpot
+      if (formation.released || formation.leader !== report.bot || !spot || !report.planned) continue
+      if (spot.x === report.planned.x && spot.y === report.planned.y && spot.z === report.planned.z) releaseFormation(formation)
+    }
+  } else if (report.path) {
+    // Into the book of every other thread; the bot's own already has it.
+    for (const other of threads) {
+      if (other !== thread) other.worker.postMessage({ type: 'path', world: report.path.world, nodes: report.path.nodes })
+    }
   } else if (report.end) {
-    release(report.bot)
+    leaveSpot(report.bot)
     bots.delete(report.bot)
+    worldOf.delete(report.bot)
+    waiting.delete(report.bot)
+    // A leader gone before its path: the rest of its formation walks without it.
+    for (const formation of formations.values()) {
+      if (!formation.released && formation.leader === report.bot && formation.candidates) releaseFormation(formation)
+    }
     thread.bots--
     if (closing && bots.size === 0) process.exit(0)
   } else {
@@ -111,7 +190,7 @@ socket.on('data', protocol.frames(frame => {
       break
     case protocol.TYPES.FORMATION:
       // Same: a bot already gone has no spot to take. Its old spot goes once it takes the new one.
-      bots.get(message.bot)?.worker.postMessage({ type: 'formation', bot: message.bot, target: { x: message.x, y: message.y, z: message.z } })
+      if (bots.has(message.bot)) formationOrder(message.bot, { id: message.id, target: { x: message.x, y: message.y, z: message.z } })
       break
   }
 }))

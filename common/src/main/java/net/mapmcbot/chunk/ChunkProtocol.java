@@ -51,7 +51,10 @@ public final class ChunkProtocol {
 	public static final int SPAWN = 17;
 	/** bot name. */
 	public static final int QUIT = 18;
-	/** bot name, i32 x, i32 y, i32 z: the block to stand on, or the nearest free one next to it. */
+	/**
+	 * bot name, i32 formation id, i32 x, i32 y, i32 z: the block to stand on, or the nearest free one
+	 * next to it. One id per #formation, higher than the last: the fleet works the spots out once per id.
+	 */
 	public static final int FORMATION = 19;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
@@ -239,11 +242,12 @@ public final class ChunkProtocol {
 		return frame.bytes();
 	}
 
-	public static byte[] formation(String bot, int x, int y, int z) {
+	public static byte[] formation(String bot, int id, int x, int y, int z) {
 		final Frame frame = new Frame(FORMATION);
 
 		try {
 			writeString(frame.out, bot);
+			frame.out.writeInt(id);
 			frame.out.writeInt(x);
 			frame.out.writeInt(y);
 			frame.out.writeInt(z);

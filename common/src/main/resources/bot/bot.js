@@ -8,10 +8,12 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
 const serialize = require('./serializer')
+const { communalPlanner } = require('./communalPaths')
 
-// send(frame) writes to the mod, onEnd() once the bot is gone and its last frame sent; chunks holds
-// the columns of its thread (see sharedChunks.js).
-module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
+// send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
+// its last frame sent; chunks and paths hold the columns and the paths of its thread (see
+// sharedChunks.js, communalPaths.js).
+module.exports = function startBot ({ name, host, port, chunks, paths, send, report, onEnd }) {
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
   chunks.attach(bot, name, server)
@@ -40,6 +42,9 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
     return d.includes(':') ? d : `minecraft:${d}`
   }
 
+  // Where the bot is: "server|dimension".
+  const world = () => `${server}|${dimension()}`
+
   function held (x, z) {
     const column = columns.get(`${x >> 4},${z >> 4}`)
     if (!column) throw new Error(`${name}: change at ${x},${z} in a column it never claimed`)
@@ -47,15 +52,19 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
   }
 
   bot.loadPlugin(pathfinder)
-  let spawned = false
-  const onSpawn = []
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
+    // The fleet passes each path found on to the other threads, and starts a formation's other
+    // bots once its first one has its path (see fleet.js).
+    bot.pathfinder.getPathTo = communalPlanner(bot, paths, world, (goal, nodes) => {
+      report({ planned: goal })
+      if (nodes) report({ path: { world: world(), nodes } })
+    })
     log('spawned')
     out(protocol.botSpawned(name))
-    spawned = true
-    for (const run of onSpawn.splice(0)) run()
   })
+  // Every spawn, the first and each respawn or change of dimension: the fleet keeps where each bot is.
+  bot.on('spawn', () => report({ world: world() }))
   // The mod draws the path being walked and its target; an empty PATH clears it.
   const goalOf = () => {
     const g = bot.pathfinder.goal
@@ -67,7 +76,11 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))
   })
-  bot.on('goal_reached', () => out(protocol.path(name, null)))
+  bot.on('goal_reached', goal => {
+    out(protocol.path(name, null))
+    // Already there: no path to find, for the formation waiting on it either.
+    report({ planned: goal && goal.x !== undefined ? { x: goal.x, y: goal.y, z: goal.z } : null })
+  })
   bot.on('path_stop', () => out(protocol.path(name, null)))
   bot.on('path_reset', () => out(protocol.path(name, null)))
 
@@ -138,6 +151,9 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
   })
 
   bot.on('end', reason => {
+    // mineflayer's dig timer outlives the connection: it would set the block to air in a world, and
+    // shared columns, this bot no longer holds.
+    bot.stopDigging()
     log('disconnected: ' + reason)
     flush()
     columns.clear()
@@ -153,11 +169,9 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
 
     spot: () => formationSpot,
 
-    // Runs now if the bot is in the world, else on its spawn.
-    whenSpawned: run => spawned ? run() : onSpawn.push(run),
-
     // The block and the standable ones around it, nearest first (breadth first, one step sideways
-    // and up to one up or down), each with its key: "server|dimension|x,y,z".
+    // and up to one up or down), each with its key: "server|dimension|x,y,z". Asked of one bot per
+    // formation; the fleet hands the spots out to all of its bots (see fleet.js).
     formationCandidates ({ x, y, z }) {
       const target = new Vec3(x, y, z)
       if (!bot.blockAt(target)) throw new Error(`${name}: formation target ${x},${y},${z} is not loaded`)
@@ -166,7 +180,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
       const queue = [target]
       for (let i = 0; i < queue.length && i < 4096; i++) {
         const p = queue[i]
-        if (standable(p)) candidates.push({ spot: { x: p.x, y: p.y, z: p.z }, key: `${server}|${dimension()}|${p.x},${p.y},${p.z}` })
+        if (standable(p)) candidates.push({ spot: { x: p.x, y: p.y, z: p.z }, key: `${world()}|${p.x},${p.y},${p.z}` })
         for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
           for (const dy of [0, 1, -1]) {
             const n = p.offset(dx, dy, dz)

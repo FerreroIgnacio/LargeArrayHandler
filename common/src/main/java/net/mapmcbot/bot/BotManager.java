@@ -3,6 +3,7 @@ package net.mapmcbot.bot;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -39,7 +40,7 @@ import net.mapmcbot.chunk.ChunkProtocol;
  * the fleet), on its own thread so the game never waits on it.
  */
 public final class BotManager implements ChunkChannel {
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
@@ -62,7 +63,11 @@ public final class BotManager implements ChunkChannel {
 	private volatile OutputStream out;
 	private volatile Thread reader;
 
-	/** Every frame through the socket, one line each, in socket.log of the fleet's folder. */
+	/**
+	 * Every frame through the socket, one line each, in socket.log of the fleet's folder. Buffered and
+	 * written out when the fleet goes away or the game exits, never per frame: a flush per frame held
+	 * up the reader and, in send, the write lock.
+	 */
 	private volatile PrintWriter socketLog;
 
 	public BotManager(File directory) {
@@ -110,13 +115,16 @@ public final class BotManager implements ChunkChannel {
 		thread.start();
 	}
 
-	/** The bot walks to x,y,z, or next to it when another bot holds that block. */
-	public void formation(final String name, final int x, final int y, final int z) {
+	/**
+	 * The bot walks to x,y,z, or next to it when another bot holds that block. `id` is the
+	 * formation's, the same for every bot sent to it and higher than any before.
+	 */
+	public void formation(final String name, final int id, final int x, final int y, final int z) {
 		if (!bots.contains(name)) {
 			throw new IllegalStateException("formation for " + name + ": no such bot");
 		}
 
-		send(ChunkProtocol.formation(name, x, y, z));
+		send(ChunkProtocol.formation(name, id, x, y, z));
 	}
 
 	/** Each bot leaves; its chunks are released when the fleet reports it gone. The fleet stays up. */
@@ -178,7 +186,7 @@ public final class BotManager implements ChunkChannel {
 			}
 		}
 
-		socketLog = new PrintWriter(new OutputStreamWriter(new FileOutputStream(new File(directory, "socket.log"), false), StandardCharsets.UTF_8));
+		socketLog = new PrintWriter(new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory, "socket.log"), false), StandardCharsets.UTF_8), 1 << 16));
 		final ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
 		final Process process = new ProcessBuilder("node", "fleet.js", Integer.toString(server.getLocalPort()))
 				.directory(directory).redirectErrorStream(true).start();
@@ -278,6 +286,8 @@ public final class BotManager implements ChunkChannel {
 			failure = e;
 		}
 
+		flushSocketLog();
+
 		// Every bot went with the fleet, on purpose or not.
 		bots.clear();
 		spawned.clear();
@@ -303,7 +313,15 @@ public final class BotManager implements ChunkChannel {
 
 		synchronized (socketLog) {
 			socketLog.println(direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
-			socketLog.flush();
+		}
+	}
+
+	/** Writes out what socket.log holds (checkError flushes); PrintWriter keeps its write errors to itself, so one is thrown here. */
+	private void flushSocketLog() {
+		synchronized (socketLog) {
+			if (socketLog.checkError()) {
+				throw new UncheckedIOException(new IOException("could not write socket.log in " + directory));
+			}
 		}
 	}
 
@@ -333,6 +351,8 @@ public final class BotManager implements ChunkChannel {
 		} catch (InterruptedException e) {
 			throw new IllegalStateException("interrupted waiting for the bot fleet reader", e);
 		}
+
+		flushSocketLog();
 	}
 
 	/** Overwrites only what changed, so a mod update reaches the scripts without touching the rest. */

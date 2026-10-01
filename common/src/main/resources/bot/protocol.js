@@ -235,7 +235,7 @@ function decode (frame) {
       message = { type, bot: r.str() }
       break
     case TYPES.FORMATION:
-      message = { type, bot: r.str(), x: r.i32(), y: r.i32(), z: r.i32() }
+      message = { type, bot: r.str(), id: r.i32(), x: r.i32(), y: r.i32(), z: r.i32() }
       break
     default:
       throw new Error(`unknown message type ${type} from the mod`)
