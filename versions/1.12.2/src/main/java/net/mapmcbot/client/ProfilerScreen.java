@@ -326,19 +326,18 @@ public class ProfilerScreen extends Screen {
 	}
 
 	private Table threadTable(final ProfileReport r) {
-		final Table table = new Table(new String[] {"Thread", "CPU", "Loop busy", "GC", "Heap", "Allocated", "CPU total", "Load"},
-				new int[] {30, 9, 9, 9, 12, 12, 10, 12});
+		final Table table = new Table(new String[] {"Thread", "CPU", "GC", "Heap", "Allocated", "CPU total", "Load"},
+				new int[] {30, 9, 9, 12, 12, 10, 12});
 
 		if (r.row("node", "mem.rss") != null) {
 			table.rows.add(new String[] {null, "Fleet (node)"});
 
 			for (String scope : r.scopes("node.thread:")) {
-				final double cpu = r.rate(scope, "cpu.user") + r.rate(scope, "cpu.system");
 				final String load = r.row(scope, "bots") != null ? (int) r.value(scope, "bots") + " bots"
 						: r.row(scope, "queue") != null ? (int) r.value(scope, "queue") + " queued" : (int) r.value(scope, "columns") + " cols";
-				table.rows.add(new String[] {scope.substring("node.thread:".length()), pct(cpu), pct(r.rate(scope, "loop.active")), pct(r.rate(scope, "gc.time")),
-						bytes(r.value(scope, "mem.heapUsed")) + "/" + bytes(r.value(scope, "mem.heapTotal")), "-",
-						seconds(r.value(scope, "cpu.user") + r.value(scope, "cpu.system")), load});
+				// Node: the time the thread's event loop was busy (see profiler.js).
+				table.rows.add(new String[] {scope.substring("node.thread:".length()), pct(r.rate(scope, "cpu")), pct(r.rate(scope, "gc.time")),
+						bytes(r.value(scope, "mem.heapUsed")) + "/" + bytes(r.value(scope, "mem.heapTotal")), "-", seconds(r.value(scope, "cpu")), load});
 			}
 		}
 
@@ -353,7 +352,7 @@ public class ProfilerScreen extends Screen {
 		});
 
 		for (String scope : threads) {
-			table.rows.add(new String[] {scope.substring("java.thread:".length()), pct(r.rate(scope, "cpu")), "-", "-", "-",
+			table.rows.add(new String[] {scope.substring("java.thread:".length()), pct(r.rate(scope, "cpu")), "-", "-",
 					perSecond(r.rate(scope, "alloc"), true), seconds(r.value(scope, "cpu")), ""});
 		}
 

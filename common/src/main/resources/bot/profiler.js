@@ -10,16 +10,6 @@
 //   B: bytes now, #: how many now, %: a percentage now
 const { performance, PerformanceObserver } = require('perf_hooks')
 
-if (typeof process.threadCpuUsage !== 'function') {
-  throw new Error(`node ${process.version} has no process.threadCpuUsage: the profiler needs node 22.19 or later`)
-}
-
-// CPU time of the calling thread so far, user and system, in ms.
-function threadCpu () {
-  const { user, system } = process.threadCpuUsage()
-  return { user: user / 1000, system: system / 1000 }
-}
-
 // Garbage collections of the calling thread, counted as they happen: { count, ms }.
 function watchGc () {
   const gc = { count: 0, ms: 0 }
@@ -33,17 +23,16 @@ function watchGc () {
 }
 
 // One per thread: its CPU, event loop and heap when asked for (rows), its garbage collections as they happen.
+// A thread's CPU is the time its event loop was busy (event loop utilization): node has no CPU time
+// per thread before 22.19 (process.threadCpuUsage). The process's whole CPU is exact (see fleet.js).
 function threadProfiler (scope) {
   const gc = watchGc()
   return {
     rows (extra = []) {
-      const cpu = threadCpu()
       const elu = performance.eventLoopUtilization()
       const memory = process.memoryUsage()
       return [
-        [scope, 'cpu.user', 'ms', cpu.user],
-        [scope, 'cpu.system', 'ms', cpu.system],
-        [scope, 'loop.active', 'ms', elu.active],
+        [scope, 'cpu', 'ms', elu.active],
         [scope, 'gc.time', 'ms', gc.ms],
         [scope, 'gc.count', 'n', gc.count],
         [scope, 'mem.heapUsed', 'B', memory.heapUsed],
