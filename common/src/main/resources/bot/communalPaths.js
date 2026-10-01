@@ -2,7 +2,9 @@
 // bots close together heading about the same place would find about the same path, so the
 // second joins the first's instead of searching the whole way. A path joins when it passes near
 // the bot (JOIN_NEAR) and ends near its goal (NEAR_GOAL): the search covers only the few blocks to
-// it, follows it while each move still holds in the world, and searches the rest.
+// it, follows it while each move still holds in the world, and searches the rest. A path found
+// broken as it is followed is cut where it breaks, and goes on the way the rest was found, for
+// every path thread (see plan).
 //
 // Bounded by distance (SEARCH_RADIUS) and by nodes expanded (MAX_EXPANDED), never by time.
 const AStar = require('mineflayer-pathfinder/lib/astar')
@@ -18,27 +20,61 @@ const SEARCH_RADIUS = 64
 // Nodes a search expands at most: past it the search gives up with the nearest it got (noPath).
 const MAX_EXPANDED = 10000
 
-// The paths of one path thread, per world ("server|dimension"): each an Int32Array x, y, z per node.
-function pathBook () {
+// The paths of the fleet as one path thread has them, per world ("server|dimension"): id -> an
+// Int32Array x, y, z per node, oldest first. Each path has the id its path thread gave it
+// ("thread:n"): the paths this thread finds or cuts go to the rest with `share(world, id, nodes)`
+// (through the fleet, see pathThread.js), theirs come in with `apply`. Two threads cutting the same
+// path at once may end up each with the other's cut: each one a path that held when it was cut.
+//
+// Possible optimization, for later: a path is checked only as it is followed, so one that still
+// holds but is no longer the best way (a bridge built, a wall dug through since) keeps being joined.
+// Dropping the paths through a column when one of its blocks changes (the fleet hears of it, see
+// bot.js's markChanged) would leave the search to find the better way.
+function pathBook (thread, share) {
   const worlds = new Map()
+  let next = 0
+
+  // Too short to join (fewer than two nodes): gone. Not here (gone as the oldest, or never in):
+  // in as the newest.
+  function put (world, id, nodes) {
+    if (nodes.length % 3 !== 0) throw new Error(`a path of ${nodes.length} coordinates is not whole nodes`)
+    let paths = worlds.get(world)
+    if (!paths) worlds.set(world, (paths = new Map()))
+    if (nodes.length < 6) {
+      paths.delete(id)
+      return
+    }
+    paths.set(id, nodes)
+    if (paths.size > KEPT) paths.delete(paths.keys().next().value)
+  }
 
   return {
+    // A path this thread found.
     add (world, nodes) {
       if (nodes.length % 3 !== 0) throw new Error(`a path of ${nodes.length} coordinates is not whole nodes`)
       if (nodes.length < 6) return
-      let paths = worlds.get(world)
-      if (!paths) worlds.set(world, (paths = []))
-      paths.push(nodes)
-      if (paths.length > KEPT) paths.shift()
+      const id = `${thread}:${next++}`
+      put(world, id, nodes)
+      share(world, id, nodes)
     },
 
+    // A path of the book as this thread found it now: broken on from some node, its nodes up to it
+    // (and the way on, if found).
+    cut (world, id, nodes) {
+      put(world, id, nodes)
+      share(world, id, nodes)
+    },
+
+    // A path another thread found or cut.
+    apply: put,
+
     // The nodes near `start` worth joining on the way to `goal` (a pathfinder goal with a position):
-    // node hash -> { nodes, from, to, left }, the path to follow from node `from` to node `to`, its
-    // nearest to the goal, `left` from there.
+    // node hash -> { id, nodes, from, to, left }, the path to follow from node `from` to node `to`,
+    // its nearest to the goal, `left` from there.
     joinsToward (world, start, goal) {
       const joins = new Map()
       const point = { x: 0, y: 0, z: 0 }
-      for (const nodes of worlds.get(world) ?? []) {
+      for (const [id, nodes] of worlds.get(world) ?? []) {
         const count = nodes.length / 3
         let to = 0
         let left = Infinity
@@ -61,7 +97,7 @@ function pathBook () {
           const hash = `${x},${y},${z}`
           const known = joins.get(hash)
           // The one that leaves the least to walk.
-          if (!known || to - from + left < known.to - known.from + known.left) joins.set(hash, { nodes, from, to, left })
+          if (!known || to - from + left < known.to - known.from + known.left) joins.set(hash, { id, nodes, from, to, left })
         }
       }
       return joins
@@ -97,9 +133,19 @@ function search (start, movements, goal) {
   return result
 }
 
+// `nodes` (an Int32Array x, y, z per node) with the nodes of the Moves `moves` after them.
+function withMoves (nodes, moves) {
+  const all = new Int32Array(nodes.length + moves.length * 3)
+  all.set(nodes)
+  moves.forEach((m, i) => all.set([m.x, m.y, m.z], nodes.length + i * 3))
+  return all
+}
+
 // The path from the Move `start` to `goal` in `world`, joining a path of `book` when one fits;
-// what was found goes into the book. { status, exhausted, visitedNodes, generatedNodes, path: [Move],
-// nodes: Int32Array of the path, start included, when found }.
+// what was found goes into the book. A joined path that breaks as it is followed is cut in the book
+// at the last node that holds, and goes on the way the rest of the search found to the goal, if it
+// did (what it had past where it broke is gone: past the node nearest the goal no search checked it).
+// { status, exhausted, visitedNodes, generatedNodes, path: [Move] }.
 function plan (book, world, start, movements, goal) {
   // Goals with a position (GoalBlock, GoalNear...) can join a path; any other searches it all.
   const positioned = goal.x !== undefined && goal.y !== undefined && goal.z !== undefined
@@ -118,9 +164,13 @@ function plan (book, world, start, movements, goal) {
   const reached = path.length > 0 ? path[path.length - 1] : start
   if (status === 'success' && !goal.isEnd(reached)) {
     // Joined a path: along it, then the rest of the way.
-    const along = follow(movements, reached, joins.get(reached.hash))
+    const join = joins.get(reached.hash)
+    const along = follow(movements, reached, join)
     path.push(...along)
     const from = along.length > 0 ? along[along.length - 1] : reached
+    // Broken past node `held`: cut there, kept up to it.
+    const held = join.from + along.length
+    let kept = held < join.to ? join.nodes.slice(0, (held + 1) * 3) : null
     if (!goal.isEnd(from)) {
       const rest = search(from, movements, goal)
       path.push(...rest.path)
@@ -128,16 +178,14 @@ function plan (book, world, start, movements, goal) {
       exhausted = rest.exhausted
       visitedNodes += rest.visitedNodes
       generatedNodes += rest.generatedNodes
+      // The way on from where it broke.
+      if (kept && rest.status === 'success') kept = withMoves(kept, rest.path)
     }
+    if (kept) book.cut(world, join.id, kept)
   }
 
-  let nodes = null
-  if (status === 'success') {
-    nodes = new Int32Array((path.length + 1) * 3)
-    ;[start, ...path].forEach((node, i) => nodes.set([node.x, node.y, node.z], i * 3))
-    book.add(world, nodes)
-  }
-  return { status, exhausted, visitedNodes, generatedNodes, path, nodes }
+  if (status === 'success') book.add(world, withMoves(new Int32Array([start.x, start.y, start.z]), path))
+  return { status, exhausted, visitedNodes, generatedNodes, path }
 }
 
 module.exports = { pathBook, plan, MAX_EXPANDED }

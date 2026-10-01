@@ -21,7 +21,8 @@ const scope = `node.thread:path:${workerData.index}`
 const prof = threadProfiler(scope)
 // Bot -> what its searches on this thread took: { ms, searches, nodes }.
 const searched = new Map()
-const book = pathBook()
+// The fleet's paths: those this thread finds or cuts go to the other path threads through the fleet.
+const book = pathBook(workerData.index, (world, id, nodes) => parentPort.postMessage({ path: { world, id, nodes } }))
 // "server|dimension" -> "cx,cz" -> column: the fleet's columns.
 const worlds = new Map()
 // Minecraft version -> { Column, movements, bot }: the stand-in bot pathfinder's Movements reads.
@@ -150,8 +151,6 @@ function search (request) {
   if (found.visitedNodes > LOG_SEARCH_NODES) {
     console.log(`[path thread ${workerData.index}] ${found.visitedNodes} nodes in ${Math.round(took)} ms (${found.status}), ${queue.length} waiting`)
   }
-  // The other path threads join it too.
-  if (found.nodes) parentPort.postMessage({ path: { world: request.world, nodes: found.nodes } })
   return {
     id: request.id,
     status: found.status,
@@ -223,7 +222,8 @@ parentPort.on('message', message => {
       break
     }
     case 'path':
-      book.add(message.world, message.nodes)
+      // Found or cut by another path thread.
+      book.apply(message.world, message.id, message.nodes)
       break
     case 'profile': {
       const rows = prof.rows([[scope, 'queue', '#', queue.length], [scope, 'parked', '#', parked.size]])

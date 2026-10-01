@@ -96,7 +96,7 @@ function formationOrder (name, order) {
 }
 
 // The path threads: every column goes to each of them as it comes and goes, and every path one
-// of them finds, to the others. Pool threads ask them over ports of their own (see startThread).
+// of them finds or cuts, to the others. Pool threads ask them over ports of their own (see startThread).
 const PATH_THREADS = 3
 const pathThreads = []
 for (let i = 0; i < PATH_THREADS; i++) {
@@ -116,7 +116,7 @@ for (let i = 0; i < PATH_THREADS; i++) {
     }
     if (!message.path) throw new Error('unknown message from a path thread')
     for (const other of pathThreads) {
-      if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, nodes: message.path.nodes })
+      if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, id: message.path.id, nodes: message.path.nodes })
     }
   })
   worker.on('error', err => { throw err })
