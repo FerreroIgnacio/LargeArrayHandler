@@ -66,10 +66,16 @@ public final class BotManager implements ChunkChannel {
 
 	/**
 	 * Every frame through the socket, one line each, in socket.log of the fleet's folder. Buffered and
-	 * written out when the fleet goes away or the game exits, never per frame: a flush per frame held
-	 * up the reader and, in send, the write lock.
+	 * written out every SOCKET_LOG_LINES lines, when the fleet goes away and when the game exits, never
+	 * per frame: a flush per frame held up the reader and, in send, the write lock. A game killed
+	 * outright loses at most the last SOCKET_LOG_LINES lines.
 	 */
 	private volatile PrintWriter socketLog;
+
+	private static final int SOCKET_LOG_LINES = 1000;
+
+	/** Lines in socket.log since it was last written out; guarded by socketLog. */
+	private int socketLogPending;
 
 	public BotManager(File directory) {
 		this.directory = directory;
@@ -323,12 +329,18 @@ public final class BotManager implements ChunkChannel {
 
 		synchronized (socketLog) {
 			socketLog.println(LocalTime.now() + " " + direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
+
+			if (++socketLogPending >= SOCKET_LOG_LINES) {
+				flushSocketLog();
+			}
 		}
 	}
 
 	/** Writes out what socket.log holds (checkError flushes); PrintWriter keeps its write errors to itself, so one is thrown here. */
 	private void flushSocketLog() {
 		synchronized (socketLog) {
+			socketLogPending = 0;
+
 			if (socketLog.checkError()) {
 				throw new UncheckedIOException(new IOException("could not write socket.log in " + directory));
 			}

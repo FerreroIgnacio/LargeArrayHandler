@@ -71,7 +71,7 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     return g && g.x !== undefined ? { x: g.x, y: g.y, z: g.z } : null
   }
   bot.on('path_update', result => {
-    if (result.status === 'noPath') log('formation: no path')
+    if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))

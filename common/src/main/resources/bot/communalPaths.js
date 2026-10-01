@@ -6,7 +6,9 @@
 // and, through the fleet, into the book of every other thread (see fleet.js).
 //
 // Replaces mineflayer-pathfinder's getPathTo, which its movement loop calls whenever it needs a
-// path: the search runs to the end in one go, bounded by distance (SEARCH_RADIUS), not by time.
+// path: the search runs to the end in one go, bounded by distance (SEARCH_RADIUS) and by how many
+// nodes it expands (MAX_EXPANDED), never by time. A search that goes on blocks every bot of its
+// thread, keepalives included.
 const AStar = require('mineflayer-pathfinder/lib/astar')
 const Move = require('mineflayer-pathfinder/lib/move')
 const { Vec3 } = require('vec3')
@@ -19,6 +21,8 @@ const JOIN_NEAR = 6
 const NEAR_GOAL = 8
 // How much costlier than the straight distance a search may get (pathfinder's searchRadius).
 const SEARCH_RADIUS = 64
+// Nodes a search expands at most: past it the search gives up with the nearest it got (noPath).
+const MAX_EXPANDED = 10000
 
 // The paths of one pool thread, per world ("server|dimension"): each an Int32Array x, y, z per node.
 function pathBook () {
@@ -88,8 +92,15 @@ function follow (movements, start, { nodes, from, to }) {
   return moves
 }
 
+// A* from start to goal, giving up once it expanded MAX_EXPANDED nodes: past that every node is a
+// dead end, so the open set drains at once. `exhausted` tells that apart from a real noPath.
 function search (start, movements, goal) {
-  return new AStar(start, movements, goal, Infinity, Infinity, SEARCH_RADIUS).compute()
+  let expanded = 0
+  const budgeted = Object.create(movements)
+  budgeted.getNeighbors = node => ++expanded > MAX_EXPANDED ? [] : movements.getNeighbors(node)
+  const result = new AStar(start, budgeted, goal, Infinity, Infinity, SEARCH_RADIUS).compute()
+  result.exhausted = expanded > MAX_EXPANDED
+  return result
 }
 
 // getPathTo(movements, goal) for the bot, drawing on `book` for the bot's world `world()`;
@@ -168,6 +179,11 @@ function communalPlanner (bot, book, world, onPath) {
 
     // Goals with a position (GoalBlock, GoalNear...) can join a path; any other searches it all.
     const positioned = goal.x !== undefined && goal.y !== undefined && goal.z !== undefined
+    // Nothing to walk on there: no search would find it, after searching everything it may.
+    if (positioned && !bot.blockAt(new Vec3(goal.x, goal.y, goal.z))) {
+      onPath({ x: goal.x, y: goal.y, z: goal.z }, null)
+      return { status: 'noPath', reason: 'target not loaded', cost: 0, time: performance.now() - began, visitedNodes: 0, generatedNodes: 0, path: [] }
+    }
     const joins = positioned ? book.joinsToward(world(), start, goal) : new Map()
     // A node to join counts as nothing left to go, so the search takes the nearest one first.
     const toward = joins.size === 0
@@ -177,6 +193,7 @@ function communalPlanner (bot, book, world, onPath) {
     const first = search(start, movements, toward)
     const path = first.path
     let status = first.status
+    let exhausted = first.exhausted
     let visitedNodes = first.visitedNodes
     let generatedNodes = first.generatedNodes
     const reached = path.length > 0 ? path[path.length - 1] : start
@@ -189,6 +206,7 @@ function communalPlanner (bot, book, world, onPath) {
         const rest = search(from, movements, goal)
         path.push(...rest.path)
         status = rest.status
+        exhausted = rest.exhausted
         visitedNodes += rest.visitedNodes
         generatedNodes += rest.generatedNodes
       }
@@ -204,6 +222,7 @@ function communalPlanner (bot, book, world, onPath) {
 
     return {
       status,
+      reason: status !== 'success' && exhausted ? `gave up after ${MAX_EXPANDED} nodes` : undefined,
       cost: path.reduce((sum, node) => sum + node.cost, 0),
       time: performance.now() - began,
       visitedNodes,
