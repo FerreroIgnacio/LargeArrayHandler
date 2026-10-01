@@ -1,26 +1,9 @@
-// Worker thread: turns a prismarine-chunk column (as toJson) into a ready CHUNK_DATA frame, off
-// the fleet's main thread.
-const { parentPort } = require('worker_threads')
 const nbt = require('prismarine-nbt')
 const { Vec3 } = require('vec3')
-const protocol = require('./protocol')
 const states = require('./states')
 
-const versions = new Map()
-
-function forVersion (version) {
-  let tools = versions.get(version)
-  if (!tools) {
-    const registry = require('prismarine-registry')(version)
-    tools = { Chunk: require('prismarine-chunk')(registry), ...states(registry) }
-    versions.set(version, tools)
-  }
-  return tools
-}
-
-function serialize ({ version, column }) {
-  const { Chunk, stateName } = forVersion(version)
-  const chunk = Chunk.fromJson(column)
+// A loaded prismarine-chunk column as the payload of a CHUNK_DATA frame; stateName from states.js.
+module.exports = function serialize (chunk, stateName) {
   const minY = chunk.minY ?? 0
   const height = chunk.worldHeight ?? 256
   const pos = new Vec3(0, 0, 0)
@@ -66,8 +49,3 @@ function serialize ({ version, column }) {
 
   return { minY, height, sections, blockEntities }
 }
-
-parentPort.on('message', job => {
-  const frame = protocol.chunkData(job.bot, job.key, job.version, serialize(job))
-  parentPort.postMessage({ id: job.id, frame })
-})

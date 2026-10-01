@@ -1,6 +1,8 @@
 package net.mapmcbot.client;
 
 import java.io.File;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -12,6 +14,9 @@ import net.mapmcbot.chunk.ChunkSnapshotStore;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.scoreboard.Scoreboard;
+import net.minecraft.scoreboard.Team;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import org.lwjgl.input.Keyboard;
@@ -22,6 +27,9 @@ import org.lwjgl.input.Keyboard;
  */
 public class MapMcBotClient implements ClientModInitializer {
 	private static final String CATEGORY = "key.categories.mapmcbot";
+
+	/** Each bot's colour, given the first time it is asked for and kept for the session. */
+	private static final Map<String, Color> BOT_COLORS = new ConcurrentHashMap<String, Color>();
 
 	private static KeyBinding areasKey;
 
@@ -60,6 +68,62 @@ public class MapMcBotClient implements ClientModInitializer {
 		}
 
 		AreaPick.tick(client);
+		glowBots(client);
+	}
+
+	/** Every bot glows through walls, coloured by the scoreboard team it is put on. */
+	private static void glowBots(MinecraftClient client) {
+		if (bots == null || bots.getBots().isEmpty()) {
+			return;
+		}
+
+		final Scoreboard scoreboard = client.world.getScoreboard();
+
+		for (PlayerEntity player : client.world.playerEntities) {
+			final String name = player.getEntityName();
+
+			if (!bots.getBots().contains(name)) {
+				continue;
+			}
+
+			final Color color = colorOf(name);
+			final String teamName = "mapmcbot_" + color.name().toLowerCase();
+			Team team = scoreboard.getTeam(teamName);
+
+			if (team == null) {
+				team = scoreboard.addTeam(teamName);
+				team.setFormatting(color.getFormatting());
+			}
+
+			if (scoreboard.getPlayerTeam(name) != team) {
+				scoreboard.addPlayerToTeam(name, teamName);
+			}
+
+			player.setGlowing(true);
+		}
+	}
+
+	/** The bot's colour; a new bot takes the next one in turn, so the first few never share one. */
+	public static Color colorOf(String bot) {
+		return BOT_COLORS.computeIfAbsent(bot, name -> Color.values()[BOT_COLORS.size() % Color.values().length]);
+	}
+
+	/** A chat line for the mod: #formation sends every bot to the block the player stands on. False when it is not one. */
+	public static boolean command(String line) {
+		if (!line.equals("#formation")) {
+			return false;
+		}
+
+		final MinecraftClient client = MinecraftClient.getInstance();
+		final int x = (int) Math.floor(client.player.x);
+		final int y = (int) Math.floor(client.player.y);
+		final int z = (int) Math.floor(client.player.z);
+
+		for (String bot : bots().getBots()) {
+			bots().formation(bot, x, y, z);
+		}
+
+		return true;
 	}
 
 	private static void leaveWorld() {
@@ -109,6 +173,11 @@ public class MapMcBotClient implements ClientModInitializer {
 			chunks = new ChunkRegistry(bots, new ChunkSnapshotStore(new File(directory, "chunks")));
 		}
 
+		return bots;
+	}
+
+	/** The bots, or null while none was ever started. */
+	public static BotManager botsOrNull() {
 		return bots;
 	}
 

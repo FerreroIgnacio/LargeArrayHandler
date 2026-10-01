@@ -9,6 +9,8 @@ const TYPES = {
   BLOCK_ENTITY_UPDATE: 4,
   UNLOAD: 5,
   BOT_GONE: 6,
+  PATH: 7,
+  BOT_SPAWNED: 8,
   // mod -> fleet
   REQUEST_CHUNK: 16,
   SPAWN: 17,
@@ -192,6 +194,31 @@ function botGone (bot) {
   return w.frame()
 }
 
+function botSpawned (bot) {
+  const w = new Writer(TYPES.BOT_SPAWNED)
+  w.str(bot)
+  return w.frame()
+}
+
+// The path the bot is walking: target {x, y, z} and nodes [{x, y, z}]; null when it is not walking one.
+function path (bot, target, nodes) {
+  const w = new Writer(TYPES.PATH)
+  w.str(bot)
+  w.u8(target ? 1 : 0)
+  if (target) {
+    w.i32(target.x)
+    w.i32(target.y)
+    w.i32(target.z)
+    w.i32(nodes.length)
+    for (const n of nodes) {
+      w.i32(Math.floor(n.x))
+      w.i32(Math.floor(n.y))
+      w.i32(Math.floor(n.z))
+    }
+  }
+  return w.frame()
+}
+
 // A mod -> fleet frame (without its length) as an object.
 function decode (frame) {
   const r = new Reader(frame)
@@ -232,4 +259,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, chunkData, blockUpdate, blockEntityUpdate, unload, botGone, decode, frames }
+module.exports = { TYPES, claim, chunkData, blockUpdate, blockEntityUpdate, unload, botGone, botSpawned, path, decode, frames }

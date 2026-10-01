@@ -7,20 +7,21 @@ const { Vec3 } = require('vec3')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
+const serialize = require('./serializer')
 
-// send(frame) writes to the mod, serialize(job) resolves to a CHUNK_DATA frame, onEnd() once the bot is gone.
-module.exports = function startBot ({ name, host, port, send, serialize, onEnd }) {
+// send(frame) writes to the mod, onEnd() once the bot is gone and its last frame sent; chunks holds
+// the columns of its thread (see sharedChunks.js).
+module.exports = function startBot ({ name, host, port, chunks, send, onEnd }) {
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
+  chunks.attach(bot, name, server)
   const log = line => console.log(`[${name}] ${line}`)
 
   // "cx,cz" -> { key, claim }: the columns claimed and not unloaded, with the dimension they were claimed in.
   const columns = new Map()
   let nextClaim = 1
 
-  // Everything goes out through this chain, so a frame waiting on a worker keeps its place.
-  let chain = Promise.resolve()
-  const out = frame => { chain = chain.then(() => frame).then(send) }
+  const out = send
 
   // Block updates of one event loop turn, per column, sent as one message (a multi block change is
   // many updates in one packet). Flushed before anything else goes out, to keep the order.
@@ -46,11 +47,29 @@ module.exports = function startBot ({ name, host, port, send, serialize, onEnd }
   }
 
   bot.loadPlugin(pathfinder)
+  let spawned = false
+  const onSpawn = []
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
     log('spawned')
+    out(protocol.botSpawned(name))
+    spawned = true
+    for (const run of onSpawn.splice(0)) run()
   })
-  bot.on('path_update', result => { if (result.status === 'noPath') log('formation: no path') })
+  // The mod draws the path being walked and its target; an empty PATH clears it.
+  const goalOf = () => {
+    const g = bot.pathfinder.goal
+    return g && g.x !== undefined ? { x: g.x, y: g.y, z: g.z } : null
+  }
+  bot.on('path_update', result => {
+    if (result.status === 'noPath') log('formation: no path')
+    const target = goalOf()
+    if (result.status === 'noPath' || !target) out(protocol.path(name, null))
+    else out(protocol.path(name, target, result.path))
+  })
+  bot.on('goal_reached', () => out(protocol.path(name, null)))
+  bot.on('path_stop', () => out(protocol.path(name, null)))
+  bot.on('path_reset', () => out(protocol.path(name, null)))
 
   // Feet and head free, something solid below.
   function standable (p) {
@@ -126,23 +145,28 @@ module.exports = function startBot ({ name, host, port, send, serialize, onEnd }
     onEnd()
   })
 
+  // Where this bot was last sent to stand in a formation: {x, y, z}, null until it is.
+  let formationSpot = null
+
   return {
     quit: () => bot.quit(),
 
-    // Walks to the block, or to the nearest standable one around it that free(key) accepts
-    // (breadth first, one step sideways and up to one up or down). Returns the key of the spot taken.
-    formation ({ x, y, z }, free) {
+    spot: () => formationSpot,
+
+    // Runs now if the bot is in the world, else on its spawn.
+    whenSpawned: run => spawned ? run() : onSpawn.push(run),
+
+    // The block and the standable ones around it, nearest first (breadth first, one step sideways
+    // and up to one up or down), each with its key: "server|dimension|x,y,z".
+    formationCandidates ({ x, y, z }) {
       const target = new Vec3(x, y, z)
       if (!bot.blockAt(target)) throw new Error(`${name}: formation target ${x},${y},${z} is not loaded`)
-      const keyOf = p => `${server}|${dimension()}|${p.x},${p.y},${p.z}`
+      const candidates = []
       const seen = new Set([target.toString()])
       const queue = [target]
       for (let i = 0; i < queue.length && i < 4096; i++) {
         const p = queue[i]
-        if (standable(p) && free(keyOf(p))) {
-          bot.pathfinder.setGoal(new goals.GoalBlock(p.x, p.y, p.z))
-          return keyOf(p)
-        }
+        if (standable(p)) candidates.push({ spot: { x: p.x, y: p.y, z: p.z }, key: `${server}|${dimension()}|${p.x},${p.y},${p.z}` })
         for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
           for (const dy of [0, 1, -1]) {
             const n = p.offset(dx, dy, dz)
@@ -152,7 +176,14 @@ module.exports = function startBot ({ name, host, port, send, serialize, onEnd }
           }
         }
       }
-      throw new Error(`${name}: no free block to stand on around ${x},${y},${z}`)
+      if (candidates.length === 0) throw new Error(`${name}: no block to stand on around ${x},${y},${z}`)
+      return candidates
+    },
+
+    // Walks to the spot taken.
+    goto (spot) {
+      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
+      formationSpot = spot
     },
 
     // The registry wants the blocks of the column claimed as `claim`; a claim since unloaded is
@@ -163,7 +194,7 @@ module.exports = function startBot ({ name, host, port, send, serialize, onEnd }
       flush()
       const raw = bot.world.getColumn(key.x, key.z)
       if (!raw) throw new Error(`${name}: claimed column ${key.x},${key.z} is not loaded`)
-      out(serialize({ bot: name, key: column.key, version: bot.version, column: raw.toJson() }))
+      out(protocol.chunkData(name, column.key, bot.version, serialize(raw, blockStates().stateName)))
     }
   }
 }

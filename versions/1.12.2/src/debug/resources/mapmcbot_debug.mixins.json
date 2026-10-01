@@ -1,13 +1,10 @@
 {
   "required": true,
   "minVersion": "0.8",
-  "package": "net.mapmcbot.mixin",
+  "package": "net.mapmcbot.debug.mixin",
   "compatibilityLevel": "JAVA_8",
   "client": [
-    "ChatCommandMixin",
-    "InGameHudMixin",
-    "InteractionMixin",
-    "WorldRendererMixin"
+    "ChatHistoryMixin"
   ],
   "injectors": {
     "defaultRequire": 1

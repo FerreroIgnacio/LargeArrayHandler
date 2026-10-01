@@ -39,6 +39,10 @@ public final class ChunkProtocol {
 	public static final int UNLOAD = 5;
 	/** bot name. */
 	public static final int BOT_GONE = 6;
+	/** bot name, u8 walking; when walking i32 target x, y, z, i32 node count, each i32 x, y, z. */
+	public static final int PATH = 7;
+	/** bot name: in the world, ready for orders. */
+	public static final int BOT_SPAWNED = 8;
 
 	// Mod to fleet.
 	/** header, i32 claim id. */
@@ -156,6 +160,42 @@ public final class ChunkProtocol {
 			return readString(new DataInputStream(new ByteArrayInputStream(frame, 1, frame.length - 1)));
 		} catch (IOException e) {
 			throw new UncheckedIOException("truncated BOT_GONE message", e);
+		}
+	}
+
+	/** The path of a PATH frame: {target x, y, z, node x, y, z, ...}, or null when not walking one. */
+	public static int[] pathOf(byte[] frame) {
+		try {
+			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame, 1, frame.length - 1));
+			readString(in);
+
+			if (!in.readBoolean()) {
+				end(in, PATH);
+				return null;
+			}
+
+			final int tx = in.readInt();
+			final int ty = in.readInt();
+			final int tz = in.readInt();
+			final int count = in.readInt();
+
+			if (count < 0) {
+				throw new IOException("bad path length " + count);
+			}
+
+			final int[] result = new int[3 + 3 * count];
+			result[0] = tx;
+			result[1] = ty;
+			result[2] = tz;
+
+			for (int i = 3; i < result.length; i++) {
+				result[i] = in.readInt();
+			}
+
+			end(in, PATH);
+			return result;
+		} catch (IOException e) {
+			throw new UncheckedIOException("truncated PATH message", e);
 		}
 	}
 

@@ -5,10 +5,13 @@ import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -17,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -25,7 +29,7 @@ import net.mapmcbot.chunk.ChunkKey;
 import net.mapmcbot.chunk.ChunkProtocol;
 
 /**
- * The mineflayer bots, all in one node process (the fleet, fleet.js) running from a folder in the
+ * The mineflayer bots, all in one node process (the fleet, fleet.js) on a pool of threads sharing their chunks, running from a folder in the
  * run directory. The fleet connects back to a local socket; bots are spawned and quit, and their
  * chunks reported, over it with {@link ChunkProtocol} frames. That socket is the registry's
  * {@link ChunkChannel}.
@@ -35,7 +39,7 @@ import net.mapmcbot.chunk.ChunkProtocol;
  * the fleet), on its own thread so the game never waits on it.
  */
 public final class BotManager implements ChunkChannel {
-	private static final String[] RESOURCES = {"fleet.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
@@ -43,6 +47,12 @@ public final class BotManager implements ChunkChannel {
 
 	/** The bots spawned and not yet gone; the start threads and the fleet reader touch it too. */
 	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+	/** The bots in the world (BOT_SPAWNED) and not yet gone. */
+	private final Set<String> spawned = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+	/** The path each walking bot is on, from its PATH frames. */
+	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
 	private final Object writeLock = new Object();
 
@@ -52,6 +62,9 @@ public final class BotManager implements ChunkChannel {
 	private volatile OutputStream out;
 	private volatile Thread reader;
 
+	/** Every frame through the socket, one line each, in socket.log of the fleet's folder. */
+	private volatile PrintWriter socketLog;
+
 	public BotManager(File directory) {
 		this.directory = directory;
 		Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "mapmcbot-fleet-shutdown"));
@@ -59,6 +72,20 @@ public final class BotManager implements ChunkChannel {
 
 	public Set<String> getBots() {
 		return Collections.unmodifiableSet(bots);
+	}
+
+	/** connecting, idle or walking. */
+	public String getStatus(String bot) {
+		if (!spawned.contains(bot)) {
+			return "connecting";
+		}
+
+		return paths.containsKey(bot) ? "walking" : "idle";
+	}
+
+	/** The paths being walked, by bot: {target x, y, z, node x, y, z, ...}. */
+	public Map<String, int[]> getPaths() {
+		return Collections.unmodifiableMap(paths);
 	}
 
 	/** Starts a bot that joins host:port as `name`, in the background. */
@@ -99,6 +126,8 @@ public final class BotManager implements ChunkChannel {
 		}
 
 		bots.clear();
+		spawned.clear();
+		paths.clear();
 	}
 
 	@Override
@@ -122,6 +151,7 @@ public final class BotManager implements ChunkChannel {
 			}
 
 			try {
+				logFrame("->", frame, 4);
 				out.write(frame);
 				out.flush();
 			} catch (IOException e) {
@@ -148,6 +178,7 @@ public final class BotManager implements ChunkChannel {
 			}
 		}
 
+		socketLog = new PrintWriter(new OutputStreamWriter(new FileOutputStream(new File(directory, "socket.log"), false), StandardCharsets.UTF_8));
 		final ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
 		final Process process = new ProcessBuilder("node", "fleet.js", Integer.toString(server.getLocalPort()))
 				.directory(directory).redirectErrorStream(true).start();
@@ -212,8 +243,33 @@ public final class BotManager implements ChunkChannel {
 			byte[] frame;
 
 			while ((frame = ChunkProtocol.readFrame(in)) != null) {
+				logFrame("<-", frame, 0);
+
+				// The path being walked is for the renderer only; the registry never sees it.
+				if (frame[0] == ChunkProtocol.PATH) {
+					final String bot = ChunkProtocol.botGoneName(frame);
+					final int[] path = ChunkProtocol.pathOf(frame);
+
+					if (path == null) {
+						paths.remove(bot);
+					} else {
+						paths.put(bot, path);
+					}
+
+					continue;
+				}
+
+				// Status only; the registry never sees it either.
+				if (frame[0] == ChunkProtocol.BOT_SPAWNED) {
+					spawned.add(ChunkProtocol.botGoneName(frame));
+					continue;
+				}
+
 				if (frame[0] == ChunkProtocol.BOT_GONE) {
-					bots.remove(ChunkProtocol.botGoneName(frame));
+					final String gone = ChunkProtocol.botGoneName(frame);
+					bots.remove(gone);
+					spawned.remove(gone);
+					paths.remove(gone);
 				}
 
 				ChunkProtocol.dispatch(frame, listener());
@@ -224,6 +280,8 @@ public final class BotManager implements ChunkChannel {
 
 		// Every bot went with the fleet, on purpose or not.
 		bots.clear();
+		spawned.clear();
+		paths.clear();
 		listener().onClosed();
 
 		if (closing) {
@@ -235,6 +293,18 @@ public final class BotManager implements ChunkChannel {
 		}
 
 		throw new IllegalStateException("the bot fleet closed its connection");
+	}
+
+	/** Type, bot and size of a frame; `offset` skips the length a written frame still has. */
+	private void logFrame(String direction, byte[] frame, int offset) {
+		final int type = frame[offset] & 0xFF;
+		final int nameLength = (frame[offset + 1] & 0xFF) << 8 | frame[offset + 2] & 0xFF;
+		final String bot = new String(frame, offset + 3, nameLength, StandardCharsets.UTF_8);
+
+		synchronized (socketLog) {
+			socketLog.println(direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
+			socketLog.flush();
+		}
 	}
 
 	private ChunkChannel.Listener listener() {

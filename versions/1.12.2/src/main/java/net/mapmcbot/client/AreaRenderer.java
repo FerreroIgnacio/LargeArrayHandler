@@ -1,10 +1,13 @@
 package net.mapmcbot.client;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import net.mapmcbot.area.Area;
 import net.mapmcbot.area.AreaStore;
+import net.mapmcbot.bot.BotManager;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.Tessellator;
@@ -14,7 +17,8 @@ import net.minecraft.util.math.BlockPos;
 import org.lwjgl.opengl.GL11;
 
 /**
- * Each area as a coloured box in the world, plus the block a click would pick while picking.
+ * Each area as a coloured box in the world, plus the block a click would pick while picking, and
+ * the path each walking bot is on with its target.
  *
  * Drawn at the end of entity rendering, where the camera transform is set with the camera at the
  * origin: boxes are shifted by the interpolated camera position, the raw one makes them jitter.
@@ -40,8 +44,10 @@ public final class AreaRenderer {
 
 		final AreaStore store = MapMcBotClient.areas();
 		final BlockPos target = AreaPick.isActive() ? AreaPick.target(client) : null;
+		final BotManager botManager = MapMcBotClient.botsOrNull();
+		final Map<String, int[]> paths = botManager == null ? Collections.<String, int[]>emptyMap() : botManager.getPaths();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && paths.isEmpty()) {
 			return;
 		}
 
@@ -80,6 +86,13 @@ public final class AreaRenderer {
 					target.getX() + 1, target.getY() + 1, target.getZ() + 1, 0xFFFFFF, camX, camY, camZ);
 		}
 
+		for (Map.Entry<String, int[]> entry : paths.entrySet()) {
+			final int[] path = entry.getValue();
+			final int rgb = MapMcBotClient.colorOf(entry.getKey()).getRgb();
+			drawBox(path[0], path[1], path[2], path[0] + 1, path[1] + 1, path[2] + 1, rgb, camX, camY, camZ);
+			drawPath(path, rgb, camX, camY, camZ);
+		}
+
 		// Line width is global state the rest of the frame would inherit.
 		GL11.glLineWidth(1.0F);
 		GlStateManager.depthMask(true);
@@ -87,6 +100,25 @@ public final class AreaRenderer {
 		GlStateManager.enableTexture();
 		GlStateManager.disableBlend();
 		GlStateManager.popMatrix();
+	}
+
+	/** The nodes of a path {target x, y, z, node x, y, z, ...} as a line through the block centres, over everything. */
+	private static void drawPath(int[] path, int rgb, double camX, double camY, double camZ) {
+		final Tessellator tessellator = Tessellator.getInstance();
+		final BufferBuilder buffer = tessellator.getBuffer();
+		final int r = (rgb >> 16) & 0xFF;
+		final int g = (rgb >> 8) & 0xFF;
+		final int b = rgb & 0xFF;
+
+		GlStateManager.disableDepthTest();
+		buffer.begin(GL11.GL_LINE_STRIP, VertexFormats.POSITION_COLOR);
+
+		for (int i = 3; i < path.length; i += 3) {
+			buffer.vertex(path[i] + 0.5 - camX, path[i + 1] + 0.1 - camY, path[i + 2] + 0.5 - camZ).color(r, g, b, EDGE_ALPHA).next();
+		}
+
+		tessellator.draw();
+		GlStateManager.enableDepthTest();
 	}
 
 	private static boolean isTooFar(Area area, double camX, double camY, double camZ) {

@@ -10,6 +10,9 @@
       "net.mapmcbot.debug.AutoStart"
     ]
   },
+  "mixins": [
+    "mapmcbot_debug.mixins.json"
+  ],
   "depends": {
     "mapmcbot": "*"
   }
