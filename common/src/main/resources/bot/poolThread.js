@@ -1,14 +1,14 @@
 // Worker thread of the fleet's pool, running some of its bots (see bot.js): their frames go to the
 // fleet to write to the mod, and the fleet's orders for them come back here. Their chunk columns
-// are shared with every other thread (see sharedChunks.js), and so are the paths they find (see
-// communalPaths.js).
+// are shared with every other thread (see sharedChunks.js); their paths are searched on the
+// fleet's path threads (see pathThread.js, pathClient.js).
 const { parentPort, workerData } = require('worker_threads')
 const startBot = require('./bot')
 const { sharedChunks } = require('./sharedChunks')
-const { pathBook } = require('./communalPaths')
+const { pathClient } = require('./pathClient')
 
 const chunks = sharedChunks(workerData.chunkPort, new Int32Array(workerData.signal))
-const paths = pathBook()
+const paths = pathClient(workerData.pathPorts)
 const bots = new Map()
 
 // The frames of one turn of the event loop, every bot's in the order sent, go to the fleet as one
@@ -60,12 +60,6 @@ parentPort.on('message', message => {
         report({ bot: name, end: true })
       }
     }))
-    return
-  }
-
-  // A path a bot of another thread found.
-  if (message.type === 'path') {
-    paths.add(message.world, message.nodes)
     return
   }
 

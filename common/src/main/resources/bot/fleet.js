@@ -1,5 +1,6 @@
 // Every mineflayer bot in one process, spread over a pool of worker threads (poolThread.js) that
 // share their chunk columns (sharedChunks.js), driven by the mod over one local socket (see protocol.js).
+// Their paths are searched on path threads of their own (pathThread.js), which see every column.
 // Usage: node fleet.js <mod port>
 const net = require('net')
 const os = require('os')
@@ -76,6 +77,23 @@ function formationOrder (name, order) {
   else waiting.set(name, order)
 }
 
+// The path threads: every column goes to each of them as it comes and goes, and every path one
+// of them finds, to the others. Pool threads ask them over ports of their own (see startThread).
+const PATH_THREADS = 2
+const pathThreads = []
+for (let i = 0; i < PATH_THREADS; i++) {
+  const worker = new Worker(path.join(__dirname, 'pathThread.js'))
+  worker.on('message', message => {
+    if (!message.path) throw new Error('unknown message from a path thread')
+    for (const other of pathThreads) {
+      if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, nodes: message.path.nodes })
+    }
+  })
+  worker.on('error', err => { throw err })
+  worker.on('exit', code => { throw new Error(`path thread exited (code ${code})`) })
+  pathThreads.push(worker)
+}
+
 // The shared columns: "server|dimension|cx,cz" -> { buffer, threads holding it }. Gone once no thread does.
 const columns = new Map()
 
@@ -83,7 +101,10 @@ function onChunkRequest (thread, request) {
   if (request.acquire !== undefined) {
     let column = columns.get(request.acquire)
     const load = !column
-    if (load) columns.set(request.acquire, (column = { buffer: new SharedArrayBuffer(SIZE), threads: new Set() }))
+    if (load) {
+      columns.set(request.acquire, (column = { buffer: new SharedArrayBuffer(SIZE), threads: new Set() }))
+      for (const worker of pathThreads) worker.postMessage({ type: 'column', key: request.acquire, version: request.version, buffer: column.buffer })
+    }
     column.threads.add(thread)
     // The thread waits on the signal, then takes the answer straight off its port.
     thread.chunkPort.postMessage({ buffer: column.buffer, load })
@@ -92,7 +113,10 @@ function onChunkRequest (thread, request) {
   } else if (request.release !== undefined) {
     const column = columns.get(request.release)
     if (!column || !column.threads.delete(thread)) throw new Error(`a thread released column ${request.release} it does not hold`)
-    if (column.threads.size === 0) columns.delete(request.release)
+    if (column.threads.size === 0) {
+      columns.delete(request.release)
+      for (const worker of pathThreads) worker.postMessage({ type: 'drop', key: request.release })
+    }
   } else {
     throw new Error('unknown chunk request from a pool thread')
   }
@@ -122,11 +146,6 @@ function onReport (thread, report) {
       if (formation.released || formation.leader !== report.bot || !spot || !report.planned) continue
       if (spot.x === report.planned.x && spot.y === report.planned.y && spot.z === report.planned.z) releaseFormation(formation)
     }
-  } else if (report.path) {
-    // Into the book of every other thread; the bot's own already has it.
-    for (const other of threads) {
-      if (other !== thread) other.worker.postMessage({ type: 'path', world: report.path.world, nodes: report.path.nodes })
-    }
   } else if (report.end) {
     leaveSpot(report.bot)
     bots.delete(report.bot)
@@ -143,18 +162,25 @@ function onReport (thread, report) {
   }
 }
 
-// The pool: a thread per core at most, each started when a bot needs it rather than all at once,
-// so their start (each loads mineflayer and minecraft-data) never takes every core together.
+// The pool: a thread per core left by the path threads at most, each started when a bot needs it
+// rather than all at once, so their start (each loads mineflayer and minecraft-data) never takes
+// every core together.
 const threads = []
-const MAX_THREADS = os.cpus().length
+const MAX_THREADS = Math.max(1, os.cpus().length - PATH_THREADS)
 
 function startThread () {
   const { port1, port2 } = new MessageChannel()
   const signal = new SharedArrayBuffer(4)
   const thread = { bots: 0, chunkPort: port1, signal: new Int32Array(signal) }
+  // A port to each path thread.
+  const pathPorts = pathThreads.map(worker => {
+    const channel = new MessageChannel()
+    worker.postMessage({ type: 'client', port: channel.port2 }, [channel.port2])
+    return channel.port1
+  })
   thread.worker = new Worker(path.join(__dirname, 'poolThread.js'), {
-    workerData: { chunkPort: port2, signal },
-    transferList: [port2]
+    workerData: { chunkPort: port2, signal, pathPorts },
+    transferList: [port2, ...pathPorts]
   })
   thread.worker.on('message', report => onReport(thread, report))
   thread.worker.on('error', err => { throw err })

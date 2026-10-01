@@ -60,6 +60,11 @@ function columnClass (registry) {
       Atomics.notify(this.header, READY)
     }
 
+    // Whether its first bot is done loading it (for the path threads, which never wait on it).
+    isReady () {
+      return Atomics.load(this.header, READY) === 1
+    }
+
     // Blocks the thread until the bot loading it, on another thread, is done.
     waitReady () {
       Atomics.wait(this.header, READY, 0)
@@ -213,7 +218,8 @@ function sharedChunks (port, signal) {
     let load = false
     if (!entry) {
       Atomics.store(signal, 0, 0)
-      port.postMessage({ acquire: key })
+      // The version too: the fleet hands every new column to the path threads (see pathThread.js).
+      port.postMessage({ acquire: key, version: registry.version.minecraftVersion })
       Atomics.wait(signal, 0, 0)
       const reply = receiveMessageOnPort(port)
       if (!reply) throw new Error(`the fleet signalled column ${key} without an answer`)
@@ -301,4 +307,4 @@ function sharedChunks (port, signal) {
   }
 }
 
-module.exports = { sharedChunks, SIZE }
+module.exports = { sharedChunks, columnClass, SIZE }

@@ -8,11 +8,10 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
 const serialize = require('./serializer')
-const { communalPlanner } = require('./communalPaths')
 
-// A spot the bot does not have loaded is walked to in hops of this many blocks toward it, each
-// inside what the bot sees (the server sends at least two chunks around it): the next hop once
-// it gets there, the spot itself once its block arrives.
+// A spot no bot of the fleet has loaded is walked to in hops of this many blocks toward it, each
+// inside what the bot sees (the server sends at least two chunks around it), trying the spot
+// itself again after each hop.
 const HOP = 24
 // How close to a hop's end (blocks) counts as there.
 const HOP_REACH = 2
@@ -22,7 +21,7 @@ const LOG_SEARCH_NODES = 1000
 
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
 // its last frame sent; chunks and paths hold the columns and the paths of its thread (see
-// sharedChunks.js, communalPaths.js).
+// sharedChunks.js) and its path threads' client (see pathClient.js).
 module.exports = function startBot ({ name, host, port, chunks, paths, send, report, onEnd }) {
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
@@ -64,12 +63,9 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.loadPlugin(pathfinder)
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
-    // The fleet passes each path found on to the other threads, and starts a formation's other
-    // bots once its first one has its path (see fleet.js).
-    bot.pathfinder.getPathTo = communalPlanner(bot, paths, world, (goal, nodes) => {
-      report({ planned: goal })
-      if (nodes) report({ path: { world: world(), nodes } })
-    })
+    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns
+    // are. The fleet starts a formation's other bots once its first one has its path (see fleet.js).
+    bot.pathfinder.getPathTo = paths.planner(bot, () => `${server}|${bot.game.dimension}`, goal => report({ planned: goal }))
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -83,6 +79,9 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   }
   bot.on('path_update', result => {
     if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
+    // No bot of the fleet has the spot: a hop toward it. pathfinder takes this event's path right
+    // after it, so the new goal goes once it is done.
+    if (result.reason === 'target not loaded' && !hopping && formationSpot) queueMicrotask(hop)
     if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
@@ -110,8 +109,6 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('error', err => log('error: ' + err.message))
 
   bot.on('chunkColumnLoad', point => {
-    // The column of the spot being hopped to: straight there now.
-    if (hopping && point.x >> 4 === formationSpot.x >> 4 && point.z >> 4 === formationSpot.z >> 4) walk()
     flush()
     const id = `${point.x >> 4},${point.z >> 4}`
     // The server sent the column again: drop the old claim and start over.
@@ -182,21 +179,21 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
   // Where this bot was last sent to stand in a formation: {x, y, z}, null until it is.
   let formationSpot = null
-  // Walking hops toward it, its block not loaded yet.
+  // Walking a hop toward it, no bot of the fleet having its block.
   let hopping = false
 
-  // To the spot if its block is loaded, else a hop toward it.
   function walk () {
+    hopping = false
+    bot.pathfinder.setGoal(new goals.GoalBlock(formationSpot.x, formationSpot.y, formationSpot.z))
+  }
+
+  function hop () {
+    hopping = true
     const spot = formationSpot
-    hopping = !bot.blockAt(new Vec3(spot.x, spot.y, spot.z))
-    if (!hopping) {
-      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
-      return
-    }
     const p = bot.entity.position
     const dx = spot.x + 0.5 - p.x
     const dz = spot.z + 0.5 - p.z
-    const k = HOP / Math.hypot(dx, dz)
+    const k = Math.min(1, HOP / Math.hypot(dx, dz))
     bot.pathfinder.setGoal(new goals.GoalNearXZ(p.x + dx * k, p.z + dz * k, HOP_REACH))
   }
 

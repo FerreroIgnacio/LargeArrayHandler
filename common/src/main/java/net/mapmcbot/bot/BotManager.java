@@ -41,7 +41,7 @@ import net.mapmcbot.chunk.ChunkProtocol;
  * the fleet), on its own thread so the game never waits on it.
  */
 public final class BotManager implements ChunkChannel {
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "pathThread.js", "pathClient.js", "bot.js", "serializer.js", "protocol.js", "states.js", "package.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
