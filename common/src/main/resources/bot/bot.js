@@ -10,12 +10,6 @@ const protocol = require('./protocol')
 const states = require('./states')
 const { botMeter } = require('./profiler')
 
-// A spot no bot of the fleet has loaded is walked to in hops of this many blocks toward it, each
-// inside what the bot sees (the server sends at least two chunks around it), trying the spot
-// itself again after each hop.
-const HOP = 24
-// How close to a hop's end (blocks) counts as there.
-const HOP_REACH = 2
 // Searches past this many nodes go to the log, with how long they took to be done (taking turns with
 // the other searches of the thread included).
 const LOG_SEARCH_NODES = 1000
@@ -91,9 +85,8 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.loadPlugin(pathfinder)
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
-    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns
-    // are. The fleet starts a formation's other bots once its first one has its path (see fleet.js).
-    bot.pathfinder.getPathTo = paths.planner(bot, world, goal => report({ planned: goal }))
+    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns are.
+    bot.pathfinder.getPathTo = paths.planner(bot, world)
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -102,26 +95,16 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   // The mod draws the path being walked and its target; an empty PATH clears it.
   const goalOf = () => {
     const g = bot.pathfinder.goal
-    // A hop has no y: drawn at the bot's.
-    return g && g.x !== undefined ? { x: g.x, y: g.y ?? Math.floor(bot.entity.position.y), z: g.z } : null
+    return g ? { x: g.x, y: g.y, z: g.z } : null
   }
   bot.on('path_update', result => {
     if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
-    // No bot of the fleet has the spot: a hop toward it. pathfinder takes this event's path right
-    // after it, so the new goal goes once it is done.
-    if (result.reason === 'target not loaded' && !hopping && formationSpot) queueMicrotask(hop)
     if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))
   })
-  bot.on('goal_reached', goal => {
-    out(protocol.path(name, null))
-    // pathfinder clears its goal right after this event: the next one goes once it is done.
-    if (hopping) queueMicrotask(walk)
-    // Already there: no path to find, for the formation waiting on it either.
-    report({ planned: goal && goal.x !== undefined ? { x: goal.x, y: goal.y, z: goal.z } : null })
-  })
+  bot.on('goal_reached', () => out(protocol.path(name, null)))
   bot.on('path_stop', () => out(protocol.path(name, null)))
   bot.on('path_reset', () => out(protocol.path(name, null)))
 
@@ -174,23 +157,6 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
   // Where this bot was last sent to stand in a formation: {x, y, z}, null until it is.
   let formationSpot = null
-  // Walking a hop toward it, no bot of the fleet having its block.
-  let hopping = false
-
-  function walk () {
-    hopping = false
-    bot.pathfinder.setGoal(new goals.GoalBlock(formationSpot.x, formationSpot.y, formationSpot.z))
-  }
-
-  function hop () {
-    hopping = true
-    const spot = formationSpot
-    const p = bot.entity.position
-    const dx = spot.x + 0.5 - p.x
-    const dz = spot.z + 0.5 - p.z
-    const k = Math.min(1, HOP / Math.hypot(dx, dz))
-    bot.pathfinder.setGoal(new goals.GoalNearXZ(p.x + dx * k, p.z + dz * k, HOP_REACH))
-  }
 
   return {
     quit: () => bot.quit(),
@@ -241,10 +207,10 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
       return candidates
     },
 
-    // Walks to the spot taken.
+    // Walks to the spot taken: its own search, from where it stands.
     goto (spot) {
       formationSpot = spot
-      walk()
+      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
     }
   }
 }

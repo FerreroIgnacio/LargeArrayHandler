@@ -32,9 +32,10 @@ function leaveSpot (name) {
 }
 
 // The formations of the latest #formation, one per world its bots are in: "id|world|x,y,z" ->
-// { leader, candidates, queue, released }. The spots around the target are worked out once, by
-// its first bot in the world (the leader). The leader walks first; the rest wait for its path,
-// so each of them finds it in its thread's book and joins it (see communalPaths.js).
+// { surveyor, candidates, queue }. The spots around the target are worked out once, by one bot of
+// the formation in that world (the surveyor), which has to have the target loaded; the bots that
+// join before they are in wait in `queue`. Once they are, every bot takes its spot and searches its
+// own path there, none waiting on another.
 const formations = new Map()
 let latestFormation = -Infinity
 // The bots ordered into the latest formation before they were in the world: bot -> { id, target }.
@@ -44,14 +45,19 @@ function joinFormation (name, { id, target }) {
   const key = `${id}|${worldOf.get(name)}|${target.x},${target.y},${target.z}`
   const formation = formations.get(key)
   if (!formation) {
-    formations.set(key, { leader: name, candidates: null, queue: [name], released: false })
-    // A spot for every bot of the fleet, if the ground around the target has them.
-    bots.get(name).worker.postMessage({ type: 'candidates', bot: name, formation: key, target, needed: bots.size })
-  } else if (formation.released) {
+    const fresh = { surveyor: name, target, candidates: null, queue: [name] }
+    formations.set(key, fresh)
+    survey(key, fresh)
+  } else if (formation.candidates) {
     goto(formation, name)
   } else {
     formation.queue.push(name)
   }
+}
+
+// The surveyor works out a spot for every bot of the fleet, if the ground around the target has them.
+function survey (key, formation) {
+  bots.get(formation.surveyor).worker.postMessage({ type: 'candidates', bot: formation.surveyor, formation: key, target: formation.target, needed: bots.size })
 }
 
 // The spot nearest the target that no other bot stands on. None left (the ground around the target
@@ -67,16 +73,7 @@ function goto (formation, name) {
   leaveSpot(name)
   spots.set(taken.key, name)
   spotOf.set(name, taken.key)
-  if (name === formation.leader) formation.leaderSpot = taken.spot
   thread.worker.postMessage({ type: 'goto', bot: name, spot: taken.spot })
-}
-
-// The rest of the formation walks.
-function releaseFormation (formation) {
-  formation.released = true
-  for (const name of formation.queue.splice(0)) {
-    if (name !== formation.leader) goto(formation, name)
-  }
 }
 
 function formationOrder (name, order) {
@@ -392,24 +389,27 @@ function onReport (thread, report) {
     // Gone with an older formation: nothing waits on these.
     const formation = formations.get(report.formation)
     if (!formation) return
+    if (formation.candidates) throw new Error(`formation ${report.formation} surveyed twice`)
+    if (formation.surveyor !== report.bot) throw new Error(`${report.bot} surveyed formation ${report.formation}, surveyed by ${formation.surveyor}`)
     formation.candidates = report.candidates
-    if (bots.has(formation.leader)) goto(formation, formation.leader)
-    else releaseFormation(formation)
-  } else if (report.planned !== undefined) {
-    // A leader with its path to its spot (or none to find): the rest of its formation walks.
-    for (const formation of formations.values()) {
-      const spot = formation.leaderSpot
-      if (formation.released || formation.leader !== report.bot || !spot || !report.planned) continue
-      if (spot.x === report.planned.x && spot.y === report.planned.y && spot.z === report.planned.z) releaseFormation(formation)
-    }
+    // Every bot waiting on the spots takes its own, nearest first in the order they joined.
+    for (const name of formation.queue.splice(0)) goto(formation, name)
   } else if (report.end) {
     leaveSpot(report.bot)
     bots.delete(report.bot)
     worldOf.delete(report.bot)
     waiting.delete(report.bot)
-    // A leader gone before its path: the rest of its formation walks without it.
-    for (const formation of formations.values()) {
-      if (!formation.released && formation.leader === report.bot && formation.candidates) releaseFormation(formation)
+    // A surveyor gone before its spots: the next bot waiting surveys instead, if any is left.
+    for (const [key, formation] of formations) {
+      if (formation.candidates) continue
+      formation.queue = formation.queue.filter(n => n !== report.bot)
+      if (formation.surveyor !== report.bot) continue
+      if (formation.queue.length === 0) {
+        formations.delete(key)
+        continue
+      }
+      formation.surveyor = formation.queue[0]
+      survey(key, formation)
     }
     thread.bots--
     if (closing && bots.size === 0) process.exit(0)

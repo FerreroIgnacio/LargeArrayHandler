@@ -13,7 +13,7 @@ const RETRY_AFTER = 4
 const ENTITY_MARGIN = 32
 const { Vec3 } = require('vec3')
 const Move = require('mineflayer-pathfinder/lib/move')
-const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
+const { GoalBlock } = require('mineflayer-pathfinder/lib/goals')
 
 // `ports`: one per path thread, from the fleet. `pending`: per path thread, the requests sent to it
 // and not answered yet, shared by every pool thread: one more as a request goes, one less as its
@@ -53,9 +53,8 @@ function pathClient (ports, pending) {
   }
 
   // getPathTo(movements, goal) for the bot; `world()` is its "server|dimension" as the shared
-  // columns are keyed, `onPlanned(goal)` gets the goal ({x, y, z}, null without a position) of
-  // each search answered, found or not.
-  function planner (bot, world, onPlanned) {
+  // columns are keyed.
+  function planner (bot, world) {
     const water = bot.registry.blocksByName.water.id
     const ladder = bot.registry.blocksByName.ladder.id
     const vine = bot.registry.blocksByName.vine.id
@@ -88,8 +87,7 @@ function pathClient (ports, pending) {
 
     function goalOf (goal) {
       if (goal instanceof GoalBlock) return { kind: 'block', x: goal.x, y: goal.y, z: goal.z }
-      if (goal instanceof GoalNearXZ) return { kind: 'nearXZ', x: goal.x, z: goal.z, range: Math.sqrt(goal.rangeSq) }
-      throw new Error(`${bot.username}: the path threads know GoalBlock and GoalNearXZ, not ${goal.constructor.name}`)
+      throw new Error(`${bot.username}: the path threads know GoalBlock, not ${goal.constructor.name}`)
     }
 
     // pathfinder's postProcessPath without the shortcuts (off by default there): each node up to
@@ -191,7 +189,6 @@ function pathClient (ports, pending) {
               path: standOn(path)
             }
           }
-          onPlanned(goal.x !== undefined && goal.y !== undefined ? { x: goal.x, y: goal.y, z: goal.z } : null)
           // Still the goal: pathfinder asks again, and gets it.
           if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(goal)
         })

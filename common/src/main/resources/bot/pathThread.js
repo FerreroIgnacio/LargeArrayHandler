@@ -8,7 +8,7 @@ const { Vec3 } = require('vec3')
 const nbt = require('prismarine-nbt')
 const Move = require('mineflayer-pathfinder/lib/move')
 const Movements = require('mineflayer-pathfinder/lib/movements')
-const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
+const { GoalBlock } = require('mineflayer-pathfinder/lib/goals')
 const { columnClass, openColumns } = require('./sharedChunks')
 const { pathBook, plan, MAX_EXPANDED } = require('./communalPaths')
 const { threadProfiler } = require('./profiler')
@@ -102,7 +102,6 @@ function split (key) {
 
 function goalOf (goal) {
   if (goal.kind === 'block') return new GoalBlock(goal.x, goal.y, goal.z)
-  if (goal.kind === 'nearXZ') return new GoalNearXZ(goal.x, goal.z, goal.range)
   throw new Error(`unknown goal ${goal.kind} for the path thread`)
 }
 
@@ -134,7 +133,7 @@ function search (request) {
   bot.entity.effects = request.effects
   bot.entities = request.entities
   const goal = goalOf(request.goal)
-  if (request.goal.kind === 'block' && !bot.blockAt(goal)) {
+  if (!bot.blockAt(goal)) {
     return { id: request.id, status: 'noPath', reason: 'target not loaded', visitedNodes: 0, generatedNodes: 0, moves: [] }
   }
   movements.clearCollisionIndex()
