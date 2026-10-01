@@ -19,6 +19,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.time.LocalTime;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
@@ -211,15 +212,24 @@ public final class BotManager implements ChunkChannel {
 		reader.start();
 	}
 
-	/** Fleet output to the game log; the fleet exiting on its own is a failure. */
+	/**
+	 * Fleet output to the game log and, each line with its time, to fleet.log of the fleet's folder
+	 * (the game log can drown in a map's own output); the fleet exiting on its own is a failure.
+	 * Written out line by line: the fleet says little, and its last words matter most.
+	 */
 	private void pump(final Process process, final ServerSocket server) {
 		final Thread pump = new Thread(() -> {
 			try (BufferedReader lines = new BufferedReader(
-					new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+					new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
+					BufferedWriter fleetLog = new BufferedWriter(new OutputStreamWriter(
+							new FileOutputStream(new File(directory, "fleet.log"), false), StandardCharsets.UTF_8))) {
 				String line;
 
 				while ((line = lines.readLine()) != null) {
 					System.out.println("[mapmcbot fleet] " + line);
+					fleetLog.write(LocalTime.now() + " " + line);
+					fleetLog.newLine();
+					fleetLog.flush();
 				}
 
 				server.close();
@@ -312,7 +322,7 @@ public final class BotManager implements ChunkChannel {
 		final String bot = new String(frame, offset + 3, nameLength, StandardCharsets.UTF_8);
 
 		synchronized (socketLog) {
-			socketLog.println(direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
+			socketLog.println(LocalTime.now() + " " + direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
 		}
 	}
 
