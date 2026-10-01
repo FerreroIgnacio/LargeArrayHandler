@@ -22,7 +22,7 @@ const NEAR_GOAL = 8
 // How much costlier than the straight distance a search may get (pathfinder's searchRadius).
 const SEARCH_RADIUS = 64
 // Nodes a search expands at most: past it the search gives up with the nearest it got (noPath).
-const MAX_EXPANDED = 10000
+const MAX_EXPANDED = 4000
 
 // The paths of one pool thread, per world ("server|dimension"): each an Int32Array x, y, z per node.
 function pathBook () {

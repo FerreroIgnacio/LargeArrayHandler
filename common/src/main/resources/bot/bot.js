@@ -10,6 +10,15 @@ const states = require('./states')
 const serialize = require('./serializer')
 const { communalPlanner } = require('./communalPaths')
 
+// A spot the bot does not have loaded is walked to in hops of this many blocks toward it, each
+// inside what the bot sees (the server sends at least two chunks around it): the next hop once
+// it gets there, the spot itself once its block arrives.
+const HOP = 24
+// How close to a hop's end (blocks) counts as there.
+const HOP_REACH = 2
+// Searches past this many nodes go to the log, with how long they took.
+const LOG_SEARCH_NODES = 1000
+
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
 // its last frame sent; chunks and paths hold the columns and the paths of its thread (see
 // sharedChunks.js, communalPaths.js).
@@ -68,16 +77,20 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   // The mod draws the path being walked and its target; an empty PATH clears it.
   const goalOf = () => {
     const g = bot.pathfinder.goal
-    return g && g.x !== undefined ? { x: g.x, y: g.y, z: g.z } : null
+    // A hop has no y: drawn at the bot's.
+    return g && g.x !== undefined ? { x: g.x, y: g.y ?? Math.floor(bot.entity.position.y), z: g.z } : null
   }
   bot.on('path_update', result => {
     if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
+    if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes in ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))
   })
   bot.on('goal_reached', goal => {
     out(protocol.path(name, null))
+    // pathfinder clears its goal right after this event: the next one goes once it is done.
+    if (hopping) queueMicrotask(walk)
     // Already there: no path to find, for the formation waiting on it either.
     report({ planned: goal && goal.x !== undefined ? { x: goal.x, y: goal.y, z: goal.z } : null })
   })
@@ -96,6 +109,8 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('error', err => log('error: ' + err.message))
 
   bot.on('chunkColumnLoad', point => {
+    // The column of the spot being hopped to: straight there now.
+    if (hopping && point.x >> 4 === formationSpot.x >> 4 && point.z >> 4 === formationSpot.z >> 4) walk()
     flush()
     const id = `${point.x >> 4},${point.z >> 4}`
     // The server sent the column again: drop the old claim and start over.
@@ -163,6 +178,23 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
   // Where this bot was last sent to stand in a formation: {x, y, z}, null until it is.
   let formationSpot = null
+  // Walking hops toward it, its block not loaded yet.
+  let hopping = false
+
+  // To the spot if its block is loaded, else a hop toward it.
+  function walk () {
+    const spot = formationSpot
+    hopping = !bot.blockAt(new Vec3(spot.x, spot.y, spot.z))
+    if (!hopping) {
+      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
+      return
+    }
+    const p = bot.entity.position
+    const dx = spot.x + 0.5 - p.x
+    const dz = spot.z + 0.5 - p.z
+    const k = HOP / Math.hypot(dx, dz)
+    bot.pathfinder.setGoal(new goals.GoalNearXZ(p.x + dx * k, p.z + dz * k, HOP_REACH))
+  }
 
   return {
     quit: () => bot.quit(),
@@ -196,8 +228,8 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
     // Walks to the spot taken.
     goto (spot) {
-      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
       formationSpot = spot
+      walk()
     },
 
     // The registry wants the blocks of the column claimed as `claim`; a claim since unloaded is
