@@ -12,6 +12,7 @@ import net.mapmcbot.bot.BotManager;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
+import net.mapmcbot.profile.ProfileRegistry;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
@@ -33,6 +34,7 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static final Map<String, Color> BOT_COLORS = new ConcurrentHashMap<String, Color>();
 
 	private static KeyBinding areasKey;
+	private static KeyBinding profilerKey;
 
 	/** The id of the last #formation sent; each one gets the next. */
 	private static int lastFormation;
@@ -41,11 +43,13 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static String areasWorldId;
 	private static BotRegistry bots;
 	private static ChunkRegistry chunks;
+	private static ProfileRegistry profile;
 
 	@Override
 	public void onInitializeClient() {
 		// LWJGL 2 key codes, right up to 1.12.2; 1.13+ uses GLFW codes.
 		areasKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.areas", Keyboard.KEY_V, CATEGORY));
+		profilerKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.profiler", Keyboard.KEY_Z, CATEGORY));
 		ClientTickEvents.END_CLIENT_TICK.register(MapMcBotClient::tick);
 	}
 
@@ -69,6 +73,16 @@ public class MapMcBotClient implements ClientModInitializer {
 			} else {
 				client.setScreen(new AreaScreen());
 			}
+		}
+
+		boolean openProfiler = false;
+
+		while (profilerKey.wasPressed()) {
+			openProfiler = true;
+		}
+
+		if (openProfiler && client.currentScreen == null) {
+			client.setScreen(new ProfilerScreen());
 		}
 
 		AreaPick.tick(client);
@@ -139,6 +153,11 @@ public class MapMcBotClient implements ClientModInitializer {
 		}
 
 		if (bots != null) {
+			// The last profile with the bots still in: called every tick outside a world, so only while there are some.
+			if (!bots.getBots().isEmpty()) {
+				profile.request("leaving the world");
+			}
+
 			bots.stopAll();
 		}
 
@@ -177,9 +196,16 @@ public class MapMcBotClient implements ClientModInitializer {
 			final BotManager fleet = new BotManager(new File(directory, "bot"));
 			bots = new BotRegistry(fleet);
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
+			profile = new ProfileRegistry(fleet, new File(directory, "bot/profile.log"), chunks::chunksByBot);
 		}
 
 		return bots;
+	}
+
+	/** CPU and memory of the mod and the fleet (see ProfilerScreen); created with the bots. */
+	public static ProfileRegistry profile() {
+		bots();
+		return profile;
 	}
 
 	/** The bots, or null while none was ever started. */

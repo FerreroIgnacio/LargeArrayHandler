@@ -8,6 +8,7 @@ const { Vec3 } = require('vec3')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
+const { botMeter } = require('./profiler')
 
 // A spot no bot of the fleet has loaded is walked to in hops of this many blocks toward it, each
 // inside what the bot sees (the server sends at least two chunks around it), trying the spot
@@ -26,6 +27,10 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
   const log = line => console.log(`[${name}] ${line}`)
+  // The time its handlers take on the thread: mineflayer's events and the client's packets.
+  const meter = botMeter()
+  meter.wrap(bot)
+  meter.wrap(bot._client)
 
   function dimension () {
     const d = bot.game.dimension
@@ -189,6 +194,22 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
   return {
     quit: () => bot.quit(),
+
+    // Its rows for a profile (see profiler.js); `heapShare` its part of the thread's heap.
+    profile (heapShare) {
+      const scope = `node.bot:${name}`
+      // No socket until it connects, no entities until it logs in: none of them yet.
+      const socket = bot._client.socket
+      return [
+        [scope, 'cpu.handlers', 'ms', meter.ms],
+        [scope, 'events', 'n', meter.events],
+        [scope, 'net.in', 'bytes', socket ? socket.bytesRead : 0],
+        [scope, 'net.out', 'bytes', socket ? socket.bytesWritten : 0],
+        [scope, 'mem.heapShare', 'B', heapShare],
+        [scope, 'columns', '#', columns.size],
+        [scope, 'entities', '#', bot.entities ? Object.keys(bot.entities).length : 0]
+      ]
+    },
 
     spot: () => formationSpot,
 

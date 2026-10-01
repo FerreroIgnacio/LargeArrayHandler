@@ -58,6 +58,32 @@ public final class ChunkRegistry implements ChunkListener {
 		channel.setChunkListener(this);
 	}
 
+	/**
+	 * Per bot, the chunks held that it claimed (the fleet's first bot to get each): {chunks, block
+	 * entities in them, bytes of their NBT}. For the profile; the blocks are in the columns file, not here.
+	 */
+	public synchronized Map<String, long[]> chunksByBot() {
+		final Map<String, long[]> byBot = new HashMap<String, long[]>();
+
+		for (Entry entry : chunks.values()) {
+			long[] counts = byBot.get(entry.bot);
+
+			if (counts == null) {
+				counts = new long[3];
+				byBot.put(entry.bot, counts);
+			}
+
+			counts[0]++;
+			counts[1] += entry.blockEntities.size();
+
+			for (ChunkData.BlockEntity entity : entry.blockEntities.values()) {
+				counts[2] += entity.getNbt().length;
+			}
+		}
+
+		return byBot;
+	}
+
 	/** Whether the chunk is held and its blocks are in its slot. */
 	public synchronized boolean isLoaded(ChunkKey key) {
 		final Entry entry = chunks.get(key);

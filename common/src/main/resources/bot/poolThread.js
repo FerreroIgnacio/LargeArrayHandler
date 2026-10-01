@@ -9,12 +9,26 @@ const { parentPort, workerData } = require('worker_threads')
 const startBot = require('./bot')
 const { sharedChunks, openColumns } = require('./sharedChunks')
 const { pathClient } = require('./pathClient')
+const { threadProfiler } = require('./profiler')
 
 openColumns(workerData.columnsFile)
 const port = workerData.chunkPort
 const chunks = sharedChunks(port, new Int32Array(workerData.signal), post)
 const paths = pathClient(workerData.pathPorts, new Int32Array(workerData.pathPending))
 const bots = new Map()
+const scope = `node.thread:pool:${workerData.index}`
+const prof = threadProfiler(scope)
+
+// This thread's rows for a profile, and its bots': each bot's share of the heap is the thread's
+// split evenly, the bots of a thread sharing one heap with nothing to tell their parts apart.
+function profileRows () {
+  const rows = prof.rows([[scope, 'bots', '#', bots.size]])
+  const share = bots.size === 0 ? 0 : process.memoryUsage().heapUsed / bots.size
+  for (const [name, bot] of bots) {
+    rows.push(...bot.profile(share), [`node.bot:${name}`, 'thread', '#', workerData.index])
+  }
+  return rows
+}
 
 // The frames of one turn of the event loop, every bot's in the order sent, go to the fleet as one
 // buffer handed over (transferred, never copied): one message per turn instead of one per frame.
@@ -51,6 +65,10 @@ function post (message) {
 const report = post
 
 parentPort.on('message', message => {
+  if (message.type === 'profile') {
+    post({ profile: message.profile, rows: profileRows() })
+    return
+  }
   if (message.type === 'spawn') {
     const { name, host, port } = message
     if (bots.has(name)) throw new Error(`a bot named ${name} is already running on this thread`)

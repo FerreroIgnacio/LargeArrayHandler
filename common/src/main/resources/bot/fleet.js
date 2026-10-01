@@ -9,10 +9,13 @@ const path = require('path')
 const { Worker, MessageChannel } = require('worker_threads')
 const protocol = require('./protocol')
 const states = require('./states')
+const { threadProfiler, toText } = require('./profiler')
 const { HEADER, SLOTS, loadedHeader } = require('./sharedChunks')
 
 const columnsFile = process.argv[3]
 if (!columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin>')
+
+const prof = threadProfiler('node.thread:fleet')
 
 // Bot name -> the thread running it.
 const bots = new Map()
@@ -86,6 +89,7 @@ function formationOrder (name, order) {
     waiting.clear()
     spots.clear()
     spotOf.clear()
+    takeProfile(0, `formation ${order.id}`)
   }
   if (worldOf.has(name)) joinFormation(name, order)
   else waiting.set(name, order)
@@ -106,6 +110,10 @@ for (let i = 0; i < PATH_THREADS; i++) {
       wantSnapshots(worker, message.wanted.ticket, message.wanted.world, message.wanted.ids)
       return
     }
+    if (message.profile !== undefined) {
+      onProfileRows(worker, message.profile, message.rows)
+      return
+    }
     if (!message.path) throw new Error('unknown message from a path thread')
     for (const other of pathThreads) {
       if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, nodes: message.path.nodes })
@@ -117,6 +125,7 @@ for (let i = 0; i < PATH_THREADS; i++) {
 }
 // Requests sent to each path thread and not answered yet, counted by every pool thread (see pathClient.js).
 const pathPending = new SharedArrayBuffer(4 * PATH_THREADS)
+const pathPendingCounts = new Int32Array(pathPending)
 
 // The columns in a slot of columns.bin: "server|dimension|cx,cz" -> { header, slot, threads holding
 // it, chunk, claim, version, modHolds, ready }. Every path thread sees them all.
@@ -307,7 +316,9 @@ function chunkOf (key) {
 
 // What a pool thread sends, in the order it happened there (see poolThread.js).
 function onThreadMessage (thread, message) {
-  if (message.acquire !== undefined || message.release !== undefined || message.ready !== undefined || message.changed !== undefined) {
+  if (message.profile !== undefined) {
+    onProfileRows(thread.worker, message.profile, message.rows)
+  } else if (message.acquire !== undefined || message.release !== undefined || message.ready !== undefined || message.changed !== undefined) {
     onChunkRequest(thread, message)
   } else {
     onReport(thread, message)
@@ -371,6 +382,7 @@ function onReport (thread, report) {
     send(Buffer.from(report.frames))
   } else if (report.world) {
     worldOf.set(report.bot, report.world)
+    takeProfile(0, `${report.bot} in ${report.world}`)
     const order = waiting.get(report.bot)
     if (order) {
       waiting.delete(report.bot)
@@ -401,6 +413,7 @@ function onReport (thread, report) {
     }
     thread.bots--
     if (closing && bots.size === 0) process.exit(0)
+    takeProfile(0, `${report.bot} gone`)
   } else {
     throw new Error('unknown report from a pool thread')
   }
@@ -423,7 +436,7 @@ function startThread () {
     return channel.port1
   })
   thread.worker = new Worker(path.join(__dirname, 'poolThread.js'), {
-    workerData: { chunkPort: port2, signal, pathPorts, pathPending, columnsFile },
+    workerData: { index: threads.length, chunkPort: port2, signal, pathPorts, pathPending, columnsFile },
     transferList: [port2, ...pathPorts]
   })
   thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
@@ -432,6 +445,69 @@ function startThread () {
   port1.on('message', message => onThreadMessage(thread, message))
   threads.push(thread)
   return thread
+}
+
+// Profiles being put together: key -> { id, reason, waiting: the threads yet to send their rows,
+// rows }. Every thread of the fleet sends its own (see profiler.js), the pool threads their bots'
+// too; once all of them did, the profile goes to the mod. `id` is the mod's PROFILE_REQUEST's, 0
+// for the fleet's own: a bot in a world or gone, a new formation.
+const profiles = new Map()
+let nextProfile = 1
+
+function takeProfile (id, reason) {
+  if (closing) return
+  const key = nextProfile++
+  const workers = [...threads.map(t => t.worker), ...pathThreads]
+  const cpu = process.cpuUsage()
+  const memory = process.memoryUsage()
+  let pending = 0
+  for (let i = 0; i < PATH_THREADS; i++) pending += Atomics.load(pathPendingCounts, i)
+  const rows = [
+    // The whole process: every thread, libuv's and V8's own included.
+    ['node', 'cpu.user', 'ms', cpu.user / 1000],
+    ['node', 'cpu.system', 'ms', cpu.system / 1000],
+    ['node', 'mem.rss', 'B', memory.rss],
+    ['node', 'uptime.s', '#', process.uptime()],
+    ['node', 'bots', '#', bots.size],
+    ['node', 'threads', '#', 1 + workers.length],
+    ...prof.rows([
+      ['node.thread:fleet', 'columns', '#', columns.size],
+      ['node.thread:fleet', 'columns.cached', '#', cached.size],
+      ['node.thread:fleet', 'slots.free', '#', freeSlots.length],
+      ['node.thread:fleet', 'path.pending', '#', pending]
+    ])
+  ]
+  profiles.set(key, { id, reason, waiting: new Set(workers), rows })
+  for (const worker of workers) worker.postMessage({ type: 'profile', profile: key })
+}
+
+// A thread's rows for the profile `key`.
+function onProfileRows (worker, key, rows) {
+  const profile = profiles.get(key)
+  if (!profile || !profile.waiting.delete(worker)) throw new Error(`a thread sent rows for profile ${key}, which does not wait on it`)
+  profile.rows.push(...rows)
+  if (profile.waiting.size > 0) return
+  profiles.delete(key)
+  send(protocol.profile(profile.id, profile.reason, toText(merged(profile.rows))))
+}
+
+// The rows of a bot from every path thread that searched for it, added up into one; those of bots
+// gone are left out (each path thread keeps what it searched for every bot it ever had).
+function merged (rows) {
+  const byKey = new Map()
+  for (const row of rows) {
+    const [scope, name, unit, value] = row
+    if (scope.startsWith('node.bot:') && !bots.has(scope.slice('node.bot:'.length))) continue
+    const key = `${scope}\t${name}`
+    const known = byKey.get(key)
+    if (!known) {
+      byKey.set(key, [scope, name, unit, value])
+      continue
+    }
+    if (known[2] !== unit) throw new Error(`profile row ${scope} ${name} sent in ${known[2]} and in ${unit}`)
+    known[3] += value
+  }
+  return [...byKey.values()]
 }
 
 let closing = false
@@ -469,6 +545,9 @@ socket.on('data', protocol.frames(frame => {
       break
     case protocol.TYPES.LOADED:
       onLoaded(`${message.key.server}|${message.key.dimension}|${message.key.x},${message.key.z}`, message.slot, message.version)
+      break
+    case protocol.TYPES.PROFILE_REQUEST:
+      takeProfile(message.id, message.reason)
       break
     case protocol.TYPES.FORMATION:
       // Same: a bot already gone has no spot to take. Its old spot goes once it takes the new one.

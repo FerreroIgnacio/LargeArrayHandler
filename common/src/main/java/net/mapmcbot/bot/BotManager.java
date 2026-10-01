@@ -15,19 +15,27 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import net.mapmcbot.chunk.ChunkKey;
 import net.mapmcbot.chunk.ChunkListener;
 import net.mapmcbot.fleet.FleetChannel;
 import net.mapmcbot.fleet.FleetProtocol;
+import net.mapmcbot.profile.ProfileListener;
+import net.mapmcbot.profile.ProfileReport;
 
 /**
  * The mineflayer bots, all in one node process (the fleet, fleet.js) on a pool of threads sharing their chunks, running from a folder in the
@@ -46,7 +54,7 @@ import net.mapmcbot.fleet.FleetProtocol;
 public final class BotManager implements FleetChannel {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "pathThread.js", "pathClient.js", "bot.js", "protocol.js", "states.js", "package.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "communalPaths.js", "pathThread.js", "pathClient.js", "bot.js", "profiler.js", "protocol.js", "states.js", "package.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
@@ -57,6 +65,13 @@ public final class BotManager implements FleetChannel {
 
 	private volatile ChunkListener chunkListener;
 	private volatile BotListener botListener;
+	private volatile ProfileListener profileListener;
+
+	/** HotSpot's: CPU time and allocations of the reader thread, per frame. */
+	private final com.sun.management.ThreadMXBean threadBean;
+
+	/** What each bot's frames cost the mod, by bot name; "" for the fleet's own frames. */
+	private final Map<String, Traffic> traffic = new ConcurrentHashMap<String, Traffic>();
 	private volatile boolean closing;
 	private volatile Process fleet;
 	private volatile OutputStream out;
@@ -80,6 +95,20 @@ public final class BotManager implements FleetChannel {
 			throw new IllegalStateException("BotManager is a singleton: one was already created");
 		}
 
+		if (!(ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean)) {
+			throw new IllegalStateException("the profiler reads the CPU and allocations of the fleet's frames through com.sun.management, which this JVM ("
+					+ System.getProperty("java.vm.name") + ") does not have");
+		}
+
+		threadBean = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+
+		if (!threadBean.isCurrentThreadCpuTimeSupported() || !threadBean.isThreadAllocatedMemorySupported()) {
+			throw new IllegalStateException("this JVM cannot tell the CPU time or the allocations of a thread");
+		}
+
+		threadBean.setThreadCpuTimeEnabled(true);
+		threadBean.setThreadAllocatedMemoryEnabled(true);
+
 		this.directory = directory;
 		this.columns = new File(directory, "columns.bin");
 		createColumns();
@@ -102,6 +131,47 @@ public final class BotManager implements FleetChannel {
 		}
 
 		botListener = listener;
+	}
+
+	@Override
+	public void setProfileListener(ProfileListener listener) {
+		if (profileListener != null) {
+			throw new IllegalStateException("the bot fleet already has a profile listener");
+		}
+
+		profileListener = listener;
+	}
+
+	@Override
+	public boolean isRunning() {
+		return out != null && !closing;
+	}
+
+	@Override
+	public void requestProfile(int id, String reason) {
+		send(FleetProtocol.profileRequest(id, reason));
+	}
+
+	@Override
+	public List<ProfileReport.Row> channelRows() {
+		final List<ProfileReport.Row> rows = new ArrayList<ProfileReport.Row>();
+
+		for (Map.Entry<String, Traffic> entry : traffic.entrySet()) {
+			final String scope = entry.getKey().isEmpty() ? "java.channel" : "java.bot:" + entry.getKey();
+			final Traffic t = entry.getValue();
+			rows.add(new ProfileReport.Row(scope, "cpu.frames", ProfileReport.MS, t.cpu.get() / 1e6));
+			rows.add(new ProfileReport.Row(scope, "alloc", ProfileReport.BYTES_SO_FAR, t.allocated.get()));
+			rows.add(new ProfileReport.Row(scope, "frames.in", ProfileReport.COUNT, t.framesIn.get()));
+			rows.add(new ProfileReport.Row(scope, "net.in", ProfileReport.BYTES_SO_FAR, t.bytesIn.get()));
+			rows.add(new ProfileReport.Row(scope, "frames.out", ProfileReport.COUNT, t.framesOut.get()));
+			rows.add(new ProfileReport.Row(scope, "net.out", ProfileReport.BYTES_SO_FAR, t.bytesOut.get()));
+		}
+
+		return rows;
+	}
+
+	private Traffic traffic(String bot) {
+		return traffic.computeIfAbsent(bot, name -> new Traffic());
 	}
 
 	/** In the background: the first bot starts the fleet, on its own thread so the game never waits on it. */
@@ -173,6 +243,9 @@ public final class BotManager implements FleetChannel {
 
 			try {
 				logFrame("->", frame, 4);
+				final Traffic t = traffic(botOf(frame, 4));
+				t.framesOut.incrementAndGet();
+				t.bytesOut.addAndGet(frame.length);
 				out.write(frame);
 				out.flush();
 			} catch (IOException e) {
@@ -275,7 +348,23 @@ public final class BotManager implements FleetChannel {
 
 			while ((frame = FleetProtocol.readFrame(in)) != null) {
 				logFrame("<-", frame, 0);
-				FleetProtocol.dispatch(frame, chunkListener(), botListener());
+				// What the frame cost here, the snapshots it makes the chunk registry write included.
+				final long cpu = threadBean.getCurrentThreadCpuTime();
+				final long allocated = threadBean.getThreadAllocatedBytes(Thread.currentThread().getId());
+				FleetProtocol.dispatch(frame, chunkListener(), botListener(), profileListener());
+				final String bot = botOf(frame, 0);
+
+				// Gone: nothing more of it to count.
+				if ((frame[0] & 0xFF) == FleetProtocol.BOT_GONE) {
+					traffic.remove(bot);
+					continue;
+				}
+
+				final Traffic t = traffic(bot);
+				t.cpu.addAndGet(threadBean.getCurrentThreadCpuTime() - cpu);
+				t.allocated.addAndGet(threadBean.getThreadAllocatedBytes(Thread.currentThread().getId()) - allocated);
+				t.framesIn.incrementAndGet();
+				t.bytesIn.addAndGet(frame.length + 4);
 			}
 		} catch (IOException e) {
 			failure = e;
@@ -298,11 +387,16 @@ public final class BotManager implements FleetChannel {
 		throw new IllegalStateException("the bot fleet closed its connection");
 	}
 
+	/** The bot a frame is about, "" for the fleet's own; `offset` skips the length a written frame still has. */
+	private static String botOf(byte[] frame, int offset) {
+		final int nameLength = (frame[offset + 1] & 0xFF) << 8 | frame[offset + 2] & 0xFF;
+		return new String(frame, offset + 3, nameLength, StandardCharsets.UTF_8);
+	}
+
 	/** Type, bot and size of a frame; `offset` skips the length a written frame still has. */
 	private void logFrame(String direction, byte[] frame, int offset) {
 		final int type = frame[offset] & 0xFF;
-		final int nameLength = (frame[offset + 1] & 0xFF) << 8 | frame[offset + 2] & 0xFF;
-		final String bot = new String(frame, offset + 3, nameLength, StandardCharsets.UTF_8);
+		final String bot = botOf(frame, offset);
 
 		synchronized (socketLog) {
 			socketLog.println(LocalTime.now() + " " + direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
@@ -329,6 +423,16 @@ public final class BotManager implements FleetChannel {
 
 		if (current == null) {
 			throw new IllegalStateException("the bot fleet has no chunk listener");
+		}
+
+		return current;
+	}
+
+	private ProfileListener profileListener() {
+		final ProfileListener current = profileListener;
+
+		if (current == null) {
+			throw new IllegalStateException("the bot fleet has no profile listener");
 		}
 
 		return current;
@@ -387,6 +491,16 @@ public final class BotManager implements FleetChannel {
 				Files.write(target.toPath(), bytes);
 			}
 		}
+	}
+
+	/** What one bot's frames (or the fleet's own) cost the mod so far: reader thread CPU (ns), allocations, frames and bytes. */
+	private static final class Traffic {
+		final AtomicLong cpu = new AtomicLong();
+		final AtomicLong allocated = new AtomicLong();
+		final AtomicLong framesIn = new AtomicLong();
+		final AtomicLong bytesIn = new AtomicLong();
+		final AtomicLong framesOut = new AtomicLong();
+		final AtomicLong bytesOut = new AtomicLong();
 	}
 
 	private static byte[] readAll(InputStream in) throws IOException {

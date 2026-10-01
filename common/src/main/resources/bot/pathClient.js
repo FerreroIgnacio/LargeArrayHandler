@@ -211,6 +211,7 @@ function pathClient (ports, pending) {
         }
         job.port.postMessage({
           id: job.id,
+          bot: bot.username,
           world: world(),
           version: bot.version,
           start: from,

@@ -11,11 +11,16 @@ const Movements = require('mineflayer-pathfinder/lib/movements')
 const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
 const { columnClass, openColumns } = require('./sharedChunks')
 const { pathBook, plan, MAX_EXPANDED } = require('./communalPaths')
+const { threadProfiler } = require('./profiler')
 
 // Searches past this many nodes go to the log, with what they cost and how many requests wait.
 const LOG_SEARCH_NODES = 1000
 
 openColumns(workerData.columnsFile)
+const scope = `node.thread:path:${workerData.index}`
+const prof = threadProfiler(scope)
+// Bot -> what its searches on this thread took: { ms, searches, nodes }.
+const searched = new Map()
 const book = pathBook()
 // "server|dimension" -> "cx,cz" -> column: the fleet's columns.
 const worlds = new Map()
@@ -136,8 +141,14 @@ function search (request) {
   const { start } = request
   const began = performance.now()
   const found = plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal)
+  const took = performance.now() - began
+  let spent = searched.get(request.bot)
+  if (!spent) searched.set(request.bot, (spent = { ms: 0, searches: 0, nodes: 0 }))
+  spent.ms += took
+  spent.searches++
+  spent.nodes += found.visitedNodes
   if (found.visitedNodes > LOG_SEARCH_NODES) {
-    console.log(`[path thread ${workerData.index}] ${found.visitedNodes} nodes in ${Math.round(performance.now() - began)} ms (${found.status}), ${queue.length} waiting`)
+    console.log(`[path thread ${workerData.index}] ${found.visitedNodes} nodes in ${Math.round(took)} ms (${found.status}), ${queue.length} waiting`)
   }
   // The other path threads join it too.
   if (found.nodes) parentPort.postMessage({ path: { world: request.world, nodes: found.nodes } })
@@ -214,6 +225,14 @@ parentPort.on('message', message => {
     case 'path':
       book.add(message.world, message.nodes)
       break
+    case 'profile': {
+      const rows = prof.rows([[scope, 'queue', '#', queue.length], [scope, 'parked', '#', parked.size]])
+      for (const [bot, spent] of searched) {
+        rows.push([`node.bot:${bot}`, 'cpu.path', 'ms', spent.ms], [`node.bot:${bot}`, 'path.searches', 'n', spent.searches], [`node.bot:${bot}`, 'path.nodes', 'n', spent.nodes])
+      }
+      parentPort.postMessage({ profile: message.profile, rows })
+      break
+    }
     case 'wanted': {
       // The columns the ticket wanted are in (their 'column' came first), or have no snapshot: searched again.
       if (cancelledTickets.delete(message.ticket)) break

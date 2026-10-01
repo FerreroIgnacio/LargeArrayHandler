@@ -14,12 +14,14 @@ const TYPES = {
   BOT_SPAWNED: 8,
   STATE_NAMES: 9,
   LOAD: 10,
+  PROFILE: 11,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
   SPAWN: 17,
   QUIT: 18,
-  FORMATION: 19
+  FORMATION: 19,
+  PROFILE_REQUEST: 21
 }
 
 class Writer {
@@ -218,6 +220,17 @@ function path (bot, target, nodes) {
   return w.frame()
 }
 
+// The fleet's profile (see profiler.js): `id` the PROFILE_REQUEST's, 0 when the fleet took it on an
+// event of its own, `reason` what it was taken for, `text` its rows. No bot: an empty name.
+function profile (id, reason, text) {
+  const w = new Writer(TYPES.PROFILE)
+  w.str('')
+  w.i32(id)
+  w.str(reason)
+  w.bytes(Buffer.from(text, 'utf8'))
+  return w.frame()
+}
+
 // A mod -> fleet frame (without its length) as an object.
 function decode (frame) {
   const r = new Reader(frame)
@@ -241,6 +254,9 @@ function decode (frame) {
     case TYPES.FORMATION:
       message = { type, bot: r.str(), id: r.i32(), x: r.i32(), y: r.i32(), z: r.i32() }
       break
+    case TYPES.PROFILE_REQUEST:
+      message = { type, bot: r.str(), id: r.i32(), reason: r.str() }
+      break
     default:
       throw new Error(`unknown message type ${type} from the mod`)
   }
@@ -263,4 +279,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load,stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load,stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, profile, decode, frames }

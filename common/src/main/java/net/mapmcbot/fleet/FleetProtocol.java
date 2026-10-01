@@ -17,6 +17,7 @@ import net.mapmcbot.bot.BotListener;
 import net.mapmcbot.chunk.ChunkData;
 import net.mapmcbot.chunk.ChunkKey;
 import net.mapmcbot.chunk.ChunkListener;
+import net.mapmcbot.profile.ProfileListener;
 
 /**
  * The binary messages between the mod and the bot fleet, mirrored by bot/protocol.js, and the
@@ -67,6 +68,11 @@ public final class FleetProtocol {
 	public static final int STATE_NAMES = 9;
 	/** bot name (empty), key, i32 slot: read the column's snapshot into the free slot; answered with LOADED. */
 	public static final int LOAD = 10;
+	/**
+	 * bot name (empty), i32 request id (0 when the fleet took it on an event of its own), reason
+	 * string, i32 length and the profile's rows, UTF-8 (see bot/profiler.js).
+	 */
+	public static final int PROFILE = 11;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -82,6 +88,8 @@ public final class FleetProtocol {
 	 * next to it. One id per #formation, higher than the last: the fleet works the spots out once per id.
 	 */
 	public static final int FORMATION = 19;
+	/** bot name (empty), i32 request id, reason string: the fleet answers with a PROFILE of that id. */
+	public static final int PROFILE_REQUEST = 21;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -108,8 +116,8 @@ public final class FleetProtocol {
 		return frame;
 	}
 
-	/** Decodes a fleet-to-mod frame and hands it to the listener of its domain: chunks or bots. */
-	public static void dispatch(byte[] frame, ChunkListener chunks, BotListener bots) {
+	/** Decodes a fleet-to-mod frame and hands it to the listener of its domain: chunks, bots or profiles. */
+	public static void dispatch(byte[] frame, ChunkListener chunks, BotListener bots, ProfileListener profiles) {
 		try {
 			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame));
 			final int type = in.readUnsignedByte();
@@ -231,6 +239,15 @@ public final class FleetProtocol {
 					bots.onSpawned(bot);
 					break;
 
+				case PROFILE: {
+					final int id = in.readInt();
+					final String reason = readString(in);
+					final String text = new String(readBytes(in), StandardCharsets.UTF_8);
+					end(in, type);
+					profiles.onProfile(id, reason, text);
+					break;
+				}
+
 				default:
 					throw new IllegalStateException("unknown message type " + type + " from the bot fleet");
 			}
@@ -288,6 +305,20 @@ public final class FleetProtocol {
 		try {
 			writeString(frame.out, bot);
 			frame.out.writeInt(slot);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] profileRequest(int id, String reason) {
+		final Frame frame = new Frame(PROFILE_REQUEST);
+
+		try {
+			writeString(frame.out, "");
+			frame.out.writeInt(id);
+			writeString(frame.out, reason);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}
