@@ -12,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Debug only (src/debug, remove with it): every bot (a player named Bot...) wears
- * textures/entity/bot_skin.png of this source set, in the classic (wide-arm) model. Client side
+ * textures/entity/bot_skin.png of this source set, in the slim (thin-arm) model. Client side
  * only: the bots join offline, with no skin of their own, and only this client sees it.
  */
 @Mixin(PlayerListEntry.class)
@@ -32,7 +32,7 @@ public abstract class BotSkinMixin {
 	@Inject(method = "getModel()Ljava/lang/String;", at = @At("HEAD"), cancellable = true)
 	private void mapmcbot$botModel(CallbackInfoReturnable<String> cir) {
 		if (mapmcbot$isBot()) {
-			cir.setReturnValue("default");
+			cir.setReturnValue("slim");
 		}
 	}
 
