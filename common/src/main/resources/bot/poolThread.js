@@ -74,7 +74,7 @@ parentPort.on('message', message => {
       bot.sendChunk(message.key, message.claim)
       break
     case 'candidates':
-      report({ bot: message.bot, formation: message.formation, candidates: bot.formationCandidates(message.target) })
+      report({ bot: message.bot, formation: message.formation, candidates: bot.formationCandidates(message.target, message.needed) })
       break
     case 'goto':
       bot.goto(message.spot)

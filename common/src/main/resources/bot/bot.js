@@ -202,18 +202,21 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
 
     spot: () => formationSpot,
 
-    // The block and the standable ones around it, nearest first (breadth first, one step sideways
-    // and up to one up or down), each with its key: "server|dimension|x,y,z". Asked of one bot per
-    // formation; the fleet hands the spots out to all of its bots (see fleet.js).
-    formationCandidates ({ x, y, z }) {
+    // `needed` blocks to stand on around the target, nearest first: breadth first over the ground
+    // a bot can walk from it (one step sideways and up to one up or down, between blocks to stand
+    // on), as far as the bot has it loaded. Each with its key: "server|dimension|x,y,z". Asked of
+    // one bot per formation; the fleet hands the spots out to all of its bots (see fleet.js).
+    formationCandidates ({ x, y, z }, needed) {
       const target = new Vec3(x, y, z)
       if (!bot.blockAt(target)) throw new Error(`${name}: formation target ${x},${y},${z} is not loaded`)
       const candidates = []
       const seen = new Set([target.toString()])
       const queue = [target]
-      for (let i = 0; i < queue.length && i < 4096; i++) {
+      for (let i = 0; i < queue.length && candidates.length < needed; i++) {
         const p = queue[i]
+        // Only ground to stand on leads on, the target aside (the player may be mid-jump).
         if (standable(p)) candidates.push({ spot: { x: p.x, y: p.y, z: p.z }, key: `${world()}|${p.x},${p.y},${p.z}` })
+        else if (i > 0) continue
         for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
           for (const dy of [0, 1, -1]) {
             const n = p.offset(dx, dy, dz)

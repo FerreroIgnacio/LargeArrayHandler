@@ -37,7 +37,8 @@ function joinFormation (name, { id, target }) {
   const formation = formations.get(key)
   if (!formation) {
     formations.set(key, { leader: name, candidates: null, queue: [name], released: false })
-    bots.get(name).worker.postMessage({ type: 'candidates', bot: name, formation: key, target })
+    // A spot for every bot of the fleet, if the ground around the target has them.
+    bots.get(name).worker.postMessage({ type: 'candidates', bot: name, formation: key, target, needed: bots.size })
   } else if (formation.released) {
     goto(formation, name)
   } else {
@@ -45,12 +46,16 @@ function joinFormation (name, { id, target }) {
   }
 }
 
-// The spot nearest the target that no other bot stands on.
+// The spot nearest the target that no other bot stands on. None left (the ground around the target
+// holds fewer bots than the fleet has): the bot stays where it is, and says so.
 function goto (formation, name) {
   const thread = bots.get(name)
   if (!thread) return
   const taken = formation.candidates.find(({ key }) => !spots.has(key) || spots.get(key) === name)
-  if (!taken) throw new Error(`${name}: every block to stand on around its formation target is taken`)
+  if (!taken) {
+    console.log(`[${name}] formation: no free spot (${formation.candidates.length} around the target for ${bots.size} bots)`)
+    return
+  }
   leaveSpot(name)
   spots.set(taken.key, name)
   spotOf.set(name, taken.key)
@@ -69,9 +74,13 @@ function releaseFormation (formation) {
 function formationOrder (name, order) {
   if (order.id < latestFormation) return
   if (order.id > latestFormation) {
+    // Every bot is sent to the new one: the spots of the old one are free, or a target near the
+    // old one would look taken by bots that have not got their new spot yet.
     latestFormation = order.id
     formations.clear()
     waiting.clear()
+    spots.clear()
+    spotOf.clear()
   }
   if (worldOf.has(name)) joinFormation(name, order)
   else waiting.set(name, order)
@@ -79,10 +88,10 @@ function formationOrder (name, order) {
 
 // The path threads: every column goes to each of them as it comes and goes, and every path one
 // of them finds, to the others. Pool threads ask them over ports of their own (see startThread).
-const PATH_THREADS = 2
+const PATH_THREADS = 3
 const pathThreads = []
 for (let i = 0; i < PATH_THREADS; i++) {
-  const worker = new Worker(path.join(__dirname, 'pathThread.js'))
+  const worker = new Worker(path.join(__dirname, 'pathThread.js'), { workerData: { index: i } })
   worker.on('message', message => {
     if (!message.path) throw new Error('unknown message from a path thread')
     for (const other of pathThreads) {

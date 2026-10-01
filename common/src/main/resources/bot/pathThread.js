@@ -3,7 +3,7 @@
 // sharedChunks.js, handed over by the fleet): a bot gets a path through columns the server never
 // sent it. Pool threads ask over a port of their own (see pathClient.js). One search per turn of
 // the event loop, so columns, cancels and new requests are taken in between.
-const { parentPort } = require('worker_threads')
+const { parentPort, workerData } = require('worker_threads')
 const { Vec3 } = require('vec3')
 const nbt = require('prismarine-nbt')
 const Move = require('mineflayer-pathfinder/lib/move')
@@ -11,6 +11,9 @@ const Movements = require('mineflayer-pathfinder/lib/movements')
 const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
 const { columnClass } = require('./sharedChunks')
 const { pathBook, plan, MAX_EXPANDED } = require('./communalPaths')
+
+// Searches past this many nodes go to the log, with what they cost and how many requests wait.
+const LOG_SEARCH_NODES = 1000
 
 const book = pathBook()
 // "server|dimension" -> "cx,cz" -> column: the fleet's columns.
@@ -90,7 +93,11 @@ function answer (request) {
   movements.clearCollisionIndex()
   movements.updateCollisionIndex()
   const { start } = request
+  const began = performance.now()
   const found = plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal)
+  if (found.visitedNodes > LOG_SEARCH_NODES) {
+    console.log(`[path thread ${workerData.index}] ${found.visitedNodes} nodes in ${Math.round(performance.now() - began)} ms (${found.status}), ${queue.length} waiting`)
+  }
   // The other path threads join it too.
   if (found.nodes) parentPort.postMessage({ path: { world: request.world, nodes: found.nodes } })
   return {

@@ -10,7 +10,7 @@ const AStar = require('mineflayer-pathfinder/lib/astar')
 // Paths kept per world; the oldest goes when one more comes.
 const KEPT = 256
 // A path joins at its nodes this close to the bot (blocks, each axis)...
-const JOIN_NEAR = 6
+const JOIN_NEAR = 12
 // ...when it gets this close to the goal (the goal's heuristic, about blocks).
 const NEAR_GOAL = 8
 // How much costlier than the straight distance a search may get (pathfinder's searchRadius).

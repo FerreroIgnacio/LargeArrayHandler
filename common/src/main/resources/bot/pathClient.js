@@ -1,7 +1,11 @@
 // mineflayer-pathfinder's getPathTo for the bots of a pool thread: their searches run on the
 // fleet's path threads (see pathThread.js), never here. getPathTo sends the request and hands
 // pathfinder no path yet, so the bot stands; once the answer comes the bot sets its goal again,
-// pathfinder asks again, and getPathTo hands it the path.
+// pathfinder asks again, and getPathTo hands it the path. Asked again for the goal it is already
+// walking to (pathfinder drops its path when a block near it changes, when the bot gets stuck or
+// fails to dig), the bot keeps walking what is left of its path until the new one comes. A goal no
+// search found a path to is not searched again until the bot is RETRY_AFTER blocks from where it was.
+const RETRY_AFTER = 4
 const { Vec3 } = require('vec3')
 const Move = require('mineflayer-pathfinder/lib/move')
 const { GoalBlock, GoalNearXZ } = require('mineflayer-pathfinder/lib/goals')
@@ -29,9 +33,14 @@ function pathClient (ports) {
     const ladder = bot.registry.blocksByName.ladder.id
     const vine = bot.registry.blocksByName.vine.id
 
-    // The request on its way, and the answer done and not handed over yet: { goal, ... }.
+    // The request on its way, the answer done and not handed over yet, and the path handed over
+    // last: { goal, ... }. pathfinder walks that path's own array, taking each node off as it gets
+    // there: what is in it is what is left.
     let running = null
     let done = null
+    let walking = null
+    // The last search that found no path: { goal, start, result }.
+    let failed = null
     bot.on('end', () => cancel())
 
     function cancel () {
@@ -123,17 +132,26 @@ function pathClient (ports) {
       if (done && done.goal === goal) {
         const result = done.result
         done = null
+        walking = { goal, path: result.path }
         return result
       }
       if (!running || running.goal !== goal) {
+        // Given up on from about here already: the same answer, without asking again.
+        const from = start(movements)
+        if (failed && failed.goal === goal && Math.abs(from.x - failed.start.x) + Math.abs(from.y - failed.start.y) + Math.abs(from.z - failed.start.z) < RETRY_AFTER) {
+          return { ...failed.result, path: [] }
+        }
         cancel()
-        const job = { goal, id: nextId++, port: ports[nextPort++ % ports.length], cancelled: false, began: performance.now() }
+        const job = { goal, id: nextId++, port: ports[nextPort++ % ports.length], cancelled: false, began: performance.now(), start: from }
         const self = bot.entity
         waiting.set(job.id, answer => {
           if (job.cancelled) return
           if (answer.cancelled) throw new Error(`${bot.username}: request ${job.id} cancelled without being asked to`)
           running = null
           const path = movesOf(answer.moves)
+          failed = answer.status !== 'success'
+            ? { goal, start: job.start, result: { status: answer.status, reason: answer.reason, cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0 } }
+            : null
           done = {
             goal,
             result: {
@@ -154,7 +172,7 @@ function pathClient (ports) {
           id: job.id,
           world: world(),
           version: bot.version,
-          start: start(movements),
+          start: from,
           goal: goalOf(goal),
           items: bot.inventory.items().map(item => ({ type: item.type, nbt: item.nbt })),
           effects: self.effects,
@@ -164,8 +182,9 @@ function pathClient (ports) {
         })
         running = job
       }
-      // No path yet: the bot stands until the answer comes.
-      return { status: 'partial', cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0, path: [] }
+      // No new path yet: the rest of the one it was walking to the same goal, else it stands.
+      const rest = walking && walking.goal === goal ? walking.path : []
+      return { status: 'partial', cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0, path: rest }
     }
   }
 
