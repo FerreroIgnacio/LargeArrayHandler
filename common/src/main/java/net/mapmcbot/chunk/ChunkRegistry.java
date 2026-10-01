@@ -35,6 +35,8 @@ import net.mapmcbot.fleet.FleetProtocol;
 public final class ChunkRegistry implements ChunkListener {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
+	private static final boolean USE_CHUNK_SNAPSHOT_OPTIMIZATION = false;
+
 	private final FleetChannel channel;
 	private final ChunkSnapshotStore snapshots;
 	/** The fleet's columns file, little-endian (see FleetProtocol); written only into slots the fleet asks to load. */
@@ -109,6 +111,10 @@ public final class ChunkRegistry implements ChunkListener {
 			if (held.getValue().slot == slot) {
 				throw new IllegalStateException(key + " to be loaded into slot " + slot + ", which " + held.getKey() + " holds");
 			}
+		}
+		if(!USE_CHUNK_SNAPSHOT_OPTIMIZATION){
+			channel.loaded(key, slot, null);
+			return;
 		}
 
 		final ChunkSnapshotStore.Snapshot snapshot = snapshots.load(key);
