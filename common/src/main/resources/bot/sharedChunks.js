@@ -3,14 +3,15 @@
 // mod, which reads the slots straight off it), handed out by the fleet's index (see fleet.js): the
 // first bot to get a column parses it into its slot, every other bot, on any thread, sees that same
 // slot. Whether it is loaded yet and its sections live in a small SharedArrayBuffer of the column:
-// Atomics.wait does not work on a mapped file. Each bot still has its own mineflayer World holding the column, so its events
-// (chunkColumnLoad, blockUpdate...) stay its own. Pre-flattening columns only (1.9 to 1.12).
+// Atomics.wait does not work on a mapped file. Each bot still has its own mineflayer World holding
+// the column, so its events (chunkColumnLoad, blockUpdate...) stay its own. Pre-flattening columns
+// only (1.9 to 1.12).
 //
 // Light is read off the packet and dropped: neither mineflayer's movement nor pathfinder looks at
 // it, and it was a third of every column. Every block reads as fully lit.
 const fs = require('fs')
 const { receiveMessageOnPort } = require('worker_threads')
-const mmap = require('mmap-io')
+const mmap = require('@riaskov/mmap-io')
 const { SmartBuffer } = require('smart-buffer')
 const { Vec3 } = require('vec3')
 const BitArray = require('prismarine-chunk/src/pc/common/BitArray')
@@ -44,7 +45,7 @@ function loadedHeader () {
   return header
 }
 
-// This thread's map of columns.bin, once openColumns took it.
+// This thread's map of columns.bin (a SharedArrayBuffer over the file), once openColumns took it.
 let mapped = null
 
 function openColumns (file) {
@@ -53,6 +54,7 @@ function openColumns (file) {
   const size = fs.fstatSync(fd).size
   if (size !== SLOTS * SIZE) throw new Error(`${file} is ${size} bytes, not ${SLOTS} slots of ${SIZE}`)
   mapped = mmap.map(size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, fd, 0)
+  if (!(mapped instanceof SharedArrayBuffer) || mapped.byteLength !== size) throw new Error(`mapping ${file} gave no SharedArrayBuffer of ${size} bytes`)
 }
 
 const index = pos => (pos.y << 8) | (pos.z << 4) | pos.x
@@ -83,10 +85,10 @@ function columnClass (registry) {
       super(registry)
       if (!mapped) throw new Error('columns.bin is not mapped on this thread (openColumns)')
       if (!Number.isInteger(slot) || slot < 0 || slot >= SLOTS) throw new Error(`column slot ${slot} outside 0..${SLOTS - 1}`)
-      const base = mapped.byteOffset + slot * SIZE
+      const base = slot * SIZE
       this.header = new Int32Array(header, 0, 2)
-      this.states = new Uint16Array(mapped.buffer, base + STATES, SECTIONS * VOLUME)
-      this.biomes = new Uint8Array(mapped.buffer, base + BIOMES, 256)
+      this.states = new Uint16Array(mapped, base + STATES, SECTIONS * VOLUME)
+      this.biomes = new Uint8Array(mapped, base + BIOMES, 256)
     }
 
     // Loaded: the bots waiting on it can read it.

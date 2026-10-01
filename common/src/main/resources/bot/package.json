@@ -7,6 +7,6 @@
   "dependencies": {
     "mineflayer": "^4.20.0",
     "mineflayer-pathfinder": "^2.4.5",
-    "mmap-io": "^1.1.7"
+    "@riaskov/mmap-io": "^1.6.0"
   }
 }

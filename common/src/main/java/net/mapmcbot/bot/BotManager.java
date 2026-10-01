@@ -190,7 +190,7 @@ public final class BotManager implements FleetChannel {
 		extractScripts();
 
 		if (!new File(directory, "node_modules/mineflayer").isDirectory() || !new File(directory, "node_modules/mineflayer-pathfinder").isDirectory()
-				|| !new File(directory, "node_modules/mmap-io").isDirectory()) {
+				|| !new File(directory, "node_modules/@riaskov/mmap-io").isDirectory()) {
 			System.out.println("[mapmcbot] installing mineflayer in " + directory);
 			final int exit = new ProcessBuilder(WINDOWS ? "npm.cmd" : "npm", "install", "--no-audit", "--no-fund")
 					.directory(directory).inheritIO().start().waitFor();
