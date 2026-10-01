@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import net.mapmcbot.fleet.FleetChannel;
@@ -30,9 +31,10 @@ import net.mapmcbot.fleet.FleetChannel;
  * the log file, whether the screen is open or not.
  *
  * Nothing is sampled on a timer. A profile is taken when someone asks for one (the screen opening,
- * its refresh, the player leaving the world) and when the fleet takes one on an event of its own (a
- * bot in a world or gone, a new formation): the fleet's part comes from the fleet, the mod's is read
- * as it arrives. With no fleet running, the mod's part alone.
+ * its refresh, the player leaving the world), every FRAMES_PER_PROFILE frames through the channel,
+ * and when the fleet takes one on an event of its own (a bot in a world or gone, a new formation):
+ * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
+ * the mod's part alone.
  *
  * Thread-safe: the channel thread feeds it, anyone may read it.
  *
@@ -49,6 +51,12 @@ public final class ProfileRegistry implements ProfileListener {
 	 * together (a formation sends every bot) would give rates over a few milliseconds, all noise.
 	 */
 	private static final long MIN_INTERVAL = 1000;
+
+	/** A profile is taken every this many frames through the channel, either way: as often as the fleet is busy, never while it is idle. */
+	private static final long FRAMES_PER_PROFILE = 5000;
+
+	/** Frames since the last profile taken for them. */
+	private final AtomicLong frames = new AtomicLong();
 
 	private final FleetChannel channel;
 	/** Per bot that claimed them: {chunks, block entities, bytes of their NBT} held by the chunk registry. */
@@ -151,6 +159,18 @@ public final class ProfileRegistry implements ProfileListener {
 
 		if (id != 0 && id == waitingFor) {
 			waitingFor = 0;
+		}
+	}
+
+	@Override
+	public void onFrame() {
+		if (frames.incrementAndGet() % FRAMES_PER_PROFILE != 0) {
+			return;
+		}
+
+		// One still on its way covers these frames too; the next one is FRAMES_PER_PROFILE frames on.
+		if (!isWaiting()) {
+			request(FRAMES_PER_PROFILE + " frames");
 		}
 	}
 

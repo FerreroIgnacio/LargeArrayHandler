@@ -8,4 +8,7 @@ public interface ProfileListener {
 	 * tab-separated (see bot/profiler.js).
 	 */
 	void onProfile(int id, String reason, String text);
+
+	/** A frame went through the channel, either way (a line of socket.log); called on the thread that sent or read it. */
+	void onFrame();
 }

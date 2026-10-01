@@ -252,6 +252,9 @@ public final class BotManager implements FleetChannel {
 				throw new UncheckedIOException("could not write to the bot fleet", e);
 			}
 		}
+
+		// Outside the lock: the profile it may ask for is a frame of its own.
+		profileListener().onFrame();
 	}
 
 	/** Once per manager; synchronized so bots started together wait on the one setup. */
@@ -352,6 +355,7 @@ public final class BotManager implements FleetChannel {
 				final long cpu = threadBean.getCurrentThreadCpuTime();
 				final long allocated = threadBean.getThreadAllocatedBytes(Thread.currentThread().getId());
 				FleetProtocol.dispatch(frame, chunkListener(), botListener(), profileListener());
+				profileListener().onFrame();
 				final String bot = botOf(frame, 0);
 
 				// Gone: nothing more of it to count.
