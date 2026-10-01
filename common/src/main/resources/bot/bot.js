@@ -133,10 +133,13 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('blockUpdate', (oldBlock, newBlock) => {
     const p = newBlock.position
     const column = held(p.x, p.z)
+    const { stateName, stateIdOf } = blockStates()
+    // The column is shared: the first bot of the fleet to get the change already wrote it there,
+    // and reported it. The rest see no change, and the registry hears it once instead of once per bot.
+    if (stateIdOf(oldBlock) === stateIdOf(newBlock)) return
     const id = `${column.key.x},${column.key.z}`
     let batch = batches.get(id)
     if (!batch) batches.set(id, (batch = { key: column.key, changes: [] }))
-    const { stateName, stateIdOf } = blockStates()
     batch.changes.push({ x: p.x, y: p.y, z: p.z, state: stateName(stateIdOf(newBlock)) })
     if (!flushQueued) {
       flushQueued = true
