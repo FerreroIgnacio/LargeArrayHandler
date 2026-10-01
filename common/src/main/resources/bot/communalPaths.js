@@ -6,9 +6,11 @@
 // and, through the fleet, into the book of every other thread (see fleet.js).
 //
 // Replaces mineflayer-pathfinder's getPathTo, which its movement loop calls whenever it needs a
-// path: the search runs to the end in one go, bounded by distance (SEARCH_RADIUS) and by how many
-// nodes it expands (MAX_EXPANDED), never by time. A search that goes on blocks every bot of its
-// thread, keepalives included.
+// path. A search never holds its thread: each pool thread runs one search at a time, SLICE nodes per
+// turn of the event loop, its bots' searches taking turns, so between slices the thread reads its
+// bots' packets and answers their keepalives. getPathTo starts the search and hands pathfinder no
+// path yet; once the search is done the bot sets its goal again, and getPathTo hands the path over.
+// Bounded by distance (SEARCH_RADIUS) and by nodes expanded (MAX_EXPANDED), never by time.
 const AStar = require('mineflayer-pathfinder/lib/astar')
 const Move = require('mineflayer-pathfinder/lib/move')
 const { Vec3 } = require('vec3')
@@ -23,6 +25,26 @@ const NEAR_GOAL = 8
 const SEARCH_RADIUS = 64
 // Nodes a search expands at most: past it the search gives up with the nearest it got (noPath).
 const MAX_EXPANDED = 4000
+// Nodes a thread's search expands per turn of the event loop.
+const SLICE = 50
+
+// This thread's searches, taking turns: each turn the first one expands a slice and goes to the back.
+const searches = []
+
+function enqueue (job) {
+  if (searches.length === 0) setImmediate(turn)
+  searches.push(job)
+}
+
+function turn () {
+  const job = searches.shift()
+  if (!job.cancelled) {
+    const { done, value } = job.steps.next()
+    if (done) job.onDone(value)
+    else searches.push(job)
+  }
+  if (searches.length > 0) setImmediate(turn)
+}
 
 // The paths of one pool thread, per world ("server|dimension"): each an Int32Array x, y, z per node.
 function pathBook () {
@@ -92,15 +114,47 @@ function follow (movements, start, { nodes, from, to }) {
   return moves
 }
 
-// A* from start to goal, giving up once it expanded MAX_EXPANDED nodes: past that every node is a
-// dead end, so the open set drains at once. `exhausted` tells that apart from a real noPath.
-function search (start, movements, goal) {
-  let expanded = 0
-  const budgeted = Object.create(movements)
-  budgeted.getNeighbors = node => ++expanded > MAX_EXPANDED ? [] : movements.getNeighbors(node)
-  const result = new AStar(start, budgeted, goal, Infinity, Infinity, SEARCH_RADIUS).compute()
-  result.exhausted = expanded > MAX_EXPANDED
-  return result
+// Expands up to `limit` nodes of pathfinder's A* (its compute, counting nodes instead of time):
+// the result once it ends, null while it goes on.
+function expand (astar, limit) {
+  for (let n = 0; n < limit; n++) {
+    if (astar.openHeap.isEmpty()) return astar.makeResult('noPath', astar.bestNode)
+    const node = astar.openHeap.pop()
+    if (astar.goal.isEnd(node.data)) return astar.makeResult('success', node)
+    astar.openDataMap.delete(node.data.hash)
+    astar.closedDataSet.add(node.data.hash)
+    astar.visitedChunks.add(`${node.data.x >> 4},${node.data.z >> 4}`)
+    for (const neighborData of astar.movements.getNeighbors(node.data)) {
+      if (astar.closedDataSet.has(neighborData.hash)) continue
+      const g = node.g + neighborData.cost
+      const heuristic = astar.goal.heuristic(neighborData)
+      if (astar.maxCost > 0 && g + heuristic > astar.maxCost) continue
+      let neighborNode = astar.openDataMap.get(neighborData.hash)
+      const update = neighborNode !== undefined
+      if (update && neighborNode.g < g) continue
+      if (!update) {
+        neighborNode = new astar.bestNode.constructor()
+        astar.openDataMap.set(neighborData.hash, neighborNode)
+      }
+      neighborNode.set(neighborData, g, heuristic, node)
+      if (neighborNode.h < astar.bestNode.h) astar.bestNode = neighborNode
+      if (update) astar.openHeap.update(neighborNode)
+      else astar.openHeap.push(neighborNode)
+    }
+  }
+  return null
+}
+
+// A* from start to goal, a slice per step (yield* it), giving up once it expanded MAX_EXPANDED
+// nodes with the nearest it got; `exhausted` tells that apart from a real noPath.
+function * search (start, movements, goal) {
+  const astar = new AStar(start, movements, goal, Infinity, Infinity, SEARCH_RADIUS)
+  for (let expanded = 0; expanded < MAX_EXPANDED; expanded += SLICE) {
+    const result = expand(astar, Math.min(SLICE, MAX_EXPANDED - expanded))
+    if (result) return Object.assign(result, { exhausted: false })
+    yield
+  }
+  return Object.assign(astar.makeResult('noPath', astar.bestNode), { exhausted: true })
 }
 
 // getPathTo(movements, goal) for the bot, drawing on `book` for the bot's world `world()`;
@@ -169,7 +223,38 @@ function communalPlanner (bot, book, world, onPath) {
     return path
   }
 
+  // The search going on, and the one done and not handed over yet: { goal, ... }.
+  let running = null
+  let done = null
+  bot.on('end', () => { if (running) running.cancelled = true })
+
   return function getPathTo (movements, goal) {
+    if (done && done.goal === goal) {
+      const result = done.result
+      done = null
+      return result
+    }
+    if (!running || running.goal !== goal) {
+      if (running) running.cancelled = true
+      const job = {
+        goal,
+        cancelled: false,
+        steps: plan(movements, goal),
+        onDone: result => {
+          running = null
+          done = { goal, result }
+          // Still the goal: pathfinder asks again, and gets it.
+          if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(goal)
+        }
+      }
+      running = job
+      enqueue(job)
+    }
+    // No path yet: the bot stands until the search is done.
+    return { status: 'partial', cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0, path: [] }
+  }
+
+  function * plan (movements, goal) {
     const began = performance.now()
     const start = startMove(movements)
     if (movements.allowEntityDetection) {
@@ -190,7 +275,7 @@ function communalPlanner (bot, book, world, onPath) {
       ? goal
       : { heuristic: node => joins.has(node.hash) ? 0 : goal.heuristic(node), isEnd: node => goal.isEnd(node) || joins.has(node.hash) }
 
-    const first = search(start, movements, toward)
+    const first = yield * search(start, movements, toward)
     const path = first.path
     let status = first.status
     let exhausted = first.exhausted
@@ -203,7 +288,7 @@ function communalPlanner (bot, book, world, onPath) {
       path.push(...along)
       const from = along.length > 0 ? along[along.length - 1] : reached
       if (!goal.isEnd(from)) {
-        const rest = search(from, movements, goal)
+        const rest = yield * search(from, movements, goal)
         path.push(...rest.path)
         status = rest.status
         exhausted = rest.exhausted

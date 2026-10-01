@@ -16,7 +16,8 @@ const { communalPlanner } = require('./communalPaths')
 const HOP = 24
 // How close to a hop's end (blocks) counts as there.
 const HOP_REACH = 2
-// Searches past this many nodes go to the log, with how long they took.
+// Searches past this many nodes go to the log, with how long they took to be done (taking turns with
+// the other searches of the thread included).
 const LOG_SEARCH_NODES = 1000
 
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
@@ -82,7 +83,7 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   }
   bot.on('path_update', result => {
     if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
-    if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes in ${Math.round(result.time)} ms (${result.status})`)
+    if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))
