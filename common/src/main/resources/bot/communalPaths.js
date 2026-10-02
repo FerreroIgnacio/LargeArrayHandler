@@ -6,8 +6,13 @@
 // broken as it is followed is cut where it breaks, and goes on the way the rest was found, for
 // every path thread (see plan).
 //
-// Bounded by time as in mineflayer-pathfinder: thinkTimeout for the whole search, tickTimeout per compute() slice.
+// Not bounded: a search ends when it finds the goal or runs out of nodes, SLICE nodes per step so the
+// thread can take turns between searches (see pathThread.js), and each step that gets nearer to the
+// goal hands out the path to the nearest node so far.
 const AStar = require('mineflayer-pathfinder/lib/astar')
+
+// Nodes a search expands per step.
+const SLICE = 50
 
 // Paths kept per world; the oldest goes when one more comes.
 const KEPT = 256
@@ -118,13 +123,60 @@ function follow (movements, start, { nodes, from, to }) {
   return moves
 }
 
-// A* from start to goal as pathfinder's getPathFromTo runs it: compute() slices of `tickTimeout` ms
-// ('partial') continue until the search ends or `thinkTimeout` ms in all have passed ('timeout', the best
-// path so far). No search radius.
-function search (start, movements, goal, thinkTimeout, tickTimeout) {
-  let result = new AStar(start, movements, goal, thinkTimeout, tickTimeout, -1).compute()
-  while (result.status === 'partial') result = result.context.compute()
-  return result
+// Expands up to `limit` nodes of pathfinder's A* (its compute, counting nodes instead of time):
+// the result once it ends, null while it goes on.
+function expand (astar, limit) {
+  for (let n = 0; n < limit; n++) {
+    if (astar.openHeap.isEmpty()) return astar.makeResult('noPath', astar.bestNode)
+    const node = astar.openHeap.pop()
+    if (astar.goal.isEnd(node.data)) return astar.makeResult('success', node)
+    astar.openDataMap.delete(node.data.hash)
+    astar.closedDataSet.add(node.data.hash)
+    astar.visitedChunks.add(`${node.data.x >> 4},${node.data.z >> 4}`)
+    for (const neighborData of astar.movements.getNeighbors(node.data)) {
+      if (astar.closedDataSet.has(neighborData.hash)) continue
+      const g = node.g + neighborData.cost
+      const heuristic = astar.goal.heuristic(neighborData)
+      let neighborNode = astar.openDataMap.get(neighborData.hash)
+      const update = neighborNode !== undefined
+      if (update && neighborNode.g < g) continue
+      if (!update) {
+        neighborNode = new astar.bestNode.constructor()
+        astar.openDataMap.set(neighborData.hash, neighborNode)
+      }
+      neighborNode.set(neighborData, g, heuristic, node)
+      if (neighborNode.h < astar.bestNode.h) astar.bestNode = neighborNode
+      if (update) astar.openHeap.update(neighborNode)
+      else astar.openHeap.push(neighborNode)
+    }
+  }
+  return null
+}
+
+// A* from start to goal, a slice per step (yield* it). Each step yields null, or { partial: [Move] }
+// when the nearest node to the goal got nearer: the path to it. Returns the result when it ends.
+function * search (start, movements, goal) {
+  const astar = new AStar(start, movements, goal, Infinity, Infinity, -1)
+  let nearest = astar.bestNode.h
+  for (;;) {
+    const result = expand(astar, SLICE)
+    if (result) return result
+    if (astar.bestNode.h < nearest) {
+      nearest = astar.bestNode.h
+      yield { partial: astar.makeResult('partial', astar.bestNode).path }
+    } else {
+      yield null
+    }
+  }
+}
+
+// The steps of `inner` with `prefix` (moves) before each partial path.
+function * prefixed (inner, prefix) {
+  for (;;) {
+    const { done, value } = inner.next()
+    if (done) return value
+    yield value && { partial: prefix.concat(value.partial) }
+  }
 }
 
 // `nodes` (an Int32Array x, y, z per node) with the nodes of the Moves `moves` after them.
@@ -139,8 +191,8 @@ function withMoves (nodes, moves) {
 // what was found goes into the book. A joined path that breaks as it is followed is cut in the book
 // at the last node that holds, and goes on the way the rest of the search found to the goal, if it
 // did (what it had past where it broke is gone: past the node nearest the goal no search checked it).
-// { status, visitedNodes, generatedNodes, path: [Move] }.
-function plan (book, world, start, movements, goal, thinkTimeout, tickTimeout) {
+// A generator of search steps (see search) that returns { status, visitedNodes, generatedNodes, path: [Move] }.
+function * plan (book, world, start, movements, goal) {
   // Goals with a position (GoalBlock, GoalNear...) can join a path; any other searches it all.
   const positioned = goal.x !== undefined && goal.y !== undefined && goal.z !== undefined
   const joins = positioned ? book.joinsToward(world, start, goal) : new Map()
@@ -149,7 +201,7 @@ function plan (book, world, start, movements, goal, thinkTimeout, tickTimeout) {
     ? goal
     : { heuristic: node => joins.has(node.hash) ? 0 : goal.heuristic(node), isEnd: node => goal.isEnd(node) || joins.has(node.hash) }
 
-  const first = search(start, movements, toward, thinkTimeout, tickTimeout)
+  const first = yield * search(start, movements, toward)
   const path = first.path
   let status = first.status
   let visitedNodes = first.visitedNodes
@@ -165,7 +217,7 @@ function plan (book, world, start, movements, goal, thinkTimeout, tickTimeout) {
     const held = join.from + along.length
     let kept = held < join.to ? join.nodes.slice(0, (held + 1) * 3) : null
     if (!goal.isEnd(from)) {
-      const rest = search(from, movements, goal, thinkTimeout, tickTimeout)
+      const rest = yield * prefixed(search(from, movements, goal), path.slice())
       path.push(...rest.path)
       status = rest.status
       visitedNodes += rest.visitedNodes

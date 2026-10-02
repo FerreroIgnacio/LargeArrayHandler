@@ -85,8 +85,9 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.loadPlugin(pathfinder)
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
-    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns are.
-    bot.pathfinder.getPathTo = paths.planner(bot, world)
+    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns are:
+    // installs the bot's getPathFromTo.
+    paths.planner(bot, world)
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -97,16 +98,25 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     const g = bot.pathfinder.goal
     return g ? { x: g.x, y: g.y, z: g.z } : null
   }
+  // The token of the result last sent: pathfinder takes a result on each tick while the search goes on,
+  // and the mod hears of it only when it tells something new.
+  let sentToken = null
+  const clearPath = () => {
+    sentToken = null
+    out(protocol.path(name, null))
+  }
   bot.on('path_update', result => {
+    if (result.token === sentToken) return
+    sentToken = result.token
     if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
-    if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
+    if (result.status !== 'partial' && result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
-    else out(protocol.path(name, target, result.path))
+    else out(protocol.path(name, target, result.path, result.waiting))
   })
-  bot.on('goal_reached', () => out(protocol.path(name, null)))
-  bot.on('path_stop', () => out(protocol.path(name, null)))
-  bot.on('path_reset', () => out(protocol.path(name, null)))
+  bot.on('goal_reached', clearPath)
+  bot.on('path_stop', clearPath)
+  bot.on('path_reset', clearPath)
 
   // Feet and head free, something solid below.
   function standable (p) {

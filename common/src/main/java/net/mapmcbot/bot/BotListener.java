@@ -5,8 +5,11 @@ public interface BotListener {
 	/** In the world, ready for orders. */
 	void onSpawned(String bot);
 
-	/** The path being walked: {target x, y, z, node x, y, z, ...}, sent again on each of its updates. */
-	void onPath(String bot, int[] path);
+	/**
+	 * The path being walked: {target x, y, z, node x, y, z, ...}, sent again on each of its updates.
+	 * waiting: the bot has no path to walk until its search sends the next.
+	 */
+	void onPath(String bot, int[] path, boolean waiting);
 
 	/** Not walking a path any more. */
 	void onPathCleared(String bot);

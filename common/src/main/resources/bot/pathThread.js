@@ -1,8 +1,8 @@
 // A path thread of the fleet: searches the bots' paths (see communalPaths.js), never on a bot's
 // thread, in a world made of every column any bot of the fleet holds (the slots of columns.bin, see
 // sharedChunks.js, handed over by the fleet): a bot gets a path through columns the server never
-// sent it. Pool threads ask over a port of their own (see pathClient.js). One search per turn of
-// the event loop, so columns, cancels and new requests are taken in between.
+// sent it. Pool threads ask over a port of their own (see pathClient.js). A step of one search per turn of
+// the event loop, the searches taking turns, so columns, cancels and new requests are taken in between.
 const { parentPort, workerData } = require('worker_threads')
 const { Vec3 } = require('vec3')
 const nbt = require('prismarine-nbt')
@@ -105,85 +105,108 @@ function goalOf (goal) {
   throw new Error(`unknown goal ${goal.kind} for the path thread`)
 }
 
-// Searches the request, waiting on snapshots: a search that looked for columns the fleet does not
-// have in memory, and the request never asked for, is put aside while the fleet reads them off
-// their snapshots (see fleet.js), then run again once the fleet says they are in (or have none).
-// Columns with no snapshot stay unknown: the search answers with the best path it finds without them.
-// asked: the "cx,cz" this request asked the fleet for already.
-function run (port, request, asked) {
-  missing = new Set()
-  // The column last looked up may be one missing: looked up again, to be counted.
-  last.columns = null
-  const result = search(request)
-  const wanted = [...missing].filter(id => !asked.has(id))
-  if (wanted.length === 0) {
-    port.postMessage(result)
-    return
-  }
-  for (const id of wanted) asked.add(id)
-  const ticket = nextTicket++
-  parked.set(ticket, { port, request, asked })
-  parentPort.postMessage({ wanted: { world: request.world, ids: wanted, ticket } })
+// The moves as they go over the port.
+function wire (moves) {
+  return moves.map(m => ({ x: m.x, y: m.y, z: m.z, remainingBlocks: m.remainingBlocks, cost: m.cost, toBreak: m.toBreak, toPlace: m.toPlace, parkour: m.parkour }))
 }
 
-function search (request) {
+// What the search of a request sees: the world of the fleet, the bot's items, effects and entities.
+// Set before every step, the searches taking turns on the same movements.
+function prepare (request) {
   const { bot, movements } = forVersion(request.version)
   bot.columns = worlds.get(request.world) ?? new Map()
   bot.items = request.items
   bot.entity.effects = request.effects
   bot.entities = request.entities
+  movements.clearCollisionIndex()
+  movements.updateCollisionIndex()
+  return { bot, movements }
+}
+
+// The steps of a request's search (see communalPaths.js's plan): yields null or { partial } as plan
+// does, returns the answer once the search ends.
+function * search (request) {
+  const { bot, movements } = forVersion(request.version)
   const goal = goalOf(request.goal)
   if (!bot.blockAt(goal)) {
     return { id: request.id, status: 'noPath', reason: 'target not loaded', visitedNodes: 0, generatedNodes: 0, moves: [] }
   }
-  movements.clearCollisionIndex()
-  movements.updateCollisionIndex()
   const { start } = request
-  const began = performance.now()
-  const found = plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal, request.thinkTimeout, request.tickTimeout)
-  const took = performance.now() - began
-  let spent = searched.get(request.bot)
-  if (!spent) searched.set(request.bot, (spent = { ms: 0, searches: 0, nodes: 0 }))
-  spent.ms += took
-  spent.searches++
-  spent.nodes += found.visitedNodes
-  if (found.visitedNodes > LOG_SEARCH_NODES) {
-    console.log(`[path thread ${workerData.index}] ${found.visitedNodes} nodes in ${Math.round(took)} ms (${found.status}), ${queue.length} waiting`)
-  }
+  const found = yield * plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal)
   return {
     id: request.id,
     status: found.status,
     visitedNodes: found.visitedNodes,
     generatedNodes: found.generatedNodes,
-    moves: found.path.map(m => ({ x: m.x, y: m.y, z: m.z, remainingBlocks: m.remainingBlocks, cost: m.cost, toBreak: m.toBreak, toPlace: m.toPlace, parkour: m.parkour }))
+    moves: wire(found.path)
   }
 }
 
-// Requests waiting, in order: { port, request, asked }.
-const queue = []
-// Requests put aside until the fleet has the snapshots they wanted: ticket -> { port, request, asked }.
+// The searches taking turns: { port, request, asked, steps, ms, nodes }. Each turn the first one
+// takes a step and goes to the back, so a search never holds the thread and none waits for another to end.
+// asked: the "cx,cz" this request asked the fleet for already.
+const searches = []
+// Searches put aside until the fleet has the snapshots they wanted: ticket -> the same entries.
+// A search that looked for columns the fleet does not have in memory, and the request never asked
+// for, is put aside while the fleet reads them off their snapshots (see fleet.js), then begun again
+// once the fleet says they are in (or have none). Columns with no snapshot stay unknown: the search
+// goes on without them.
 const parked = new Map()
 let nextTicket = 1
-// Tickets of requests cancelled while put aside: the fleet's answer to them goes nowhere.
+// Tickets of searches cancelled while put aside: the fleet's answer to them goes nowhere.
 const cancelledTickets = new Set()
 
 function turn () {
-  const { port, request, asked } = queue.shift()
-  run(port, request, asked)
-  if (queue.length > 0) setImmediate(turn)
+  const job = searches.shift()
+  step(job)
+  if (searches.length > 0) setImmediate(turn)
 }
 
-function enqueue (entry) {
-  if (queue.length === 0) setImmediate(turn)
-  queue.push(entry)
+function enqueue (job) {
+  if (searches.length === 0) setImmediate(turn)
+  searches.push(job)
+}
+
+function step (job) {
+  const { port, request } = job
+  prepare(request)
+  missing = new Set()
+  // The column last looked up may be one missing: looked up again, to be counted.
+  last.columns = null
+  const began = performance.now()
+  const { done, value } = job.steps.next()
+  job.ms += performance.now() - began
+  const wanted = [...missing].filter(id => !job.asked.has(id))
+  if (wanted.length > 0) {
+    for (const id of wanted) job.asked.add(id)
+    const ticket = nextTicket++
+    parked.set(ticket, job)
+    parentPort.postMessage({ wanted: { world: request.world, ids: wanted, ticket } })
+    return
+  }
+  if (done) {
+    let spent = searched.get(request.bot)
+    if (!spent) searched.set(request.bot, (spent = { ms: 0, searches: 0, nodes: 0 }))
+    spent.ms += job.ms
+    spent.searches++
+    spent.nodes += value.visitedNodes
+    if (value.visitedNodes > LOG_SEARCH_NODES) {
+      console.log(`[path thread ${workerData.index}] ${value.visitedNodes} nodes in ${Math.round(job.ms)} ms (${value.status}), ${searches.length} taking turns`)
+    }
+    port.postMessage(value)
+    return
+  }
+  // Nearer to the goal than ever: the bot walks the path to there while the search goes on.
+  if (value) port.postMessage({ id: request.id, status: 'partial', moves: wire(value.partial) })
+  searches.push(job)
 }
 
 function onRequest (port, message) {
   if (message.cancel !== undefined) {
-    // Not started yet, or put aside: dropped, and said so. Being searched or done: its answer is on the way.
-    const i = queue.findIndex(q => q.port === port && q.request.id === message.cancel)
+    // Taking turns, or put aside: dropped, and said so. Done: its answer is on the way.
+    const i = searches.findIndex(q => q.port === port && q.request.id === message.cancel)
     if (i >= 0) {
-      queue.splice(i, 1)
+      searches.splice(i, 1)
       port.postMessage({ id: message.cancel, cancelled: true })
       return
     }
@@ -196,7 +219,7 @@ function onRequest (port, message) {
     }
     return
   }
-  enqueue({ port, request: message, asked: new Set() })
+  enqueue({ port, request: message, asked: new Set(), steps: search(message), ms: 0 })
 }
 
 parentPort.on('message', message => {
@@ -224,7 +247,7 @@ parentPort.on('message', message => {
       book.apply(message.world, message.id, message.nodes)
       break
     case 'profile': {
-      const rows = prof.rows([[scope, 'queue', '#', queue.length], [scope, 'parked', '#', parked.size]])
+      const rows = prof.rows([[scope, 'queue', '#', searches.length], [scope, 'parked', '#', parked.size]])
       for (const [bot, spent] of searched) {
         rows.push([`node.bot:${bot}`, 'cpu.path', 'ms', spent.ms], [`node.bot:${bot}`, 'path.searches', 'n', spent.searches], [`node.bot:${bot}`, 'path.nodes', 'n', spent.nodes])
       }
@@ -234,10 +257,12 @@ parentPort.on('message', message => {
     case 'wanted': {
       // The columns the ticket wanted are in (their 'column' came first), or have no snapshot: searched again.
       if (cancelledTickets.delete(message.ticket)) break
-      const entry = parked.get(message.ticket)
-      if (!entry) throw new Error(`the fleet answered ticket ${message.ticket}, which no request waits on`)
+      const job = parked.get(message.ticket)
+      if (!job) throw new Error(`the fleet answered ticket ${message.ticket}, which no request waits on`)
       parked.delete(message.ticket)
-      enqueue(entry)
+      // Begun again: what it read before was without those columns.
+      job.steps = search(job.request)
+      enqueue(job)
       break
     }
     default:

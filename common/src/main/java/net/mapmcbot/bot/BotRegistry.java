@@ -30,6 +30,9 @@ public final class BotRegistry implements BotListener {
 	/** The path each walking bot is on, from its PATH frames. */
 	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
+	/** The walking bots with no path to walk until their search sends the next. */
+	private final Set<String> waiting = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
 	public BotRegistry(FleetChannel channel) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
@@ -43,13 +46,17 @@ public final class BotRegistry implements BotListener {
 		return Collections.unmodifiableSet(bots);
 	}
 
-	/** connecting, idle or walking. */
+	/** connecting, idle, walking or waiting instruction. */
 	public String getStatus(String bot) {
 		if (!spawned.contains(bot)) {
 			return "connecting";
 		}
 
-		return paths.containsKey(bot) ? "walking" : "idle";
+		if (!paths.containsKey(bot)) {
+			return "idle";
+		}
+
+		return waiting.contains(bot) ? "waiting instruction" : "walking";
 	}
 
 	/** The paths being walked, by bot: {target x, y, z, node x, y, z, ...}. */
@@ -90,13 +97,20 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
-	public void onPath(String bot, int[] path) {
+	public void onPath(String bot, int[] path, boolean isWaiting) {
 		paths.put(bot, path);
+
+		if (isWaiting) {
+			waiting.add(bot);
+		} else {
+			waiting.remove(bot);
+		}
 	}
 
 	@Override
 	public void onPathCleared(String bot) {
 		paths.remove(bot);
+		waiting.remove(bot);
 	}
 
 	@Override
@@ -104,6 +118,7 @@ public final class BotRegistry implements BotListener {
 		bots.remove(bot);
 		spawned.remove(bot);
 		paths.remove(bot);
+		waiting.remove(bot);
 	}
 
 	@Override
@@ -115,5 +130,6 @@ public final class BotRegistry implements BotListener {
 		bots.clear();
 		spawned.clear();
 		paths.clear();
+		waiting.clear();
 	}
 }

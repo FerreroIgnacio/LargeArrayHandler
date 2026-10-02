@@ -229,9 +229,10 @@ public final class FleetProtocol {
 						break;
 					}
 
+					final boolean waiting = in.readBoolean();
 					final int[] path = readPath(in);
 					end(in, type);
-					bots.onPath(bot, path);
+					bots.onPath(bot, path, waiting);
 					break;
 
 				case BOT_SPAWNED:

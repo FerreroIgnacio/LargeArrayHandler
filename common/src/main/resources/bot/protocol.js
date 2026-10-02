@@ -199,11 +199,13 @@ function botSpawned (bot) {
 }
 
 // The path the bot is walking: target {x, y, z} and nodes [{x, y, z}]; null when it is not walking one.
-function path (bot, target, nodes) {
+// `waiting`: its search is not over and the bot has no path to walk until the next one comes.
+function path (bot, target, nodes, waiting) {
   const w = new Writer(TYPES.PATH)
   w.str(bot)
   w.u8(target ? 1 : 0)
   if (target) {
+    w.u8(waiting ? 1 : 0)
     w.i32(target.x)
     w.i32(target.y)
     w.i32(target.z)

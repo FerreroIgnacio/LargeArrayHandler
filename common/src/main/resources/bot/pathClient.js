@@ -1,10 +1,13 @@
-// mineflayer-pathfinder's getPathTo for the bots of a pool thread: their searches run on the
-// fleet's path threads (see pathThread.js), never here. getPathTo sends the request and hands
-// pathfinder no path yet, so the bot stands; once the answer comes the bot sets its goal again,
-// pathfinder asks again, and getPathTo hands it the path. Asked again for the goal it is already
-// walking to (pathfinder drops its path when a block near it changes, when the bot gets stuck or
-// fails to dig), the bot keeps walking what is left of its path until the new one comes. A goal no
-// search found a path to is not searched again until the bot is RETRY_AFTER blocks from where it was.
+// mineflayer-pathfinder's getPathFromTo for the bots of a pool thread: their searches run on the
+// fleet's path threads (see pathThread.js), never here. A bot with a goal walks what the search has
+// found so far: each time the search gets nearer to the goal the thread sends the path to there (a
+// 'partial' answer), and the bot takes it from pathfinder's own astar context, whose compute() hands
+// out the latest (pathfinder calls it each tick while the status is 'partial'). The search ends with
+// 'success' or 'noPath': the answer that says so is the last. A bot that walked a partial path to its
+// end stands, waiting for the next, and says so (`waiting` of the results, see bot.js).
+// Asked again for the goal it is already searching, the bot goes on with that search (pathfinder drops
+// its path when a block near it changes, when the bot gets stuck or fails to dig). A goal no search
+// found a path to is not searched again until the bot is RETRY_AFTER blocks from where it was.
 // Each request goes to the path thread with the fewest waiting, counted across the whole fleet.
 const RETRY_AFTER = 4
 // Entities go with a request only inside the box of its start and goal widened by this many blocks
@@ -16,7 +19,7 @@ const Move = require('mineflayer-pathfinder/lib/move')
 const { GoalBlock } = require('mineflayer-pathfinder/lib/goals')
 
 // `ports`: one per path thread, from the fleet. `pending`: per path thread, the requests sent to it
-// and not answered yet, shared by every pool thread: one more as a request goes, one less as its
+// and not ended yet, shared by every pool thread: one more as a request goes, one less as its last
 // answer (or its cancel) comes, every request getting exactly one.
 function pathClient (ports, pending) {
   if (pending.length !== ports.length) throw new Error(`${pending.length} pending counts for ${ports.length} path threads`)
@@ -29,8 +32,11 @@ function pathClient (ports, pending) {
     port.on('message', answer => {
       const onAnswer = waiting.get(answer.id)
       if (!onAnswer) throw new Error(`a path thread answered request ${answer.id}, which no bot is waiting on`)
-      waiting.delete(answer.id)
-      if (Atomics.sub(pending, i, 1) <= 0) throw new Error(`path thread ${i} answered more requests than it was sent`)
+      // A partial answer is not the last: the request goes on.
+      if (answer.status !== 'partial') {
+        waiting.delete(answer.id)
+        if (Atomics.sub(pending, i, 1) <= 0) throw new Error(`path thread ${i} answered more requests than it was sent`)
+      }
       onAnswer(answer)
     })
   })
@@ -59,21 +65,24 @@ function pathClient (ports, pending) {
     const ladder = bot.registry.blocksByName.ladder.id
     const vine = bot.registry.blocksByName.vine.id
 
-    // The request on its way, the answer done and not handed over yet, and the path handed over
-    // last: { goal, ... }. pathfinder walks that path's own array, taking each node off as it gets
-    // there: what is in it is what is left.
-    let running = null
-    let done = null
-    let walking = null
+    // The search of the goal the bot walks to: { goal, id, port, cancelled, began, start, answer, final,
+    // delivered }. `answer`: the latest of the thread, { status, reason, moves, ... }; `final`: it is the last.
+    let job = null
+    // The path handed to pathfinder last, and the goal it was for: pathfinder walks that path's own
+    // array, taking each node off as it gets there: what is in it is what is left.
+    let held = []
+    let heldGoal = null
     // The last search that found no path: { goal, start, result }.
     let failed = null
+    // Changes with each result that tells the mod something new (see bot.js).
+    let sequence = 0
     bot.on('end', () => cancel())
 
     function cancel () {
-      if (!running) return
-      running.cancelled = true
-      running.port.postMessage({ cancel: running.id })
-      running = null
+      if (!job || job.final) return
+      job.cancelled = true
+      job.port.postMessage({ cancel: job.id })
+      job = null
     }
 
     // The block the bot stands in, as pathfinder's getPathFromTo takes it.
@@ -153,77 +162,129 @@ function pathClient (ports, pending) {
         m.toPlace.map(p => p.returnPos ? { ...p, returnPos: new Vec3(p.returnPos.x, p.returnPos.y, p.returnPos.z) } : p), m.parkour))
     }
 
-    return function getPathTo (movements, goal) {
-      if (done && done.goal === goal) {
-        const result = done.result
-        done = null
-        walking = { goal, path: result.path }
-        return result
+    // The node reached: where the bot stands, as pathfinder takes a node as arrived at.
+    function reached (node) {
+      const p = bot.entity.position
+      return Math.abs(node.x - p.x) <= 0.35 && Math.abs(node.z - p.z) <= 0.35 && Math.abs(node.y - p.y) < 1
+    }
+
+    // The same move as another Move, sharing its blocks to break and place (what is dug or placed on
+    // one is dug or placed on all), standing where standOn put it.
+    function copy (m) {
+      const c = new Move(m.x, m.y, m.z, m.remainingBlocks, m.cost, m.toBreak, m.toPlace, m.parkour)
+      c.x = m.x
+      c.y = m.y
+      c.z = m.z
+      return c
+    }
+
+    // The result for pathfinder of the latest answer of the job: what pathfinder's compute would give.
+    // A path of its own each time, as compute's are: pathfinder cuts it down to where the bot is.
+    function resultOf (job) {
+      const answer = job.answer
+      let path
+      let waiting
+      if (!answer) {
+        // Nothing found yet: the rest of the path it was walking to this goal, else it stands.
+        path = heldGoal === job.goal ? held : []
+        waiting = path.length === 0 || reached(path[path.length - 1])
+      } else {
+        path = answer.moves.map(copy)
+        waiting = !job.final && (path.length === 0 || reached(path[path.length - 1]))
+        if (job.final) job.delivered = true
       }
-      if (!running || running.goal !== goal) {
-        // Given up on from about here already: the same answer, without asking again.
-        const from = start(movements)
-        if (failed && failed.goal === goal && Math.abs(from.x - failed.start.x) + Math.abs(from.y - failed.start.y) + Math.abs(from.z - failed.start.z) < RETRY_AFTER) {
-          return { ...failed.result, path: [] }
-        }
-        cancel()
-        const job = { goal, id: nextId++, port: leastBusy(), cancelled: false, began: performance.now(), start: from }
-        const self = bot.entity
-        waiting.set(job.id, answer => {
-          if (job.cancelled) return
-          if (answer.cancelled) throw new Error(`${bot.username}: request ${job.id} cancelled without being asked to`)
-          running = null
-          const path = movesOf(answer.moves)
-          failed = answer.status === 'noPath'
-            ? { goal, start: job.start, result: { status: answer.status, reason: answer.reason, cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0 } }
-            : null
-          done = {
-            goal,
-            result: {
-              status: answer.status,
-              reason: answer.reason,
-              cost: path.reduce((sum, node) => sum + node.cost, 0),
-              time: performance.now() - job.began,
-              visitedNodes: answer.visitedNodes,
-              generatedNodes: answer.generatedNodes,
-              path: standOn(path)
-            }
-          }
-          // Still the goal: pathfinder asks again, and gets it.
-          if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(goal)
-        })
-        const target = goalOf(goal)
-        const minX = Math.min(from.x, target.x) - ENTITY_MARGIN
-        const maxX = Math.max(from.x, target.x) + ENTITY_MARGIN
-        const minZ = Math.min(from.z, target.z) - ENTITY_MARGIN
-        const maxZ = Math.max(from.z, target.z) + ENTITY_MARGIN
-        const entities = []
-        for (const id in bot.entities) {
-          const e = bot.entities[id]
-          if (e === self || !e.position) continue
-          if (movements.passableEntities.has(e.name) && !movements.entitiesToAvoid.has(e.name)) continue
-          const { x, y, z } = e.position
-          if (x < minX || x > maxX || z < minZ || z > maxZ) continue
-          entities.push({ name: e.name, width: e.width, height: e.height, position: { x, y, z } })
-        }
-        job.port.postMessage({
-          id: job.id,
-          bot: bot.username,
-          world: world(),
-          version: bot.version,
-          start: from,
-          goal: target,
-          items: bot.inventory.items().map(item => ({ type: item.type, nbt: item.nbt })),
-          thinkTimeout: bot.pathfinder.thinkTimeout,
-          tickTimeout: bot.pathfinder.tickTimeout,
-          effects: self.effects,
-          entities
-        })
-        running = job
+      held = path
+      heldGoal = job.goal
+      return {
+        status: answer ? answer.status : 'partial',
+        reason: answer?.reason,
+        cost: path.reduce((sum, node) => sum + node.cost, 0),
+        time: performance.now() - job.began,
+        visitedNodes: answer ? answer.visitedNodes : 0,
+        generatedNodes: answer ? answer.generatedNodes : 0,
+        path,
+        waiting,
+        // Told by the answer it is of and by waiting: the same one asked again is nothing new.
+        token: `${job.id}:${answer ? answer.sequence : 0}:${waiting}`
       }
-      // No new path yet: the rest of the one it was walking to the same goal, else it stands.
-      const rest = walking && walking.goal === goal ? walking.path : []
-      return { status: 'partial', cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0, path: rest }
+    }
+
+    // pathfinder's astar context for the job: it calls compute() on each tick while the status it
+    // got is 'partial'. Nothing it visited is kept here: no chunk loading cuts the path.
+    function contextOf (job) {
+      return { visitedChunks: new Set(), compute: () => resultOf(job) }
+    }
+
+    function begin (movements, goal, from) {
+      cancel()
+      job = { goal, id: nextId++, port: leastBusy(), cancelled: false, final: false, delivered: false, answer: null, began: performance.now(), start: from }
+      const mine = job
+      const self = bot.entity
+      waiting.set(mine.id, answer => {
+        if (mine.cancelled) return
+        if (answer.cancelled) throw new Error(`${bot.username}: request ${mine.id} cancelled without being asked to`)
+        mine.answer = {
+          status: answer.status,
+          reason: answer.reason,
+          visitedNodes: answer.visitedNodes,
+          generatedNodes: answer.generatedNodes,
+          moves: standOn(movesOf(answer.moves)),
+          sequence: ++sequence
+        }
+        if (answer.status === 'partial') return
+        mine.final = true
+        if (answer.status === 'noPath') {
+          failed = { goal, start: mine.start, result: { status: 'noPath', reason: answer.reason, cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0 } }
+        } else {
+          failed = null
+        }
+      })
+      const target = goalOf(goal)
+      const minX = Math.min(from.x, target.x) - ENTITY_MARGIN
+      const maxX = Math.max(from.x, target.x) + ENTITY_MARGIN
+      const minZ = Math.min(from.z, target.z) - ENTITY_MARGIN
+      const maxZ = Math.max(from.z, target.z) + ENTITY_MARGIN
+      const entities = []
+      for (const id in bot.entities) {
+        const e = bot.entities[id]
+        if (e === self || !e.position) continue
+        if (movements.passableEntities.has(e.name) && !movements.entitiesToAvoid.has(e.name)) continue
+        const { x, y, z } = e.position
+        if (x < minX || x > maxX || z < minZ || z > maxZ) continue
+        entities.push({ name: e.name, width: e.width, height: e.height, position: { x, y, z } })
+      }
+      mine.port.postMessage({
+        id: mine.id,
+        bot: bot.username,
+        world: world(),
+        version: bot.version,
+        start: from,
+        goal: target,
+        items: bot.inventory.items().map(item => ({ type: item.type, nbt: item.nbt })),
+        effects: self.effects,
+        entities
+      })
+      return mine
+    }
+
+    // pathfinder's getPathTo calls this and takes the first value: the result to start walking, and the
+    // context that gives it the next ones.
+    bot.pathfinder.getPathFromTo = function * getPathFromTo (movements, startPos, goal) {
+      // The search of this goal still going, or its last answer not handed over yet: that one.
+      if (job && job.goal === goal && (!job.final || !job.delivered)) {
+        yield { result: resultOf(job), astarContext: contextOf(job) }
+        return
+      }
+      // Given up on from about here already: the same answer, without asking again.
+      const from = start(movements)
+      if (failed && failed.goal === goal && Math.abs(from.x - failed.start.x) + Math.abs(from.y - failed.start.y) + Math.abs(from.z - failed.start.z) < RETRY_AFTER) {
+        held = []
+        heldGoal = goal
+        yield { result: { ...failed.result, path: [], waiting: false, token: `failed:${++sequence}` }, astarContext: null }
+        return
+      }
+      const mine = begin(movements, goal, from)
+      yield { result: resultOf(mine), astarContext: contextOf(mine) }
     }
   }
 
