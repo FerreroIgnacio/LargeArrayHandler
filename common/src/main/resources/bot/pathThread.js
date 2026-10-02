@@ -10,7 +10,7 @@ const Move = require('mineflayer-pathfinder/lib/move')
 const Movements = require('mineflayer-pathfinder/lib/movements')
 const { GoalBlock } = require('mineflayer-pathfinder/lib/goals')
 const { columnClass, openColumns } = require('./sharedChunks')
-const { pathBook, plan, MAX_EXPANDED } = require('./communalPaths')
+const { pathBook, plan } = require('./communalPaths')
 const { threadProfiler } = require('./profiler')
 
 // Searches past this many nodes go to the log, with what they cost and how many requests wait.
@@ -140,7 +140,7 @@ function search (request) {
   movements.updateCollisionIndex()
   const { start } = request
   const began = performance.now()
-  const found = plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal)
+  const found = plan(book, request.world, new Move(start.x, start.y, start.z, start.remainingBlocks, 0), movements, goal, request.thinkTimeout, request.tickTimeout)
   const took = performance.now() - began
   let spent = searched.get(request.bot)
   if (!spent) searched.set(request.bot, (spent = { ms: 0, searches: 0, nodes: 0 }))
@@ -153,7 +153,6 @@ function search (request) {
   return {
     id: request.id,
     status: found.status,
-    reason: found.status !== 'success' && found.exhausted ? `gave up after ${MAX_EXPANDED} nodes` : undefined,
     visitedNodes: found.visitedNodes,
     generatedNodes: found.generatedNodes,
     moves: found.path.map(m => ({ x: m.x, y: m.y, z: m.z, remainingBlocks: m.remainingBlocks, cost: m.cost, toBreak: m.toBreak, toPlace: m.toPlace, parkour: m.parkour }))

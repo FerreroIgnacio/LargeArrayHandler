@@ -8,7 +8,7 @@
 // Each request goes to the path thread with the fewest waiting, counted across the whole fleet.
 const RETRY_AFTER = 4
 // Entities go with a request only inside the box of its start and goal widened by this many blocks
-// (half communalPaths.js's SEARCH_RADIUS, as far as a search strays to either side), and only
+// (a window around the search, which is no longer bounded by a radius), and only
 // those pathfinder's Movements counts: a bot in a crowd sees every other bot of the fleet.
 const ENTITY_MARGIN = 32
 const { Vec3 } = require('vec3')
@@ -174,7 +174,7 @@ function pathClient (ports, pending) {
           if (answer.cancelled) throw new Error(`${bot.username}: request ${job.id} cancelled without being asked to`)
           running = null
           const path = movesOf(answer.moves)
-          failed = answer.status !== 'success'
+          failed = answer.status === 'noPath'
             ? { goal, start: job.start, result: { status: answer.status, reason: answer.reason, cost: 0, time: 0, visitedNodes: 0, generatedNodes: 0 } }
             : null
           done = {
@@ -214,6 +214,8 @@ function pathClient (ports, pending) {
           start: from,
           goal: target,
           items: bot.inventory.items().map(item => ({ type: item.type, nbt: item.nbt })),
+          thinkTimeout: bot.pathfinder.thinkTimeout,
+          tickTimeout: bot.pathfinder.tickTimeout,
           effects: self.effects,
           entities
         })

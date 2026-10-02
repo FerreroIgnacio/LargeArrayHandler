@@ -6,7 +6,7 @@
 // broken as it is followed is cut where it breaks, and goes on the way the rest was found, for
 // every path thread (see plan).
 //
-// Bounded by distance (SEARCH_RADIUS) and by nodes expanded (MAX_EXPANDED), never by time.
+// Bounded by time as in mineflayer-pathfinder: thinkTimeout for the whole search, tickTimeout per compute() slice.
 const AStar = require('mineflayer-pathfinder/lib/astar')
 
 // Paths kept per world; the oldest goes when one more comes.
@@ -15,10 +15,6 @@ const KEPT = 256
 const JOIN_NEAR = 12
 // ...when it gets this close to the goal (the goal's heuristic, about blocks).
 const NEAR_GOAL = 8
-// How much costlier than the straight distance a search may get (pathfinder's searchRadius).
-const SEARCH_RADIUS = 64
-// Nodes a search expands at most: past it the search gives up with the nearest it got (noPath).
-const MAX_EXPANDED = 10000
 
 // The paths of the fleet as one path thread has them, per world ("server|dimension"): id -> an
 // Int32Array x, y, z per node, oldest first. Each path has the id its path thread gave it
@@ -122,14 +118,12 @@ function follow (movements, start, { nodes, from, to }) {
   return moves
 }
 
-// A* from start to goal, giving up once it expanded MAX_EXPANDED nodes: past that every node is a
-// dead end, so the open set drains at once. `exhausted` tells that apart from a real noPath.
-function search (start, movements, goal) {
-  let expanded = 0
-  const budgeted = Object.create(movements)
-  budgeted.getNeighbors = node => ++expanded > MAX_EXPANDED ? [] : movements.getNeighbors(node)
-  const result = new AStar(start, budgeted, goal, Infinity, Infinity, SEARCH_RADIUS).compute()
-  result.exhausted = expanded > MAX_EXPANDED
+// A* from start to goal as pathfinder's getPathFromTo runs it: compute() slices of `tickTimeout` ms
+// ('partial') continue until the search ends or `thinkTimeout` ms in all have passed ('timeout', the best
+// path so far). No search radius.
+function search (start, movements, goal, thinkTimeout, tickTimeout) {
+  let result = new AStar(start, movements, goal, thinkTimeout, tickTimeout, -1).compute()
+  while (result.status === 'partial') result = result.context.compute()
   return result
 }
 
@@ -145,8 +139,8 @@ function withMoves (nodes, moves) {
 // what was found goes into the book. A joined path that breaks as it is followed is cut in the book
 // at the last node that holds, and goes on the way the rest of the search found to the goal, if it
 // did (what it had past where it broke is gone: past the node nearest the goal no search checked it).
-// { status, exhausted, visitedNodes, generatedNodes, path: [Move] }.
-function plan (book, world, start, movements, goal) {
+// { status, visitedNodes, generatedNodes, path: [Move] }.
+function plan (book, world, start, movements, goal, thinkTimeout, tickTimeout) {
   // Goals with a position (GoalBlock, GoalNear...) can join a path; any other searches it all.
   const positioned = goal.x !== undefined && goal.y !== undefined && goal.z !== undefined
   const joins = positioned ? book.joinsToward(world, start, goal) : new Map()
@@ -155,10 +149,9 @@ function plan (book, world, start, movements, goal) {
     ? goal
     : { heuristic: node => joins.has(node.hash) ? 0 : goal.heuristic(node), isEnd: node => goal.isEnd(node) || joins.has(node.hash) }
 
-  const first = search(start, movements, toward)
+  const first = search(start, movements, toward, thinkTimeout, tickTimeout)
   const path = first.path
   let status = first.status
-  let exhausted = first.exhausted
   let visitedNodes = first.visitedNodes
   let generatedNodes = first.generatedNodes
   const reached = path.length > 0 ? path[path.length - 1] : start
@@ -172,10 +165,9 @@ function plan (book, world, start, movements, goal) {
     const held = join.from + along.length
     let kept = held < join.to ? join.nodes.slice(0, (held + 1) * 3) : null
     if (!goal.isEnd(from)) {
-      const rest = search(from, movements, goal)
+      const rest = search(from, movements, goal, thinkTimeout, tickTimeout)
       path.push(...rest.path)
       status = rest.status
-      exhausted = rest.exhausted
       visitedNodes += rest.visitedNodes
       generatedNodes += rest.generatedNodes
       // The way on from where it broke.
@@ -185,7 +177,7 @@ function plan (book, world, start, movements, goal) {
   }
 
   if (status === 'success') book.add(world, withMoves(new Int32Array([start.x, start.y, start.z]), path))
-  return { status, exhausted, visitedNodes, generatedNodes, path }
+  return { status, visitedNodes, generatedNodes, path }
 }
 
-module.exports = { pathBook, plan, MAX_EXPANDED }
+module.exports = { pathBook, plan }
