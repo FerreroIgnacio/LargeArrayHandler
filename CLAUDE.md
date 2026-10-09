@@ -5,6 +5,8 @@
 - Todo se dispara por eventos: el cambio que ocurre es el que provoca la acción.
 - Si no queda otra que usar algo basado en tiempo, consultar antes. Nunca implementarlo sin preguntar.
 
+- Excepción autorizada: el **deadline** de las primitivas con condición esperada (`interact`, `esperar slot`, `mover`). Solo sirve para fallar (pasar el bot a `error`) y se resuelve antes si llega el evento. No usarlo para nada más.
+
 ## Fallar fuerte
 - Esto es un entorno de dev, no prod: si algo falla, que rompa. Nada de fallar en silencio.
 - Prohibido tragarse excepciones (`catch` vacío o que solo ignora), devolver `null`/valores por defecto para tapar errores, o saltear datos inválidos. Relanzar (p. ej. `UncheckedIOException`, `IllegalStateException`) con un mensaje que diga qué falló.
