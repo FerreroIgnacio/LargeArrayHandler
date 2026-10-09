@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
+import net.mapmcbot.bot.BotInventory;
 import net.mapmcbot.bot.BotListener;
 import net.mapmcbot.chunk.ChunkData;
 import net.mapmcbot.chunk.ChunkKey;
@@ -81,6 +82,13 @@ public final class FleetProtocol {
 	public static final int UPDATING = 14;
 	/** bot name (empty), why: the relay could not get to the mod's commit, stays up and closes the connection. {@link #relayText} reads it. */
 	public static final int UPDATE_FAILED = 15;
+	/**
+	 * bot name, u8 hotbar slot in hand, i32 id of the last WINDOW_CLICK done (0 before any), the
+	 * cursor's item, i32 slot count and each slot's item: the bot's inventory window whole, sent once
+	 * anything in it changed. An item is u8 present, then its
+	 * name string, i32 count, i32 metadata, i32 NBT length and the NBT (see {@link BotInventory.Item}).
+	 */
+	public static final int INVENTORY = 24;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -100,6 +108,13 @@ public final class FleetProtocol {
 	public static final int HELLO = 22;
 	/** bot name, i32 x, y, z: the bot walks to stand on that block. */
 	public static final int GOTO = 23;
+	/**
+	 * bot name, i32 slot (-999 outside), u8 mouse button, u8 mode: a click on the bot's inventory
+	 * window, as the player's own client sends one (mode 0 pickup, 1 quick move, 2 swap, 3 clone, 4
+	 * throw, 5 drag, 6 pickup all), i32 id: counting up from 1 for each bot, the INVENTORY after it
+	 * says it is done.
+	 */
+	public static final int WINDOW_CLICK = 25;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -292,6 +307,27 @@ public final class FleetProtocol {
 					bots.onSpawned(bot);
 					break;
 
+				case INVENTORY: {
+					final int held = in.readUnsignedByte();
+					final int lastClick = in.readInt();
+					final BotInventory.Item cursor = readItem(in);
+					final int count = in.readInt();
+
+					if (count < 0 || count > 256) {
+						throw new IOException("bad inventory slot count " + count + " for " + bot);
+					}
+
+					final List<BotInventory.Item> slots = new ArrayList<BotInventory.Item>(count);
+
+					for (int i = 0; i < count; i++) {
+						slots.add(readItem(in));
+					}
+
+					end(in, type);
+					bots.onInventory(bot, new BotInventory(held, lastClick, cursor, slots));
+					break;
+				}
+
 				case PROFILE: {
 					final int id = in.readInt();
 					final String reason = readString(in);
@@ -307,6 +343,15 @@ public final class FleetProtocol {
 		} catch (IOException e) {
 			throw new UncheckedIOException("truncated message from the bot fleet", e);
 		}
+	}
+
+	/** An inventory item, null when the slot is empty. */
+	private static BotInventory.Item readItem(DataInput in) throws IOException {
+		if (!in.readBoolean()) {
+			return null;
+		}
+
+		return new BotInventory.Item(readString(in), in.readInt(), in.readInt(), readBytes(in));
 	}
 
 	/** {target x, y, z, node x, y, z, ...}. */
@@ -399,6 +444,22 @@ public final class FleetProtocol {
 			writeString(frame.out, bot);
 			writeString(frame.out, host);
 			frame.out.writeInt(port);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] windowClick(String bot, int slot, int button, int mode, int id) {
+		final Frame frame = new Frame(WINDOW_CLICK);
+
+		try {
+			writeString(frame.out, bot);
+			frame.out.writeInt(slot);
+			frame.out.writeByte(button);
+			frame.out.writeByte(mode);
+			frame.out.writeInt(id);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

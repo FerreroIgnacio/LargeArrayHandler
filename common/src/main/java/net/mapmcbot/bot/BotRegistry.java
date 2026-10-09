@@ -43,6 +43,19 @@ public final class BotRegistry implements BotListener {
 	/** The path each walking bot is on, from its PATH frames. */
 	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
+	/** Each bot's inventory window, from its INVENTORY frames. */
+	private final Map<String, BotInventory> inventories = new ConcurrentHashMap<String, BotInventory>();
+
+	/** Hears each inventory as it comes (the bot window, while it is open); called on the channel's thread. */
+	public interface InventoryListener {
+		void onInventory(String bot, BotInventory inventory);
+	}
+
+	private volatile InventoryListener inventoryListener;
+
+	/** The id of the last click sent to each bot's inventory window, counting up from 1. */
+	private final Map<String, Integer> clicksSent = new ConcurrentHashMap<String, Integer>();
+
 	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
@@ -71,6 +84,59 @@ public final class BotRegistry implements BotListener {
 		}
 
 		return paths.containsKey(bot) ? "walking" : "idle";
+	}
+
+	/** The bot's inventory window as last reported, null before its first. */
+	public BotInventory getInventory(String bot) {
+		return inventories.get(bot);
+	}
+
+	/** The one listener of the inventories as they come, null for none. */
+	public void setInventoryListener(InventoryListener listener) {
+		inventoryListener = listener;
+	}
+
+	/** How many bots the fleet runs (0 the mod's own, else a relay's rid), those still connecting too. */
+	public int countOn(int rid) {
+		int count = 0;
+
+		for (int fleet : fleetOf.values()) {
+			if (fleet == rid) {
+				count++;
+			}
+		}
+
+		return count;
+	}
+
+	/** Where the bot runs: 0 the mod's own fleet, else a relay's rid; null for no such bot. */
+	public Integer getFleet(String bot) {
+		return fleetOf.get(bot);
+	}
+
+	/** A click on the bot's inventory window, on the fleet running it (see FleetProtocol#WINDOW_CLICK). */
+	public void windowClick(String bot, int slot, int button, int mode) {
+		final Integer rid = fleetOf.get(bot);
+
+		if (rid == null) {
+			throw new IllegalStateException("no bot named " + bot + " to click slot " + slot + " of");
+		}
+
+		final int id = clicksSent.merge(bot, 1, Integer::sum);
+
+		if (rid == 0) {
+			channel.windowClick(bot, slot, button, mode, id);
+		} else {
+			relays.windowClick(rid, bot, slot, button, mode, id);
+		}
+	}
+
+	/**
+	 * Whether the inventory has every click sent to the bot done: one older than the clicks after it
+	 * would undo what the window already shows of them, until the next one comes.
+	 */
+	public boolean coversClicks(String bot, BotInventory inventory) {
+		return inventory.getLastClick() >= clicksSent.getOrDefault(bot, 0);
 	}
 
 	/** The paths being walked, by bot: {target x, y, z, node x, y, z, ...}. */
@@ -184,6 +250,16 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
+	public void onInventory(String bot, BotInventory inventory) {
+		inventories.put(bot, inventory);
+		final InventoryListener listener = inventoryListener;
+
+		if (listener != null) {
+			listener.onInventory(bot, inventory);
+		}
+	}
+
+	@Override
 	public void onPathCleared(String bot) {
 		paths.remove(bot);
 	}
@@ -199,6 +275,8 @@ public final class BotRegistry implements BotListener {
 
 		spawned.remove(bot);
 		paths.remove(bot);
+		inventories.remove(bot);
+		clicksSent.remove(bot);
 	}
 
 	/** The mod's own fleet is gone: its bots with it. */
@@ -232,6 +310,8 @@ public final class BotRegistry implements BotListener {
 			serverOf.remove(bot);
 			spawned.remove(bot);
 			paths.remove(bot);
+			inventories.remove(bot);
+			clicksSent.remove(bot);
 
 			if (bots.remove(bot)) {
 				names.give(bot);
@@ -246,5 +326,7 @@ public final class BotRegistry implements BotListener {
 		serverOf.clear();
 		spawned.clear();
 		paths.clear();
+		inventories.clear();
+		clicksSent.clear();
 	}
 }

@@ -19,6 +19,7 @@ const TYPES = {
   WELCOME: 13,
   UPDATING: 14,
   UPDATE_FAILED: 15,
+  INVENTORY: 24,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
@@ -26,7 +27,8 @@ const TYPES = {
   QUIT: 18,
   PROFILE_REQUEST: 21,
   HELLO: 22,
-  GOTO: 23
+  GOTO: 23,
+  WINDOW_CLICK: 25
 }
 
 class Writer {
@@ -225,6 +227,32 @@ function path (bot, target, nodes) {
   return w.frame()
 }
 
+// The bot's inventory, as its own window holds it: `held` the hotbar slot in its hand (0-8),
+// `lastClick` the id of the mod's last click done (0 before any), the item on its cursor and every
+// slot by window id (46 from 1.9, 45 before). An item is u8 present,
+// then its name ("minecraft:stone"), i32 count, i32 metadata (0 from 1.13) and i32 NBT length and
+// the NBT (named root compound, big-endian; 0 for none). Neutral of the version: the mod makes its
+// own item of it.
+function inventory (bot, held, lastClick, cursor, slots) {
+  const w = new Writer(TYPES.INVENTORY)
+  w.str(bot)
+  w.u8(held)
+  w.i32(lastClick)
+  item(w, cursor)
+  w.i32(slots.length)
+  for (const slot of slots) item(w, slot)
+  return w.frame()
+}
+
+function item (w, it) {
+  w.u8(it ? 1 : 0)
+  if (!it) return
+  w.str(it.name.includes(':') ? it.name : `minecraft:${it.name}`)
+  w.i32(it.count)
+  w.i32(it.metadata ?? 0)
+  w.bytes(it.nbt)
+}
+
 // The fleet crashed: its error, for the mod to keep. Only a relay sends it (the mod has its own fleet's output). No bot: an empty name.
 function crash (text) {
   const w = new Writer(TYPES.CRASH)
@@ -308,6 +336,12 @@ function decode (frame) {
     case TYPES.PROFILE_REQUEST:
       message = { type, bot: r.str(), id: r.i32(), reason: r.str() }
       break
+    case TYPES.WINDOW_CLICK:
+      // A click on the bot's inventory window, as the player's own client sends one: slot (-999
+      // outside), mouse button and mode (0 pickup, 1 quick move, 2 swap, 3 clone, 4 throw, 5 drag,
+      // 6 pickup all) and its id, counting up from 1 for each bot.
+      message = { type, bot: r.str(), slot: r.i32(), button: r.u8(), mode: r.u8(), id: r.i32() }
+      break
     case TYPES.GOTO:
       message = { type, bot: r.str(), spot: { x: r.i32(), y: r.i32(), z: r.i32() } }
       break
@@ -337,4 +371,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

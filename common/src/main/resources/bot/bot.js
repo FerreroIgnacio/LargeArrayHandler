@@ -203,6 +203,118 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     markChanged(newBlock.position.x, newBlock.position.z)
   })
 
+  // The bot's inventory for the mod (its bot window): sent whole once anything in it changed, a slot,
+  // the item on its cursor or the one in its hand, once per turn however many did.
+  let inventoryQueued = false
+  // The id of the mod's last click done (see click below), 0 before any.
+  let lastClick = 0
+  const itemOut = it => it ? { name: it.name, count: it.count, metadata: it.metadata, nbt: it.nbt ? nbt.writeUncompressed({ ...it.nbt, name: it.nbt.name ?? '' }) : Buffer.alloc(0) } : null
+  function sendInventory () {
+    inventoryQueued = false
+    if (!bot.inventory) return
+    out(protocol.inventory(name, bot.quickBarSlot ?? 0, lastClick, itemOut(bot.inventory.selectedItem), bot.inventory.slots.map(itemOut)))
+  }
+  function queueInventory () {
+    if (inventoryQueued) return
+    inventoryQueued = true
+    setImmediate(sendInventory)
+  }
+  bot.once('spawn', () => {
+    bot.inventory.doubleClick = pickupAll
+    bot.inventory.on('updateSlot', queueInventory)
+    bot.on('heldItemChanged', queueInventory)
+    // The server's own word on slots and the cursor, mineflayer's handlers run first.
+    bot._client.on('set_slot', queueInventory)
+    bot._client.on('window_items', queueInventory)
+    queueInventory()
+  })
+
+  // A double click with an item on the cursor (pickup all, mode 6), as the server does it, for
+  // mineflayer's window to know what the click left (prismarine-windows has none): over an empty slot
+  // the cursor takes the same item from every other slot, up to a full stack, the partly filled
+  // stacks first and the full ones after, from the first slot on (the last on, right button). The
+  // crafting result is left out.
+  function pickupAll (click) {
+    const cursor = this.selectedItem
+    if (!cursor || this.slots[click.slot]) return []
+    // The items' own class (prismarine-item's, made for this version).
+    const Item = cursor.constructor
+    const changed = []
+    const order = this.slots.map((_, i) => i)
+    if (click.mouseButton !== 0) order.reverse()
+    for (const fullOnes of [false, true]) {
+      for (const i of order) {
+        if (cursor.count >= cursor.stackSize) break
+        const it = this.slots[i]
+        if (i === this.craftingResultSlot || !it || !Item.equal(it, cursor, false)) continue
+        if (!fullOnes && it.count === it.stackSize) continue
+        const n = Math.min(cursor.stackSize - cursor.count, it.count)
+        cursor.count += n
+        it.count -= n
+        this.updateSlot(i, it.count === 0 ? null : it)
+        changed.push(i)
+      }
+    }
+    return changed
+  }
+
+  // The mod's clicks on the bot's inventory, one after the other as a client's window takes them,
+  // each id told back once done (lastClick). mineflayer clicks modes 0 to 4, and 6 with pickupAll;
+  // a drag (5) is done as the clicks that leave the same.
+  let clicks = Promise.resolve()
+  let drag = null
+  async function click (slot, button, mode) {
+    if (bot.currentWindow) throw new Error(`${name}: a click on its inventory while ${bot.currentWindow.type} is open`)
+    if (mode === 5) {
+      const stage = button & 3
+      if (stage === 0) {
+        drag = { limit: button >> 2, slots: [] }
+      } else if (stage === 1) {
+        if (!drag) throw new Error(`${name}: a drag slot outside a drag`)
+        drag.slots.push(slot)
+      } else if (stage === 2) {
+        if (!drag) throw new Error(`${name}: a drag end outside a drag`)
+        const ended = drag
+        drag = null
+        await dragOver(ended)
+      }
+      return
+    }
+    await bot.clickWindow(slot, button, mode)
+  }
+
+  // A drag as the clicks that leave the same: the cursor split evenly over the slots (limit 0) or
+  // one in each (limit 1), each slot as full as it takes, the rest left on the cursor. Only slots
+  // empty or holding the same item take any, checked as each one comes.
+  async function dragOver ({ limit, slots }) {
+    const cursor = bot.inventory.selectedItem
+    if (!cursor) return
+    if (limit === 2) {
+      log('a creative drag is not supported')
+      return
+    }
+    const same = it => it.type === cursor.type && it.metadata === cursor.metadata && JSON.stringify(it.nbt) === JSON.stringify(cursor.nbt)
+    const fits = slot => {
+      const it = bot.inventory.slots[slot]
+      return !it || (same(it) && it.count < it.stackSize)
+    }
+    const targets = slots.filter(fits)
+    if (targets.length === 0) return
+    const each = limit === 0 ? Math.floor(cursor.count / targets.length) : 1
+    for (const slot of targets) {
+      const held = bot.inventory.selectedItem
+      if (!held || !fits(slot)) continue
+      const there = bot.inventory.slots[slot]?.count ?? 0
+      const n = Math.min(each, held.stackSize - there, held.count)
+      // All the cursor holds: one left click puts it down (merged up to a full stack).
+      if (n === held.count) {
+        await bot.clickWindow(slot, 0, 0)
+        continue
+      }
+      for (let i = 0; i < n; i++) await bot.clickWindow(slot, 1, 0)
+    }
+  }
+
   bot.on('end', reason => {
     // mineflayer's dig timer outlives the connection: it would set the block to air in a world, and
     // shared columns, this bot no longer holds.
@@ -239,6 +351,15 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     setTickTimeout (ms) {
       tickTimeout = ms
       if (bot.pathfinder) bot.pathfinder.tickTimeout = ms
+    },
+
+    // A click on its inventory window from the mod (see click above), after the ones before it; the
+    // inventory goes back to the mod once it is done, whatever the server made of it.
+    click (slot, button, mode, id) {
+      clicks = clicks.then(() => click(slot, button, mode)).then(() => {
+        lastClick = id
+        queueInventory()
+      })
     },
 
     // Walks to the spot: its own search, from where it stands.

@@ -11,6 +11,9 @@ public interface BotListener {
 	/** Not walking a path any more. */
 	void onPathCleared(String bot);
 
+	/** Its inventory window changed: the whole of it now. */
+	void onInventory(String bot, BotInventory inventory);
+
 	/** Left the server; its chunks are the fleet's, unloaded as the fleet's last bot lets each go. */
 	void onGone(String bot);
 

@@ -26,7 +26,7 @@ public class AutoStart implements ClientModInitializer {
 	public static final String BOT_PREFIX = MapMcBotClient.NAME_PREFIX;
 
 	/** PandaBot2 to PandaBot32, from the mod's name list. */
-	private static final int BOT_COUNT = 31;
+	private static final int BOT_COUNT = 4;
 
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
 	private static final int MAX_PLAYERS = 128;

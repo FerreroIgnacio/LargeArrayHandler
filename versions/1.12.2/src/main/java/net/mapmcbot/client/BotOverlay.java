@@ -78,14 +78,14 @@ public final class BotOverlay {
 		return height;
 	}
 
-	/** One relay: CPU as % of the whole server, the server's RAM in use over its total, and under them the relay's own. */
+	/** One relay: its bots, CPU as % of the whole server, the server's RAM in use over its total, and under them the relay's own. */
 	private static int card(MinecraftClient client, int x, int y, int rid, String scope, ProfileReport report) {
 		final int line = client.textRenderer.fontHeight + 2;
 		final double cores = report.value(scope, "cpu.count");
 		// ms rates are % of one core: over the server's cores, a share of all of it.
 		final double cpu = (report.rate(scope, "cpu.user") + report.rate(scope, "cpu.system")) / cores;
 		final String[] lines = {
-			"rid=" + rid + (rid == 0 ? " (main)" : ""),
+			"rid=" + rid + (rid == 0 ? " (main)" : "") + "  bots " + MapMcBotClient.bots().countOn(rid),
 			"CPU " + (Double.isNaN(cpu) ? "--" : String.format(Locale.ROOT, "%.1f%%", cpu)),
 			"RAM " + bytes(report.value(scope, "mem.system.used")) + " / " + bytes(report.value(scope, "mem.system.total")),
 			"relay " + bytes(report.value(scope, "mem.rss"))

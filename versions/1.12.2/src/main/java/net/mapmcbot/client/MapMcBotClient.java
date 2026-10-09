@@ -54,6 +54,7 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	private static KeyBinding areasKey;
 	private static KeyBinding profilerKey;
+	private static KeyBinding botsKey;
 
 	private static AreaStore areas;
 	private static String areasWorldId;
@@ -67,6 +68,7 @@ public class MapMcBotClient implements ClientModInitializer {
 		// LWJGL 2 key codes, right up to 1.12.2; 1.13+ uses GLFW codes.
 		areasKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.areas", Keyboard.KEY_V, CATEGORY));
 		profilerKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.profiler", Keyboard.KEY_Z, CATEGORY));
+		botsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.bots", Keyboard.KEY_B, CATEGORY));
 		ClientTickEvents.END_CLIENT_TICK.register(MapMcBotClient::tick);
 	}
 
@@ -105,8 +107,23 @@ public class MapMcBotClient implements ClientModInitializer {
 			client.setScreen(new ProfilerScreen());
 		}
 
+		boolean openBots = false;
+
+		while (botsKey.wasPressed()) {
+			openBots = true;
+		}
+
+		if (openBots && client.currentScreen == null) {
+			client.setScreen(new BotScreen());
+		}
+
 		AreaPick.tick(client);
 		glowBots(client);
+	}
+
+	/** The key the bot window opens and closes with. */
+	public static int botsKeyCode() {
+		return botsKey.getCode();
 	}
 
 	/** Every bot glows through walls, coloured by the scoreboard team it is put on. */

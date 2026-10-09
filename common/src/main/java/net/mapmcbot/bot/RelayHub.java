@@ -249,6 +249,10 @@ public final class RelayHub {
 		relay(rid).send(FleetProtocol.quit(bot));
 	}
 
+	public void windowClick(int rid, String bot, int slot, int button, int mode, int id) {
+		relay(rid).send(FleetProtocol.windowClick(bot, slot, button, mode, id));
+	}
+
 	public void gotoSpot(int rid, String bot, int x, int y, int z) {
 		relay(rid).send(FleetProtocol.gotoSpot(bot, x, y, z));
 	}
