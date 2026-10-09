@@ -73,6 +73,14 @@ public final class FleetProtocol {
 	 * string, i32 length and the profile's rows, UTF-8 (see bot/profiler.js).
 	 */
 	public static final int PROFILE = 11;
+	/** bot name (empty), the error text: a relay crashed. Only relays send it; {@link #crashText} reads it. */
+	public static final int CRASH = 12;
+	/** bot name (empty): a relay's answer to HELLO, its commit being the mod's. Only relays send it, first of all. */
+	public static final int WELCOME = 13;
+	/** bot name (empty), the text: the relay is resetting to the mod's commit and restarting; WELCOME or UPDATE_FAILED follow. {@link #relayText} reads it. */
+	public static final int UPDATING = 14;
+	/** bot name (empty), why: the relay could not get to the mod's commit, stays up and closes the connection. {@link #relayText} reads it. */
+	public static final int UPDATE_FAILED = 15;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -83,17 +91,60 @@ public final class FleetProtocol {
 	public static final int SPAWN = 17;
 	/** bot name. */
 	public static final int QUIT = 18;
-	/**
-	 * bot name, i32 formation id, i32 x, i32 y, i32 z: the block to stand on, or the nearest free one
-	 * next to it. One id per #formation, higher than the last: the fleet works the spots out once per id.
-	 */
-	public static final int FORMATION = 19;
 	/** bot name (empty), i32 request id, reason string: the fleet answers with a PROFILE of that id. */
 	public static final int PROFILE_REQUEST = 21;
+	/**
+	 * bot name (empty), the commit the mod was built at: the first frame to a relay, which answers
+	 * WELCOME once it is at that commit (updating itself first when not) or UPDATE_FAILED.
+	 */
+	public static final int HELLO = 22;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
 	private FleetProtocol() {
+	}
+
+	/** The error text of a CRASH frame. */
+	public static String crashText(byte[] frame) {
+		try {
+			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame));
+			final int type = in.readUnsignedByte();
+
+			if (type != CRASH) {
+				throw new IllegalArgumentException("not a CRASH frame: type " + type);
+			}
+
+			readString(in);
+			final String text = new String(readBytes(in), StandardCharsets.UTF_8);
+			end(in, type);
+			return text;
+		} catch (IOException e) {
+			throw new UncheckedIOException("truncated crash message from a relay", e);
+		}
+	}
+
+	/** The text of an UPDATING or UPDATE_FAILED frame, laid out as a CRASH one. */
+	public static String relayText(byte[] frame) {
+		try {
+			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame));
+			final int type = in.readUnsignedByte();
+
+			if (type != UPDATING && type != UPDATE_FAILED) {
+				throw new IllegalArgumentException("not an UPDATING or UPDATE_FAILED frame: type " + type);
+			}
+
+			readString(in);
+			final String text = new String(readBytes(in), StandardCharsets.UTF_8);
+			end(in, type);
+			return text;
+		} catch (IOException e) {
+			throw new UncheckedIOException("truncated update message from a relay", e);
+		}
+	}
+
+	/** Whether frames of this type are about the columns of the mod's world (a relay's never are). */
+	public static boolean isChunkFrame(int type) {
+		return type == CLAIM || type == READY || type == CHANGED || type == BLOCK_ENTITY_UPDATE || type == UNLOAD || type == STATE_NAMES || type == LOAD;
 	}
 
 	/** The next frame without its length, or null when the stream ends cleanly between frames. */
@@ -326,6 +377,19 @@ public final class FleetProtocol {
 		return frame.bytes();
 	}
 
+	public static byte[] hello(String commit) {
+		final Frame frame = new Frame(HELLO);
+
+		try {
+			writeString(frame.out, "");
+			writeString(frame.out, commit);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
 	public static byte[] spawn(String bot, String host, int port) {
 		final Frame frame = new Frame(SPAWN);
 
@@ -345,22 +409,6 @@ public final class FleetProtocol {
 
 		try {
 			writeString(frame.out, bot);
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
-
-		return frame.bytes();
-	}
-
-	public static byte[] formation(String bot, int id, int x, int y, int z) {
-		final Frame frame = new Frame(FORMATION);
-
-		try {
-			writeString(frame.out, bot);
-			frame.out.writeInt(id);
-			frame.out.writeInt(x);
-			frame.out.writeInt(y);
-			frame.out.writeInt(z);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

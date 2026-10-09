@@ -1,23 +1,31 @@
 // Worker thread of the fleet's pool, running some of its bots (see bot.js): their frames go to the
 // fleet to write to the mod, and the fleet's orders for them come back here. Their chunk columns
-// are shared with every other thread (see sharedChunks.js); their paths are searched on the
-// fleet's path threads (see pathThread.js, pathClient.js).
+// are shared with every other thread (see sharedChunks.js).
 //
 // Everything for the fleet (frames, reports, the columns taken and let go) goes over one port, the
 // chunk port, so the fleet gets it all in the order it happened here.
 const { parentPort, workerData } = require('worker_threads')
 const startBot = require('./bot')
 const { sharedChunks, openColumns } = require('./sharedChunks')
-const { pathClient } = require('./pathClient')
 const { threadProfiler } = require('./profiler')
 
 openColumns(workerData.columnsFile)
 const port = workerData.chunkPort
 const chunks = sharedChunks(port, new Int32Array(workerData.signal), post)
-const paths = pathClient(workerData.pathPorts, new Int32Array(workerData.pathPending))
 const bots = new Map()
 const scope = `node.thread:pool:${workerData.index}`
 const prof = threadProfiler(scope)
+
+// The time a game tick leaves to the pathfinders of this thread, ms: pathfinder's own tickTimeout
+// for a lone bot. The bots of a thread share it, so each gets its part (at least 1 ms) and a
+// search is cut into as many partial paths as it takes; they take turns, which costs more the more
+// bots there are. Set again each time a bot comes or goes.
+const TICK_BUDGET_MS = 40
+
+function shareTickTimeout () {
+  const each = Math.max(1, Math.floor(TICK_BUDGET_MS / bots.size))
+  for (const bot of bots.values()) bot.setTickTimeout(each)
+}
 
 // This thread's rows for a profile, and its bots': each bot's share of the heap is the thread's
 // split evenly, the bots of a thread sharing one heap with nothing to tell their parts apart.
@@ -77,14 +85,15 @@ parentPort.on('message', message => {
       host,
       port,
       chunks,
-      paths,
       send,
       report: m => report({ bot: name, ...m }),
       onEnd: () => {
         bots.delete(name)
+        if (bots.size > 0) shareTickTimeout()
         report({ bot: name, end: true })
       }
     }))
+    shareTickTimeout()
     return
   }
 
@@ -94,9 +103,6 @@ parentPort.on('message', message => {
   switch (message.type) {
     case 'quit':
       bot.quit()
-      break
-    case 'candidates':
-      report({ bot: message.bot, formation: message.formation, candidates: bot.formationCandidates(message.target, message.needed) })
       break
     case 'goto':
       bot.goto(message.spot)

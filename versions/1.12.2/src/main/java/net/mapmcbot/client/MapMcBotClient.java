@@ -3,6 +3,8 @@ package net.mapmcbot.client;
 import java.io.File;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -10,6 +12,8 @@ import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.mapmcbot.area.AreaStore;
 import net.mapmcbot.bot.BotManager;
 import net.mapmcbot.bot.BotRegistry;
+import net.mapmcbot.bot.NameList;
+import net.mapmcbot.bot.RelayHub;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
 import net.mapmcbot.profile.ProfileRegistry;
@@ -28,6 +32,12 @@ import org.lwjgl.input.Keyboard;
  * the rest of the mod reaches through the static getters.
  */
 public class MapMcBotClient implements ClientModInitializer {
+	/** Every bot's name starts with it, then a number from 2 (1 being the player's). */
+	public static final String NAME_PREFIX = "PandaBot";
+
+	/** The names there are, so the bots there can be at once. */
+	private static final int MAX_BOTS = 127;
+
 	private static final String CATEGORY = "key.categories.mapmcbot";
 
 	/** Each bot's colour, given the first time it is asked for and kept for the session. */
@@ -36,12 +46,10 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static KeyBinding areasKey;
 	private static KeyBinding profilerKey;
 
-	/** The id of the last #formation sent; each one gets the next. */
-	private static int lastFormation;
-
 	private static AreaStore areas;
 	private static String areasWorldId;
 	private static BotRegistry bots;
+	private static RelayHub relays;
 	private static ChunkRegistry chunks;
 	private static ProfileRegistry profile;
 
@@ -58,6 +66,9 @@ public class MapMcBotClient implements ClientModInitializer {
 			leaveWorld();
 			return;
 		}
+
+		// In a world from the start, not at the first bot: the relays need the port open to connect.
+		bots();
 
 		boolean openAreas = false;
 
@@ -126,22 +137,15 @@ public class MapMcBotClient implements ClientModInitializer {
 		return BOT_COLORS.computeIfAbsent(bot, name -> Color.values()[BOT_COLORS.size() % Color.values().length]);
 	}
 
-	/** A chat line for the mod: #formation sends every bot to the block the player stands on. False when it is not one. */
+	/** A chat line for the mod: #relays connects to the relays listed that are not connected yet. False when it is not one. */
 	public static boolean command(String line) {
-		if (!line.equals("#formation")) {
+		if (!line.equals("#relays")) {
 			return false;
 		}
 
-		final MinecraftClient client = MinecraftClient.getInstance();
-		final int x = (int) Math.floor(client.player.x);
-		final int y = (int) Math.floor(client.player.y);
-		final int z = (int) Math.floor(client.player.z);
-		final int id = ++lastFormation;
-
-		for (String bot : bots().getBots()) {
-			bots().formation(bot, id, x, y, z);
-		}
-
+		// For a relay started after the game: knock on the ones listed that are not connected.
+		bots();
+		relays.connectMissing();
 		return true;
 	}
 
@@ -194,12 +198,20 @@ public class MapMcBotClient implements ClientModInitializer {
 		if (bots == null) {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
 			final BotManager fleet = new BotManager(new File(directory, "bot"));
-			bots = new BotRegistry(fleet);
+			relays = new RelayHub(new File(directory, "relays.txt"));
+			bots = new BotRegistry(fleet, relays, new NameList(IntStream.rangeClosed(2, MAX_BOTS + 1).mapToObj(i -> NAME_PREFIX + i).collect(Collectors.toList())));
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
-			profile = new ProfileRegistry(fleet, new File(directory, "bot/profile.log"), chunks::chunksByBot);
+			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
+			relays.start();
 		}
 
 		return bots;
+	}
+
+	/** The relays connected; created with the bots. */
+	public static RelayHub relays() {
+		bots();
+		return relays;
 	}
 
 	/** CPU and memory of the mod and the fleet (see ProfilerScreen); created with the bots. */

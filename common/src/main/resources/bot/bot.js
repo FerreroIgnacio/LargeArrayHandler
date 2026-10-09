@@ -15,9 +15,8 @@ const { botMeter } = require('./profiler')
 const LOG_SEARCH_NODES = 1000
 
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
-// its last frame sent; chunks and paths hold the columns and the paths of its thread (see
-// sharedChunks.js) and its path threads' client (see pathClient.js).
-module.exports = function startBot ({ name, host, port, chunks, paths, send, report, onEnd }) {
+// its last frame sent; chunks holds the columns of its thread (see sharedChunks.js).
+module.exports = function startBot ({ name, host, port, chunks, send, report, onEnd }) {
   const server = `${host}:${port}`
   const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
   const log = line => console.log(`[${name}] ${line}`)
@@ -31,7 +30,7 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     return d.includes(':') ? d : `minecraft:${d}`
   }
 
-  // Where the bot is: "server|dimension", as the shared columns, the paths and the formations are keyed.
+  // Where the bot is: "server|dimension", as the shared columns are keyed.
   const world = () => `${server}|${dimension()}`
 
   // "cx,cz" -> the registry's key of the column: the columns loaded, with the dimension they were loaded in.
@@ -83,10 +82,11 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   chunks.attach(bot, name, world, tag => reportBlockEntity({ x: tag.value.x.value, y: tag.value.y.value, z: tag.value.z.value }, tag))
 
   bot.loadPlugin(pathfinder)
+  // Pathfinder's time per tick, in ms, once the pool thread has shared its own out (see poolThread.js).
+  let tickTimeout = null
   bot.once('spawn', () => {
     bot.pathfinder.setMovements(new Movements(bot))
-    // Searched on the path threads, in the world of the whole fleet, keyed as the shared columns are.
-    bot.pathfinder.getPathTo = paths.planner(bot, world)
+    if (tickTimeout !== null) bot.pathfinder.tickTimeout = tickTimeout
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -98,7 +98,7 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
     return g ? { x: g.x, y: g.y, z: g.z } : null
   }
   bot.on('path_update', result => {
-    if (result.status === 'noPath') log('formation: no path' + (result.reason ? ` (${result.reason})` : ''))
+    if (result.status === 'noPath') log('no path' + (result.reason ? ` (${result.reason})` : ''))
     if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
@@ -108,14 +108,6 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('path_stop', () => out(protocol.path(name, null)))
   bot.on('path_reset', () => out(protocol.path(name, null)))
 
-  // Feet and head free, something solid below.
-  function standable (p) {
-    const feet = bot.blockAt(p)
-    const head = bot.blockAt(p.offset(0, 1, 0))
-    const floor = bot.blockAt(p.offset(0, -1, 0))
-    if (!feet || !head || !floor) return false
-    return feet.boundingBox === 'empty' && head.boundingBox === 'empty' && floor.boundingBox === 'block'
-  }
   bot.on('kicked', reason => log('kicked: ' + reason))
   bot.on('error', err => log('error: ' + err.message))
 
@@ -148,15 +140,13 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
   bot.on('end', reason => {
     // mineflayer's dig timer outlives the connection: it would set the block to air in a world, and
     // shared columns, this bot no longer holds.
-    bot.stopDigging()
+    // The digging plugin is only there once the bot got to be injected; one that ended before has no timer.
+    if (bot.stopDigging) bot.stopDigging()
     log('disconnected: ' + reason)
     columns.clear()
     out(protocol.botGone(name))
     onEnd()
   })
-
-  // Where this bot was last sent to stand in a formation: {x, y, z}, null until it is.
-  let formationSpot = null
 
   return {
     quit: () => bot.quit(),
@@ -177,39 +167,15 @@ module.exports = function startBot ({ name, host, port, chunks, paths, send, rep
       ]
     },
 
-    spot: () => formationSpot,
-
-    // `needed` blocks to stand on around the target, nearest first: breadth first over the ground
-    // a bot can walk from it (one step sideways and up to one up or down, between blocks to stand
-    // on), as far as the bot has it loaded. Each with its key: "server|dimension|x,y,z". Asked of
-    // one bot per formation; the fleet hands the spots out to all of its bots (see fleet.js).
-    formationCandidates ({ x, y, z }, needed) {
-      const target = new Vec3(x, y, z)
-      if (!bot.blockAt(target)) throw new Error(`${name}: formation target ${x},${y},${z} is not loaded`)
-      const candidates = []
-      const seen = new Set([target.toString()])
-      const queue = [target]
-      for (let i = 0; i < queue.length && candidates.length < needed; i++) {
-        const p = queue[i]
-        // Only ground to stand on leads on, the target aside (the player may be mid-jump).
-        if (standable(p)) candidates.push({ spot: { x: p.x, y: p.y, z: p.z }, key: `${world()}|${p.x},${p.y},${p.z}` })
-        else if (i > 0) continue
-        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-          for (const dy of [0, 1, -1]) {
-            const n = p.offset(dx, dy, dz)
-            if (seen.has(n.toString()) || !bot.blockAt(n)) continue
-            seen.add(n.toString())
-            queue.push(n)
-          }
-        }
-      }
-      if (candidates.length === 0) throw new Error(`${name}: no block to stand on around ${x},${y},${z}`)
-      return candidates
+    // Its pathfinder's time per tick, in ms (see poolThread.js): a search that runs out of it returns what it has so far.
+    // The plugin is only injected once the server's version is known: set when the bot spawns if it is not there yet.
+    setTickTimeout (ms) {
+      tickTimeout = ms
+      if (bot.pathfinder) bot.pathfinder.tickTimeout = ms
     },
 
-    // Walks to the spot taken: its own search, from where it stands.
+    // Walks to the spot: its own search, from where it stands.
     goto (spot) {
-      formationSpot = spot
       bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
     }
   }

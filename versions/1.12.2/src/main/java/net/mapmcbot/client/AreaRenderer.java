@@ -86,6 +86,8 @@ public final class AreaRenderer {
 					target.getX() + 1, target.getY() + 1, target.getZ() + 1, 0xFFFFFF, camX, camY, camZ);
 		}
 
+		// TODO(world): a bot may be on another server or dimension than this client's (a relay's, or a local
+		// fleet's), and its path is drawn here all the same. Needs the bot's world with its PATH, and only the paths of this world drawn.
 		for (Map.Entry<String, int[]> entry : paths.entrySet()) {
 			final int[] path = entry.getValue();
 			final int rgb = MapMcBotClient.colorOf(entry.getKey()).getRgb();

@@ -15,13 +15,17 @@ const TYPES = {
   STATE_NAMES: 9,
   LOAD: 10,
   PROFILE: 11,
+  CRASH: 12,
+  WELCOME: 13,
+  UPDATING: 14,
+  UPDATE_FAILED: 15,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
   SPAWN: 17,
   QUIT: 18,
-  FORMATION: 19,
-  PROFILE_REQUEST: 21
+  PROFILE_REQUEST: 21,
+  HELLO: 22
 }
 
 class Writer {
@@ -220,6 +224,39 @@ function path (bot, target, nodes) {
   return w.frame()
 }
 
+// The fleet crashed: its error, for the mod to keep. Only a relay sends it (the mod has its own fleet's output). No bot: an empty name.
+function crash (text) {
+  const w = new Writer(TYPES.CRASH)
+  w.str('')
+  w.bytes(Buffer.from(text, 'utf8'))
+  return w.frame()
+}
+
+// A relay's answer to the mod's HELLO: it runs the mod's scripts. No bot: an empty name.
+function welcome () {
+  const w = new Writer(TYPES.WELCOME)
+  w.str('')
+  return w.frame()
+}
+
+// A relay running other scripts than the mod's is pulling them and restarting; WELCOME or
+// UPDATE_FAILED follow. `text` says from what to what. No bot: an empty name.
+function updating (text) {
+  const w = new Writer(TYPES.UPDATING)
+  w.str('')
+  w.bytes(Buffer.from(text, 'utf8'))
+  return w.frame()
+}
+
+// The relay could not get to the mod's scripts (`text` why): it stays up on its own and closes this
+// connection. No bot: an empty name.
+function updateFailed (text) {
+  const w = new Writer(TYPES.UPDATE_FAILED)
+  w.str('')
+  w.bytes(Buffer.from(text, 'utf8'))
+  return w.frame()
+}
+
 // The fleet's profile (see profiler.js): `id` the PROFILE_REQUEST's, 0 when the fleet took it on an
 // event of its own, `reason` what it was taken for, `text` its rows. No bot: an empty name.
 function profile (id, reason, text) {
@@ -229,6 +266,22 @@ function profile (id, reason, text) {
   w.str(reason)
   w.bytes(Buffer.from(text, 'utf8'))
   return w.frame()
+}
+
+// The frames that carry columns of the mod's world: a relay's world is its own, none of them go to the mod.
+const CHUNK_TYPES = new Set([TYPES.CLAIM, TYPES.READY, TYPES.CHANGED, TYPES.BLOCK_ENTITY_UPDATE, TYPES.UNLOAD, TYPES.STATE_NAMES, TYPES.LOAD])
+
+// `buffer` holds whole frames, one after the other (length included); those about columns left out.
+// Null when none is left.
+function withoutChunkFrames (buffer) {
+  const kept = []
+  for (let offset = 0; offset < buffer.length;) {
+    const end = offset + 4 + buffer.readUInt32BE(offset)
+    if (end > buffer.length) throw new Error('truncated frame')
+    if (!CHUNK_TYPES.has(buffer[offset + 4])) kept.push(buffer.subarray(offset, end))
+    offset = end
+  }
+  return kept.length === 0 ? null : Buffer.concat(kept)
 }
 
 // A mod -> fleet frame (without its length) as an object.
@@ -251,11 +304,12 @@ function decode (frame) {
     case TYPES.QUIT:
       message = { type, bot: r.str() }
       break
-    case TYPES.FORMATION:
-      message = { type, bot: r.str(), id: r.i32(), x: r.i32(), y: r.i32(), z: r.i32() }
-      break
     case TYPES.PROFILE_REQUEST:
       message = { type, bot: r.str(), id: r.i32(), reason: r.str() }
+      break
+    case TYPES.HELLO:
+      // version: the commit the mod was built at.
+      message = { type, bot: r.str(), version: r.str() }
       break
     default:
       throw new Error(`unknown message type ${type} from the mod`)
@@ -279,4 +333,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load,stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, profile, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

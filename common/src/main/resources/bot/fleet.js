@@ -1,8 +1,24 @@
 // Every mineflayer bot in one process, spread over a pool of worker threads (poolThread.js) that
-// share their chunk columns (sharedChunks.js), driven by the mod over one local socket (see protocol.js).
-// Their paths are searched on path threads of their own (pathThread.js), which see every column.
-// The columns' blocks are not sent: they live in columns.bin, mapped by the threads and the mod.
+// share their chunk columns (sharedChunks.js), driven by the mod over one socket (see protocol.js).
+// The columns' blocks are not sent: they live in columns.bin, mapped by the threads and, for the
+// mod's own fleet, the mod.
+//
+// A relay is this same fleet on another machine, left running: it listens, and a mod that starts
+// connects to it (see RelayHub.java). Its columns.bin is its own and the mod never sees its world
+// (no frame about columns goes to the mod). When the mod goes, its bots quit and the relay waits
+// for the next one.
+//
+// A relay runs the mod's commit: the mod's first frame is HELLO with it, answered WELCOME when it is
+// this relay's. When not, the relay tells the mod it is UPDATING, fetches and resets its checkout to
+// that commit by force, and restarts on it, the mod's connection and all (see update). When it cannot
+// get to it (not pushed, say) it says why (UPDATE_FAILED), closes that connection and stays up.
+//
+// A relay never goes down: any error of its own goes to the mod (CRASH, kept there in
+// crash-relay<N>.log) and it goes on; a pool thread that dies takes only its bots with it.
 // Usage: node fleet.js <mod port> <columns.bin>
+//        node fleet.js --relay <port to listen on> <columns.bin>
+const { execSync } = require('child_process')
+const fs = require('fs')
 const net = require('net')
 const os = require('os')
 const path = require('path')
@@ -10,10 +26,30 @@ const { Worker, MessageChannel } = require('worker_threads')
 const protocol = require('./protocol')
 const states = require('./states')
 const { threadProfiler, toText } = require('./profiler')
-const { HEADER, SLOTS, loadedHeader } = require('./sharedChunks')
+const { HEADER, SLOTS, SIZE, loadedHeader } = require('./sharedChunks')
+const { RESTART } = require('./relaySupervisor')
 
-const columnsFile = process.argv[3]
-if (!columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin>')
+const relay = process.argv[2] === '--relay'
+const socketPort = Number(relay ? process.argv[3] : process.argv[2])
+const columnsFile = relay ? process.argv[4] : process.argv[3]
+if (!Number.isInteger(socketPort) || !columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin> | node fleet.js --relay <port to listen on> <columns.bin>')
+
+// The relay started by hand is its supervisor (relaySupervisor.js), which runs this file again as
+// the relay itself, handing it the mod's connections.
+if (relay && !process.env.MAPMCBOT_RELAY_CHILD) {
+  require('./relaySupervisor')(socketPort)
+  return
+}
+
+// The commit this relay's checkout is at as it starts, the one it runs: a git reset later does not change it.
+const VERSION = relay ? execSync('git rev-parse HEAD', { cwd: __dirname }).toString().trim() : null
+
+// The mod makes the columns file of its own fleet; a relay makes its own, every slot zeros.
+if (relay) {
+  const fd = fs.openSync(columnsFile, 'w')
+  fs.ftruncateSync(fd, SLOTS * SIZE)
+  fs.closeSync(fd)
+}
 
 const prof = threadProfiler('node.thread:fleet')
 
@@ -21,111 +57,8 @@ const prof = threadProfiler('node.thread:fleet')
 const bots = new Map()
 // Bot name -> where it is ("server|dimension"), from its spawns; unknown until it is in the world.
 const worldOf = new Map()
-// Formation spots: "server|dimension|x,y,z" -> bot standing there, and bot -> its spot. One bot per block.
-const spots = new Map()
-const spotOf = new Map()
-function leaveSpot (name) {
-  const key = spotOf.get(name)
-  if (key === undefined) return
-  spots.delete(key)
-  spotOf.delete(name)
-}
-
-// The formations of the latest #formation, one per world its bots are in: "id|world|x,y,z" ->
-// { surveyor, candidates, queue }. The spots around the target are worked out once, by one bot of
-// the formation in that world (the surveyor), which has to have the target loaded; the bots that
-// join before they are in wait in `queue`. Once they are, every bot takes its spot and searches its
-// own path there, none waiting on another.
-const formations = new Map()
-let latestFormation = -Infinity
-// The bots ordered into the latest formation before they were in the world: bot -> { id, target }.
-const waiting = new Map()
-
-function joinFormation (name, { id, target }) {
-  const key = `${id}|${worldOf.get(name)}|${target.x},${target.y},${target.z}`
-  const formation = formations.get(key)
-  if (!formation) {
-    const fresh = { surveyor: name, target, candidates: null, queue: [name] }
-    formations.set(key, fresh)
-    survey(key, fresh)
-  } else if (formation.candidates) {
-    goto(formation, name)
-  } else {
-    formation.queue.push(name)
-  }
-}
-
-// The surveyor works out a spot for every bot of the fleet, if the ground around the target has them.
-function survey (key, formation) {
-  bots.get(formation.surveyor).worker.postMessage({ type: 'candidates', bot: formation.surveyor, formation: key, target: formation.target, needed: bots.size })
-}
-
-// The spot nearest the target that no other bot stands on. None left (the ground around the target
-// holds fewer bots than the fleet has): the bot stays where it is, and says so.
-function goto (formation, name) {
-  const thread = bots.get(name)
-  if (!thread) return
-  const taken = formation.candidates.find(({ key }) => !spots.has(key) || spots.get(key) === name)
-  if (!taken) {
-    console.log(`[${name}] formation: no free spot (${formation.candidates.length} around the target for ${bots.size} bots)`)
-    return
-  }
-  leaveSpot(name)
-  spots.set(taken.key, name)
-  spotOf.set(name, taken.key)
-  thread.worker.postMessage({ type: 'goto', bot: name, spot: taken.spot })
-}
-
-function formationOrder (name, order) {
-  if (order.id < latestFormation) return
-  if (order.id > latestFormation) {
-    // Every bot is sent to the new one: the spots of the old one are free, or a target near the
-    // old one would look taken by bots that have not got their new spot yet.
-    latestFormation = order.id
-    formations.clear()
-    waiting.clear()
-    spots.clear()
-    spotOf.clear()
-    takeProfile(0, `formation ${order.id}`)
-  }
-  if (worldOf.has(name)) joinFormation(name, order)
-  else waiting.set(name, order)
-}
-
-// The path threads: every column goes to each of them as it comes and goes, and every path one
-// of them finds or cuts, to the others. Pool threads ask them over ports of their own (see startThread).
-const PATH_THREADS = 3
-const pathThreads = []
-for (let i = 0; i < PATH_THREADS; i++) {
-  const worker = new Worker(path.join(__dirname, 'pathThread.js'), { workerData: { index: i, columnsFile } })
-  worker.on('message', message => {
-    if (message.dropped !== undefined) {
-      settleSlot(message.dropped, worker)
-      return
-    }
-    if (message.wanted !== undefined) {
-      wantSnapshots(worker, message.wanted.ticket, message.wanted.world, message.wanted.ids)
-      return
-    }
-    if (message.profile !== undefined) {
-      onProfileRows(worker, message.profile, message.rows)
-      return
-    }
-    if (!message.path) throw new Error('unknown message from a path thread')
-    for (const other of pathThreads) {
-      if (other !== worker) other.postMessage({ type: 'path', world: message.path.world, id: message.path.id, nodes: message.path.nodes })
-    }
-  })
-  worker.on('error', err => { throw err })
-  worker.on('exit', code => { throw new Error(`path thread exited (code ${code})`) })
-  pathThreads.push(worker)
-}
-// Requests sent to each path thread and not answered yet, counted by every pool thread (see pathClient.js).
-const pathPending = new SharedArrayBuffer(4 * PATH_THREADS)
-const pathPendingCounts = new Int32Array(pathPending)
-
 // The columns in a slot of columns.bin: "server|dimension|cx,cz" -> { header, slot, threads holding
-// it, chunk, claim, version, modHolds, ready }. Every path thread sees them all.
+// it, chunk, claim, version, modHolds, ready }.
 //
 // Held ones (some thread holds them) are what the mod's registry holds: a column is claimed there
 // (CLAIM, chunk being its key there, with its slot) when the fleet's first bot gets it, readied
@@ -133,18 +66,20 @@ const pathPendingCounts = new Int32Array(pathPending)
 // for the whole fleet however many bots hold it. `claim` is this load's id there. The mod snapshots
 // it to disk on the UNLOAD and releases the slot (RELEASE); `modHolds` until then.
 //
-// The rest are cached: let go by every bot, or read off their snapshot by the mod for a search that
-// wanted them (see wantSnapshots). They stay for the path threads until slots run short.
+// The rest are cached: let go by every bot, or read off their snapshot by the mod (see loadSnapshots).
+// They stay until slots run short.
 const columns = new Map()
 let nextClaim = 1
-// The cached columns, oldest first: the first to be evicted (see makeRoom).
-const cached = new Map()
-// Slot -> its column, for every column in `columns`.
-const slotColumns = new Map()
 // Columns the mod is reading off their snapshot: key -> slot.
 const loading = new Map()
 // Keys the mod has no snapshot of; forgotten once one is unloaded (its snapshot made then).
 const noSnapshot = new Set()
+// Columns to read off their snapshot once a slot is to spare, in order.
+const toLoad = new Set()
+// The cached columns, oldest first: the first to be evicted (see makeRoom).
+const cached = new Map()
+// Slot -> its column, for every column in `columns`.
+const slotColumns = new Map()
 // Held columns changed this turn of the event loop: key -> a bot that saw it. Sent once the turn is
 // done (CHANGED), the mod snapshotting each again.
 const changed = new Map()
@@ -158,37 +93,29 @@ function sendChanged () {
 const RESERVE = 256
 
 // The slots of columns.bin no column has, taken from the end. An evicted column's slot stays out of
-// it, its blocks untouched, until the mod released it (RELEASE) and every path thread dropped it: a
-// path thread takes the drop between searches, so none still reads the slot, and a search through
-// a column evicted mid-way never sees another column loaded over it.
+// it, its blocks untouched, until the mod released it (RELEASE).
 const freeSlots = Array.from({ length: SLOTS }, (_, i) => SLOTS - 1 - i)
-// Slots evicted -> { mod: waiting on its RELEASE, paths: the path threads yet to drop it }.
+// Slots evicted -> { mod: waiting on its RELEASE }.
 const evicting = new Map()
 
-// The mod (worker undefined) or a path thread is done with the evicted slot.
-function settleSlot (slot, worker) {
+// The mod is done with the evicted slot.
+function settleSlot (slot) {
   const pending = evicting.get(slot)
   if (!pending) throw new Error(`slot ${slot} settled, but it was not evicted`)
-  if (worker === undefined) {
-    if (!pending.mod) throw new Error(`the mod released slot ${slot} twice`)
-    pending.mod = false
-  } else if (!pending.paths.delete(worker)) {
-    throw new Error(`a path thread dropped slot ${slot} twice`)
-  }
-  if (pending.mod || pending.paths.size > 0) return
+  if (!pending.mod) throw new Error(`the mod released slot ${slot} twice`)
   evicting.delete(slot)
   freeSlots.push(slot)
   loadSnapshots()
 }
 
-// A cached column out of its slot: the path threads drop it, the slot is free once they all did (see settleSlot).
+// A cached column out of its slot, which is free once the mod released it (see settleSlot).
 function evict (key, column) {
   if (column.threads.size > 0) throw new Error(`column ${key} evicted while a thread holds it`)
   cached.delete(key)
   columns.delete(key)
   slotColumns.delete(column.slot)
-  evicting.set(column.slot, { mod: column.modHolds, paths: new Set(pathThreads) })
-  for (const worker of pathThreads) worker.postMessage({ type: 'drop', key, slot: column.slot })
+  if (column.modHolds) evicting.set(column.slot, { mod: true })
+  else freeSlots.push(column.slot)
 }
 
 // The oldest cached columns go until the free slots, with those on their way back, are RESERVE again.
@@ -207,50 +134,24 @@ function takeSlot (key) {
   return slot
 }
 
-// Columns waited on by a path search, to read off their snapshot: key -> the searches waiting on it,
-// each { worker, ticket, keys it still waits on }.
-const waitedColumns = new Map()
-// Columns to read off their snapshot once a slot is to spare, in order.
-const toLoad = new Set()
-
-// Columns of `world` ("cx,cz") the path thread's search (ticket) looked for and the fleet does not
-// have in memory: read off their snapshot by the mod, the search told once each is in or has none
-// (see pathThread.js).
-function wantSnapshots (worker, ticket, world, ids) {
-  const search = { worker, ticket, keys: new Set() }
-  for (const id of ids) {
-    const key = `${world}|${id}`
-    // In since the search looked (its 'column' is ahead of the answer), or known to have no snapshot.
-    if (columns.has(key) || noSnapshot.has(key)) continue
-    search.keys.add(key)
-    let searches = waitedColumns.get(key)
-    if (!searches) waitedColumns.set(key, (searches = new Set()))
-    searches.add(search)
-    if (!loading.has(key)) toLoad.add(key)
+// Columns ("server|dimension|cx,cz") to have in memory off their snapshot, as cached ones. Nothing
+// asks for any yet.
+function wantSnapshots (keys) {
+  if (relay) throw new Error('a relay has no snapshots: its world is its own, the mod has none of it')
+  for (const key of keys) {
+    if (columns.has(key) || noSnapshot.has(key) || loading.has(key)) continue
+    toLoad.add(key)
   }
-  if (search.keys.size === 0) worker.postMessage({ type: 'wanted', ticket })
   loadSnapshots()
 }
 
-// The searches waiting on the column hear it is in, or has no snapshot to read.
-function settleWanted (key) {
-  const searches = waitedColumns.get(key)
-  if (!searches) return
-  waitedColumns.delete(key)
-  for (const search of searches) {
-    search.keys.delete(key)
-    if (search.keys.size === 0) search.worker.postMessage({ type: 'wanted', ticket: search.ticket })
-  }
-}
-
 // Asks the mod for the snapshots to read while slots are to spare past RESERVE. Short of them, cached
-// columns give way, their slots coming back once dropped (settleSlot calls this again). With none to
-// give way and none coming back, the searches go on without the rest.
+// columns give way, their slots coming back once the mod released them (settleSlot calls this again).
+// With none to give way and none coming back, the rest are given up.
 function loadSnapshots () {
   for (const key of toLoad) {
     if (columns.has(key)) {
       toLoad.delete(key)
-      settleWanted(key)
       continue
     }
     if (freeSlots.length > RESERVE) {
@@ -266,7 +167,6 @@ function loadSnapshots () {
       continue
     }
     if (evicting.size > 0 || loading.size > 0) return
-    for (const rest of toLoad) settleWanted(rest)
     toLoad.clear()
     return
   }
@@ -285,9 +185,7 @@ function onLoaded (key, slot, version) {
     columns.set(key, column)
     slotColumns.set(slot, column)
     cached.set(key, column)
-    for (const worker of pathThreads) worker.postMessage({ type: 'column', key, version, header: column.header, slot })
   }
-  settleWanted(key)
   loadSnapshots()
 }
 
@@ -333,10 +231,9 @@ function onChunkRequest (thread, request) {
     const load = !column
     if (load) {
       const slot = takeSlot(request.acquire)
-      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: true, ready: false }
+      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: !relay, ready: false }
       columns.set(request.acquire, column)
       slotColumns.set(slot, column)
-      for (const worker of pathThreads) worker.postMessage({ type: 'column', key: request.acquire, version: request.version, header: column.header, slot: column.slot })
       send(protocol.claim(request.bot, column.chunk, column.claim, column.slot, request.version))
     }
     column.threads.add(thread)
@@ -348,7 +245,7 @@ function onChunkRequest (thread, request) {
     const column = columns.get(request.release)
     if (!column || !column.threads.delete(thread)) throw new Error(`a thread released column ${request.release} it does not hold`)
     if (column.threads.size === 0) {
-      // Cached: the path threads keep seeing it; the mod snapshots it and releases the slot.
+      // Cached: the mod snapshots it and releases the slot.
       cached.set(request.release, column)
       // The mod snapshots it once more as it goes: the changes of this turn not sent yet go with it.
       changed.delete(request.release)
@@ -380,88 +277,79 @@ function onReport (thread, report) {
   } else if (report.world) {
     worldOf.set(report.bot, report.world)
     takeProfile(0, `${report.bot} in ${report.world}`)
-    const order = waiting.get(report.bot)
-    if (order) {
-      waiting.delete(report.bot)
-      joinFormation(report.bot, order)
-    }
-  } else if (report.candidates) {
-    // Gone with an older formation: nothing waits on these.
-    const formation = formations.get(report.formation)
-    if (!formation) return
-    if (formation.candidates) throw new Error(`formation ${report.formation} surveyed twice`)
-    if (formation.surveyor !== report.bot) throw new Error(`${report.bot} surveyed formation ${report.formation}, surveyed by ${formation.surveyor}`)
-    formation.candidates = report.candidates
-    // Every bot waiting on the spots takes its own, nearest first in the order they joined.
-    for (const name of formation.queue.splice(0)) goto(formation, name)
   } else if (report.end) {
-    leaveSpot(report.bot)
     bots.delete(report.bot)
     worldOf.delete(report.bot)
-    waiting.delete(report.bot)
-    // A surveyor gone before its spots: the next bot waiting surveys instead, if any is left.
-    for (const [key, formation] of formations) {
-      if (formation.candidates) continue
-      formation.queue = formation.queue.filter(n => n !== report.bot)
-      if (formation.surveyor !== report.bot) continue
-      if (formation.queue.length === 0) {
-        formations.delete(key)
-        continue
-      }
-      formation.surveyor = formation.queue[0]
-      survey(key, formation)
-    }
     thread.bots--
-    if (closing && bots.size === 0) process.exit(0)
+    // A relay stays up for the next mod.
+    if (closing && bots.size === 0 && !relay) process.exit(0)
     takeProfile(0, `${report.bot} gone`)
   } else {
     throw new Error('unknown report from a pool thread')
   }
 }
 
-// The pool: a thread per core left by the path threads at most, each started when a bot needs it
+// The pool: a thread per core at most, each started when a bot needs it
 // rather than all at once, so their start (each loads mineflayer and minecraft-data) never takes
 // every core together.
 const threads = []
-const MAX_THREADS = Math.max(1, os.cpus().length - PATH_THREADS)
+const MAX_THREADS = Math.max(1, os.cpus().length)
 
 function startThread () {
   const { port1, port2 } = new MessageChannel()
   const signal = new SharedArrayBuffer(4)
   const thread = { bots: 0, chunkPort: port1, signal: new Int32Array(signal) }
-  // A port to each path thread.
-  const pathPorts = pathThreads.map(worker => {
-    const channel = new MessageChannel()
-    worker.postMessage({ type: 'client', port: channel.port2 }, [channel.port2])
-    return channel.port1
-  })
   thread.worker = new Worker(path.join(__dirname, 'poolThread.js'), {
-    workerData: { index: threads.length, chunkPort: port2, signal, pathPorts, pathPending, columnsFile },
-    transferList: [port2, ...pathPorts]
+    workerData: { index: threads.length, chunkPort: port2, signal, columnsFile },
+    transferList: [port2]
   })
   thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
   thread.worker.on('error', err => { throw err })
-  thread.worker.on('exit', code => { throw new Error(`pool thread exited (code ${code})`) })
+  thread.worker.on('exit', code => {
+    if (!relay) throw new Error(`pool thread exited (code ${code})`)
+    dropThread(thread, code)
+  })
   port1.on('message', message => onThreadMessage(thread, message))
   threads.push(thread)
   return thread
 }
 
+// A relay's pool thread died: its bots and columns are let go, the profiles stop waiting on it, the
+// rest of the relay goes on. The error goes to the mod.
+function dropThread (thread, code) {
+  threads.splice(threads.indexOf(thread), 1)
+  const gone = []
+  for (const [name, t] of bots) {
+    if (t !== thread) continue
+    bots.delete(name)
+    worldOf.delete(name)
+    gone.push(name)
+    send(protocol.botGone(name))
+  }
+  for (const [key, column] of columns) {
+    if (!column.threads.delete(thread) || column.threads.size > 0) continue
+    changed.delete(key)
+    cached.set(key, column)
+  }
+  for (const [key, profile] of profiles) {
+    if (profile.waiting.delete(thread.worker)) finishProfile(key, profile)
+  }
+  throw new Error(`pool thread exited (code ${code}), its bots gone with it: ${gone.join(', ') || 'none'}`)
+}
+
 // Profiles being put together: key -> { id, reason, waiting: the threads yet to send their rows,
 // rows }. Every thread of the fleet sends its own (see profiler.js), the pool threads their bots'
 // too; once all of them did, the profile goes to the mod. `id` is the mod's PROFILE_REQUEST's, 0
-// for the fleet's own: a bot in a world or gone, a new formation.
+// for the fleet's own: a bot in a world or gone.
 const profiles = new Map()
 let nextProfile = 1
 
 function takeProfile (id, reason) {
   if (closing) return
   const key = nextProfile++
-  const workers = [...threads.map(t => t.worker), ...pathThreads]
+  const workers = threads.map(t => t.worker)
   const cpu = process.cpuUsage()
   const memory = process.memoryUsage()
-  let pending = 0
-  for (let i = 0; i < PATH_THREADS; i++) pending += Atomics.load(pathPendingCounts, i)
   const rows = [
     // The whole process: every thread, libuv's and V8's own included.
     ['node', 'cpu.user', 'ms', cpu.user / 1000],
@@ -469,12 +357,15 @@ function takeProfile (id, reason) {
     ['node', 'mem.rss', 'B', memory.rss],
     ['node', 'uptime.s', '#', process.uptime()],
     ['node', 'bots', '#', bots.size],
+    // The machine it runs on, for what share of it this process is.
+    ['node', 'cpu.count', '#', os.cpus().length],
+    ['node', 'mem.system.used', 'B', os.totalmem() - os.freemem()],
+    ['node', 'mem.system.total', 'B', os.totalmem()],
     ['node', 'threads', '#', 1 + workers.length],
     ...prof.rows([
       ['node.thread:fleet', 'columns', '#', columns.size],
       ['node.thread:fleet', 'columns.cached', '#', cached.size],
-      ['node.thread:fleet', 'slots.free', '#', freeSlots.length],
-      ['node.thread:fleet', 'path.pending', '#', pending]
+      ['node.thread:fleet', 'slots.free', '#', freeSlots.length]
     ])
   ]
   profiles.set(key, { id, reason, waiting: new Set(workers), rows })
@@ -486,13 +377,17 @@ function onProfileRows (worker, key, rows) {
   const profile = profiles.get(key)
   if (!profile || !profile.waiting.delete(worker)) throw new Error(`a thread sent rows for profile ${key}, which does not wait on it`)
   profile.rows.push(...rows)
+  finishProfile(key, profile)
+}
+
+// Sent to the mod once every thread it waits on sent its rows.
+function finishProfile (key, profile) {
   if (profile.waiting.size > 0) return
   profiles.delete(key)
   send(protocol.profile(profile.id, profile.reason, toText(merged(profile.rows))))
 }
 
-// The rows of a bot from every path thread that searched for it, added up into one; those of bots
-// gone are left out (each path thread keeps what it searched for every bot it ever had).
+// The rows of a bot added up into one; those of bots gone are left out.
 function merged (rows) {
   const byKey = new Map()
   for (const row of rows) {
@@ -510,19 +405,30 @@ function merged (rows) {
   return [...byKey.values()]
 }
 
-let closing = false
+// Once closing the mod is gone: what the bots still report on their way out has nowhere to go. A
+// relay is closing too while no mod is connected.
+let closing = relay
+let socket = null
 
-const socket = net.connect(Number(process.argv[2]), '127.0.0.1')
-socket.setNoDelay(true)
-socket.on('error', err => { throw err })
+// A relay's error goes to the mod, which keeps it (crash-relay<N>.log): its terminal is on another
+// machine. The relay goes on, it never goes down; should it end anyway, its supervisor says so and
+// starts another.
+const relayFailed = err => {
+  console.error(err)
+  if (!relay) process.exit(1)
+  if (socket && !socket.destroyed) socket.write(protocol.crash(err?.stack ?? String(err)))
+}
+process.on('uncaughtException', relayFailed)
+process.on('unhandledRejection', relayFailed)
 
-// Once closing the mod is gone: what the bots still report on their way out has nowhere to go.
-const send = frame => { if (!closing) socket.write(frame) }
+// A relay's world stays with it: the frames about columns are left out.
+const send = frame => {
+  if (closing || !socket) return
+  const out = relay ? protocol.withoutChunkFrames(frame) : frame
+  if (out) socket.write(out)
+}
 
-// First of all: the names of the state ids the slots hold.
-send(protocol.stateNames(states.legacyNames()))
-
-socket.on('data', protocol.frames(frame => {
+function onFrame (frame) {
   const message = protocol.decode(frame)
   switch (message.type) {
     case protocol.TYPES.SPAWN: {
@@ -549,21 +455,129 @@ socket.on('data', protocol.frames(frame => {
     case protocol.TYPES.PROFILE_REQUEST:
       takeProfile(message.id, message.reason)
       break
-    case protocol.TYPES.FORMATION:
-      // Same: a bot already gone has no spot to take. Its old spot goes once it takes the new one.
-      if (bots.has(message.bot)) formationOrder(message.bot, { id: message.id, target: { x: message.x, y: message.y, z: message.z } })
-      break
+    case protocol.TYPES.HELLO:
+      throw new Error('the mod sent HELLO again, past its first frame')
   }
-}))
+}
 
 // The mod going away (socket or stdin closed) takes every bot with it.
 function close () {
   if (closing) return
   closing = true
-  if (bots.size === 0) process.exit(0)
+  if (bots.size === 0) {
+    if (!relay) process.exit(0)
+    return
+  }
   for (const [name, thread] of bots) thread.worker.postMessage({ type: 'quit', bot: name })
 }
 
-socket.on('close', close)
-process.stdin.on('end', close)
-process.stdin.resume()
+// The mod's connection: the mod's own fleet is started with it, a relay is handed it by its server.
+function serve (connection) {
+  socket = connection
+  closing = false
+  connection.setNoDelay(true)
+  if (relay) send(protocol.welcome())
+  connection.on('error', err => {
+    if (!relay) throw err
+    // A relay outlives the mod: a connection that fails ends that session, said loudly, and it waits for the next.
+    console.error(`the mod's connection failed: ${err.message}`)
+  })
+  // First of all: the names of the state ids the slots hold.
+  send(protocol.stateNames(states.legacyNames()))
+  connection.on('data', protocol.frames(onFrame))
+  connection.on('close', close)
+}
+
+// A relay waits on the mod's HELLO: the same commit is served, another has it update.
+function hello (connection, id) {
+  // Taken until the mod is served or gone: another mod is refused meanwhile.
+  closing = false
+  socket = connection
+  const onClose = () => { closing = true }
+  const onError = err => console.error(`the mod's connection failed before its HELLO: ${err.message}`)
+  const onData = protocol.frames(frame => {
+    const message = protocol.decode(frame)
+    if (message.type !== protocol.TYPES.HELLO) throw new Error(`the mod's first frame is type ${message.type}, not HELLO`)
+    // The mod sends nothing more until its WELCOME: whatever comes next is the served relay's to read.
+    connection.pause()
+    connection.off('data', onData)
+    connection.off('error', onError)
+    connection.off('close', onClose)
+    if (message.version === VERSION) {
+      connection.resume()
+      serve(connection)
+    } else {
+      update(connection, id, message.version)
+    }
+  })
+  connection.on('close', onClose)
+  connection.on('error', onError)
+  connection.on('data', onData)
+}
+
+// The mod runs another commit than this relay: its checkout is reset to it by force, whatever it had
+// (npm install too when package.json changed), and this relay ends for its supervisor to start a new
+// one on it, handed the same connection and the mod's commit to check once more.
+function update (connection, id, version) {
+  if (!/^[0-9a-f]{40}$/.test(version)) {
+    refuse(connection, `the mod sent ${JSON.stringify(version)} for its commit, not a commit hash`)
+    return
+  }
+  const text = `the mod runs commit ${version}, this relay ${VERSION}: git fetch, reset --hard and restart`
+  console.log(text)
+  send(protocol.updating(text))
+  const packageFile = path.join(__dirname, 'package.json')
+  const packageJson = fs.readFileSync(packageFile)
+  try {
+    execSync('git fetch', { cwd: __dirname, stdio: 'inherit' })
+    execSync(`git reset --hard ${version}`, { cwd: __dirname, stdio: 'inherit' })
+    if (!fs.readFileSync(packageFile).equals(packageJson)) execSync('npm install --no-audit --no-fund', { cwd: __dirname, stdio: 'inherit' })
+  } catch (err) {
+    refuse(connection, `the update failed: ${err.message}`)
+    return
+  }
+  // Said before it ends: the supervisor hands this connection to the next relay.
+  process.send({ type: 'restart', id, version }, () => process.exit(RESTART))
+}
+
+// The mod's commit is out of this relay's reach: the mod is told why and the relay waits for the next.
+function refuse (connection, text) {
+  console.error(text)
+  connection.on('error', err => console.error(`the mod's connection failed while refused: ${err.message}`))
+  send(protocol.updateFailed(text))
+  closing = true
+  connection.end()
+}
+
+if (relay) {
+  // Each knock comes from the supervisor, which holds the port; `handoff` the mod's commit when the
+  // connection is one this relay's predecessor updated for, its HELLO already answered.
+  process.on('message', ({ type, id, handoff }, connection) => {
+    if (type !== 'connection' || !connection) throw new Error(`the supervisor sent ${JSON.stringify(type)} without a connection`)
+    connection.on('close', () => process.send({ type: 'done', id }))
+    if (handoff) {
+      socket = connection
+      closing = false
+      if (handoff !== VERSION) {
+        refuse(socket, `after its reset this relay is at commit ${VERSION}, the mod at ${handoff}`)
+      } else {
+        console.log(`updated to the mod's commit ${VERSION}`)
+        serve(socket)
+      }
+      return
+    }
+    // One mod at a time, and not while the last one's bots are still leaving.
+    if (!(closing && bots.size === 0)) {
+      console.error(`refused ${connection.remoteAddress}: a mod is connected or its bots are still leaving`)
+      connection.destroy()
+      return
+    }
+    console.log(`mod connected from ${connection.remoteAddress}`)
+    hello(connection, id)
+  })
+} else {
+  serve(net.connect(socketPort, '127.0.0.1'))
+  // The mod's own fleet lives and dies with the mod's process.
+  process.stdin.on('end', close)
+  process.stdin.resume()
+}

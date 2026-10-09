@@ -1,5 +1,6 @@
 package net.mapmcbot.bot;
 
+import java.net.InetSocketAddress;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
@@ -21,8 +22,20 @@ public final class BotRegistry implements BotListener {
 
 	private final FleetChannel channel;
 
+	/** The relays; their bots are run there, the orders go through it. */
+	private final RelayHub relays;
+
+	/** The names for the bots: the mod picks them, the fleets are only told. */
+	private final NameList names;
+
 	/** The bots spawned and not yet gone. */
 	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+	/** The fleet running each bot spawned and not yet gone: 0 the mod's own, else a relay's rid. */
+	private final Map<String, Integer> fleetOf = new ConcurrentHashMap<String, Integer>();
+
+	/** The server each bot spawned and not yet gone joins: where another fleet sends it if its relay fails to start. */
+	private final Map<String, InetSocketAddress> serverOf = new ConcurrentHashMap<String, InetSocketAddress>();
 
 	/** The bots in the world (BOT_SPAWNED) and not yet gone. */
 	private final Set<String> spawned = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
@@ -30,13 +43,16 @@ public final class BotRegistry implements BotListener {
 	/** The path each walking bot is on, from its PATH frames. */
 	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
-	public BotRegistry(FleetChannel channel) {
+	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
 		}
 
 		this.channel = channel;
+		this.names = names;
+		this.relays = relays;
 		channel.setBotListener(this);
+		relays.setBots(this);
 	}
 
 	public Set<String> getBots() {
@@ -57,28 +73,81 @@ public final class BotRegistry implements BotListener {
 		return Collections.unmodifiableMap(paths);
 	}
 
-	/** Starts a bot that joins host:port as `name`, in the background. */
-	public void create(String name, String host, int port) {
-		if (!bots.add(name)) {
-			throw new IllegalStateException("a bot named " + name + " is already running");
+	/**
+	 * Starts a bot that joins host:port in the background, named by the name list, on the fleet
+	 * (the mod's own or a relay, a starting one too) with the fewest bots; returns the name.
+	 * Synchronized with a relay failing or closing, so its rid is never picked as it goes.
+	 */
+	public synchronized String create(String host, int port) {
+		final String name = names.take();
+
+		try {
+			if (!bots.add(name)) {
+				throw new IllegalStateException("a bot named " + name + " is already running");
+			}
+
+			serverOf.put(name, InetSocketAddress.createUnresolved(host, port));
+			spawnOn(leastLoadedFleet(), name);
+		} catch (RuntimeException e) {
+			if (bots.remove(name)) {
+				fleetOf.remove(name);
+				serverOf.remove(name);
+				names.give(name);
+			}
+
+			throw e;
 		}
 
-		channel.spawn(name, host, port);
+		return name;
 	}
 
-	/** See {@link FleetChannel#formation}. */
-	public void formation(String name, int id, int x, int y, int z) {
-		if (!bots.contains(name)) {
-			throw new IllegalStateException("formation for " + name + ": no such bot");
+	private void spawnOn(int rid, String name) {
+		final InetSocketAddress server = serverOf.get(name);
+		fleetOf.put(name, rid);
+
+		if (rid == 0) {
+			channel.spawn(name, server.getHostString(), server.getPort());
+		} else {
+			relays.spawn(rid, name, server.getHostString(), server.getPort());
+		}
+	}
+
+	/** The rid of the fleet running the fewest bots, the lowest on a tie: 0 is the mod's own. */
+	private int leastLoadedFleet() {
+		final Map<Integer, Integer> counts = new java.util.TreeMap<Integer, Integer>();
+		counts.put(0, 0);
+
+		for (int rid : relays.rids()) {
+			counts.put(rid, 0);
 		}
 
-		channel.formation(name, id, x, y, z);
+		for (int rid : fleetOf.values()) {
+			if (counts.containsKey(rid)) {
+				counts.put(rid, counts.get(rid) + 1);
+			}
+		}
+
+		int best = 0;
+
+		for (Map.Entry<Integer, Integer> entry : counts.entrySet()) {
+			if (entry.getValue() < counts.get(best)) {
+				best = entry.getKey();
+			}
+		}
+
+		return best;
 	}
 
-	/** Each bot leaves; the fleet unloads each chunk once no bot holds it. The fleet stays up. */
-	public void stopAll() {
+	/** Each bot leaves; the fleet unloads each chunk once no bot holds it. The fleets stay up. */
+	public synchronized void stopAll() {
 		for (String bot : bots) {
-			channel.quit(bot);
+			final int rid = fleetOf.get(bot);
+
+			if (rid == 0) {
+				channel.quit(bot);
+			} else {
+				relays.quit(rid, bot);
+			}
 		}
 
 		clear();
@@ -101,18 +170,60 @@ public final class BotRegistry implements BotListener {
 
 	@Override
 	public void onGone(String bot) {
-		bots.remove(bot);
+		if (bots.remove(bot)) {
+			names.give(bot);
+		}
+
+		fleetOf.remove(bot);
+		serverOf.remove(bot);
+
 		spawned.remove(bot);
 		paths.remove(bot);
 	}
 
+	/** The mod's own fleet is gone: its bots with it. */
 	@Override
 	public void onClosed() {
-		clear();
+		clearFleet(0);
+	}
+
+	/** A relay failed before its WELCOME (the hub holding this registry's lock): its bots never got there and go to the fleet with the fewest. */
+	void onRelayFailed(int rid) {
+		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
+			if (entry.getValue() == rid) {
+				spawnOn(leastLoadedFleet(), entry.getKey());
+			}
+		}
+	}
+
+	/** A relay is gone: its bots with it. */
+	void onRelayClosed(int rid) {
+		clearFleet(rid);
+	}
+
+	private void clearFleet(int rid) {
+		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
+			if (entry.getValue() != rid) {
+				continue;
+			}
+
+			final String bot = entry.getKey();
+			fleetOf.remove(bot);
+			serverOf.remove(bot);
+			spawned.remove(bot);
+			paths.remove(bot);
+
+			if (bots.remove(bot)) {
+				names.give(bot);
+			}
+		}
 	}
 
 	private void clear() {
+		names.giveAll();
 		bots.clear();
+		fleetOf.clear();
+		serverOf.clear();
 		spawned.clear();
 		paths.clear();
 	}

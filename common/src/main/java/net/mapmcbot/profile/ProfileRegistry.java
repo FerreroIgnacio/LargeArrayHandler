@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import net.mapmcbot.bot.RelayHub;
 import net.mapmcbot.fleet.FleetChannel;
 
 /**
@@ -32,7 +33,7 @@ import net.mapmcbot.fleet.FleetChannel;
  *
  * Nothing is sampled on a timer. A profile is taken when someone asks for one (the screen opening,
  * its refresh, the player leaving the world), every FRAMES_PER_PROFILE frames through the channel,
- * and when the fleet takes one on an event of its own (a bot in a world or gone, a new formation):
+ * and when the fleet takes one on an event of its own (a bot in a world or gone):
  * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
  * the mod's part alone.
  *
@@ -40,7 +41,7 @@ import net.mapmcbot.fleet.FleetChannel;
  *
  * SINGLETON: one per game; a second registry throws.
  */
-public final class ProfileRegistry implements ProfileListener {
+public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileSink {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
 	/** Reports kept for the screen. */
@@ -59,6 +60,10 @@ public final class ProfileRegistry implements ProfileListener {
 	private final AtomicLong frames = new AtomicLong();
 
 	private final FleetChannel channel;
+	private final RelayHub relays;
+	/** Each relay's newest profile and the one its rates are worked out against (its own reports, apart from the mod's). */
+	private final java.util.Map<Integer, ProfileReport> relayLatest = new java.util.TreeMap<Integer, ProfileReport>();
+	private final java.util.Map<Integer, ProfileReport> relayBase = new java.util.HashMap<Integer, ProfileReport>();
 	/** Per bot that claimed them: {chunks, block entities, bytes of their NBT} held by the chunk registry. */
 	private final Supplier<Map<String, long[]>> chunksByBot;
 	private final BufferedWriter log;
@@ -71,7 +76,7 @@ public final class ProfileRegistry implements ProfileListener {
 	/** The request whose profile has not arrived, 0 for none. */
 	private volatile int waitingFor;
 
-	public ProfileRegistry(FleetChannel channel, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
+	public ProfileRegistry(FleetChannel channel, RelayHub relays, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("ProfileRegistry is a singleton: one was already created");
 		}
@@ -93,6 +98,7 @@ public final class ProfileRegistry implements ProfileListener {
 		threads.setThreadAllocatedMemoryEnabled(true);
 
 		this.channel = channel;
+		this.relays = relays;
 		this.chunksByBot = chunksByBot;
 		this.logFile = logFile;
 
@@ -110,6 +116,7 @@ public final class ProfileRegistry implements ProfileListener {
 		}
 
 		channel.setProfileListener(this);
+		relays.setProfileSink(this);
 	}
 
 	public File getLogFile() {
@@ -130,6 +137,9 @@ public final class ProfileRegistry implements ProfileListener {
 	public void request(String reason) {
 		final int id;
 
+		// The relays answer on their own, each into its own report.
+		relays.requestProfile(reason);
+
 		synchronized (this) {
 			if (!channel.isRunning()) {
 				record(reason, new ArrayList<ProfileReport.Row>());
@@ -148,6 +158,11 @@ public final class ProfileRegistry implements ProfileListener {
 		return history.isEmpty() ? null : history.getLast();
 	}
 
+	/** The newest profile of the relay `rid`, null before its first or once it is gone. Its rows are scoped as the mod's own fleet's ("node"...). */
+	public synchronized ProfileReport getRelayLatest(int rid) {
+		return relayLatest.get(rid);
+	}
+
 	/** The profiles so far, oldest first. */
 	public synchronized List<ProfileReport> getHistory() {
 		return new ArrayList<ProfileReport>(history);
@@ -160,6 +175,27 @@ public final class ProfileRegistry implements ProfileListener {
 		if (id != 0 && id == waitingFor) {
 			waitingFor = 0;
 		}
+	}
+
+	@Override
+	public synchronized void onRelayProfile(int rid, String reason, String text) {
+		final long now = System.currentTimeMillis();
+		final ProfileReport latest = relayLatest.get(rid);
+		ProfileReport base = relayBase.get(rid);
+
+		// As for the mod's: rates against the newest report at least MIN_INTERVAL older.
+		if (latest != null && (base == null || now - latest.getTime() >= MIN_INTERVAL)) {
+			base = latest;
+			relayBase.put(rid, base);
+		}
+
+		relayLatest.put(rid, new ProfileReport(now, reason, ProfileReport.parse(text), base));
+	}
+
+	@Override
+	public synchronized void onRelayGone(int rid) {
+		relayLatest.remove(rid);
+		relayBase.remove(rid);
 	}
 
 	@Override

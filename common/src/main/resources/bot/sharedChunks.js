@@ -365,4 +365,4 @@ function sharedChunks (port, signal, post) {
   }
 }
 
-module.exports = { sharedChunks, columnClass, openColumns, loadedHeader, HEADER, SLOTS }
+module.exports = { sharedChunks, columnClass, openColumns, loadedHeader, HEADER, SLOTS, SIZE }

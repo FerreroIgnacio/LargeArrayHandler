@@ -21,7 +21,7 @@ import org.lwjgl.input.Mouse;
  * newest profile of the {@link ProfileRegistry}. Opened with Z (Z or escape close it).
  *
  * A profile is taken as the screen opens and on Refresh (R), never on a timer; the fleet takes its
- * own on its events (a bot in or out, a new formation), and the screen shows each as it comes. CPU is
+ * own on its events (a bot in or out), and the screen shows each as it comes. CPU is
  * what was spent between the newest profile and the one before, as % of one core; memory is the
  * reading taken with the newest. Every profile also goes to the log (bot/profile.log).
  */

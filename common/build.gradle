@@ -15,3 +15,14 @@ tasks.withType(JavaCompile).configureEach {
 	it.options.encoding = "UTF-8"
 	it.options.release = 8
 }
+
+// The commit the mod is built at, for the relays to be at the same one (see RelayHub).
+def commit = providers.exec { commandLine "git", "rev-parse", "HEAD" }.standardOutput.asText.map { it.trim() }
+
+processResources {
+	inputs.property "commit", commit
+	def out = destinationDir
+	doLast {
+		new File(out, "mapmcbot-commit.txt").text = commit.get()
+	}
+}

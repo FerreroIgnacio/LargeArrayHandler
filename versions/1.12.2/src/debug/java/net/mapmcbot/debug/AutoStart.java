@@ -3,7 +3,6 @@ package net.mapmcbot.debug;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
-import java.util.stream.IntStream;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -24,9 +23,10 @@ import net.minecraft.world.GameMode;
  */
 public class AutoStart implements ClientModInitializer {
 	/** Every bot's name starts with it; BotSkinMixin tells the bots apart by it. */
-	public static final String BOT_PREFIX = "PandaBot";
+	public static final String BOT_PREFIX = MapMcBotClient.NAME_PREFIX;
 
-	private static final String[] BOTS = IntStream.rangeClosed(2, 32).mapToObj(i -> BOT_PREFIX + i).toArray(String[]::new);
+	/** PandaBot2 to PandaBot32, from the mod's name list. */
+	private static final int BOT_COUNT = 31;
 
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
 	private static final int MAX_PLAYERS = 128;
@@ -95,16 +95,17 @@ public class AutoStart implements ClientModInitializer {
 					if (opened != null) {
 						raisePlayerLimit(client.getServer().getPlayerManager());
 						port = Integer.parseInt(opened);
+
 						step = Step.BOTS;
 					}
 				}
 				break;
 
 			case BOTS:
-				MapMcBotClient.bots().create(BOTS[nextBot], "localhost", port);
+				MapMcBotClient.bots().create("localhost", port);
 				nextBot++;
 				wait = BOT_GAP_TICKS;
-				step = nextBot < BOTS.length ? Step.BOTS : Step.DONE;
+				step = nextBot < BOT_COUNT ? Step.BOTS : Step.DONE;
 				break;
 
 			default:

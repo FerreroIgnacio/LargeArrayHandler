@@ -1,6 +1,5 @@
 // What the fleet spends, CPU and memory, per thread and per bot: read when the mod asks for a
-// profile (PROFILE_REQUEST) or the fleet takes one on an event of its own (a bot in or out, a new
-// formation), never on a timer. Counters only go up; the mod works out the rates between two
+// profile (PROFILE_REQUEST) or the fleet takes one on an event of its own (a bot in or out), never on a timer. Counters only go up; the mod works out the rates between two
 // profiles (see net.mapmcbot.profile.ProfileReport).
 //
 // A row is [scope, name, unit, value]. Units:

@@ -41,12 +41,6 @@ public interface FleetChannel {
 
 	void quit(String bot);
 
-	/**
-	 * The bot walks to x,y,z, or next to it when another bot holds that block. `id` is the
-	 * formation's, the same for every bot sent to it and higher than any before.
-	 */
-	void formation(String bot, int id, int x, int y, int z);
-
 	/** The columns file the fleet loads every chunk into, one slot each (see FleetProtocol). */
 	File columns();
 
