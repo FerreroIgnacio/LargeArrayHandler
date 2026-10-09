@@ -253,6 +253,14 @@ public final class RelayHub {
 		relay(rid).send(FleetProtocol.windowClick(bot, slot, button, mode, id));
 	}
 
+	public void tradeSelect(int rid, String bot, int trade) {
+		relay(rid).send(FleetProtocol.tradeSelect(bot, trade));
+	}
+
+	public void action(int rid, String bot, String json) {
+		relay(rid).send(FleetProtocol.action(bot, json));
+	}
+
 	public void gotoSpot(int rid, String bot, int x, int y, int z) {
 		relay(rid).send(FleetProtocol.gotoSpot(bot, x, y, z));
 	}

@@ -116,8 +116,14 @@ parentPort.on('message', message => {
     case 'goto':
       bot.goto(message.spot)
       break
+    case 'action':
+      bot.action(message.action)
+      break
     case 'click':
       bot.click(message.slot, message.button, message.mode, message.id)
+      break
+    case 'trade':
+      bot.selectTrade(message.trade)
       break
     default:
       throw new Error(`unknown order ${message.type} for the pool thread`)

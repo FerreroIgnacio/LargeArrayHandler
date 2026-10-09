@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import net.mapmcbot.bot.BotInventory;
+import net.mapmcbot.bot.BotStatus;
+import net.mapmcbot.bot.BotWindow;
 import net.mapmcbot.bot.BotListener;
 import net.mapmcbot.chunk.ChunkData;
 import net.mapmcbot.chunk.ChunkKey;
@@ -89,6 +91,19 @@ public final class FleetProtocol {
 	 * name string, i32 count, i32 metadata, i32 NBT length and the NBT (see {@link BotInventory.Item}).
 	 */
 	public static final int INVENTORY = 24;
+	/**
+	 * bot name, u8 kind (0 idle, 1 doing, 2 error), primitive string, message bytes: what the bot is
+	 * doing (see {@link BotStatus}).
+	 */
+	public static final int STATE = 26;
+	/**
+	 * bot name, u8 open; when open the window's type string, i32 how many slots are its own, i32 slot
+	 * count, each slot's item as in INVENTORY, the cursor's item, i32 property count and each property
+	 * as i32, i32 trade count and each trade (a villager's) as its first item, second item (none for
+	 * none), result item and u8 used up: the window the bot has open, whole, sent once
+	 * anything in it changed; closed when not open.
+	 */
+	public static final int WINDOW = 27;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -115,6 +130,10 @@ public final class FleetProtocol {
 	 * says it is done.
 	 */
 	public static final int WINDOW_CLICK = 25;
+	/** bot name, bytes: a primitive for the bot as UTF-8 JSON (see the fleet's actions.js for each one's fields). */
+	public static final int ACTION = 28;
+	/** bot name, i32 trade: the villager trade the bot's open window shows, as the game's arrows pick it. */
+	public static final int TRADE_SELECT = 29;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -328,6 +347,71 @@ public final class FleetProtocol {
 					break;
 				}
 
+				case STATE: {
+					final int kind = in.readUnsignedByte();
+					final String primitive = readString(in);
+					final String message = new String(readBytes(in), StandardCharsets.UTF_8);
+					end(in, type);
+
+					if (kind > BotStatus.Kind.values().length - 1) {
+						throw new IOException("bad state kind " + kind + " for " + bot);
+					}
+
+					bots.onState(bot, new BotStatus(BotStatus.Kind.values()[kind], primitive, message));
+					break;
+				}
+
+				case WINDOW: {
+					if (!in.readBoolean()) {
+						end(in, type);
+						bots.onWindow(bot, null);
+						break;
+					}
+
+					final String windowType = readString(in);
+					final int own = in.readInt();
+					final int count = in.readInt();
+
+					if (count < 0 || count > 256 || own < 0 || own > count) {
+						throw new IOException("bad window of " + own + " own slots in " + count + " for " + bot);
+					}
+
+					final List<BotInventory.Item> slots = new ArrayList<BotInventory.Item>(count);
+
+					for (int i = 0; i < count; i++) {
+						slots.add(readItem(in));
+					}
+
+					final BotInventory.Item cursor = readItem(in);
+					final int propertyCount = in.readInt();
+
+					if (propertyCount < 0 || propertyCount > 64) {
+						throw new IOException("bad window of " + propertyCount + " properties for " + bot);
+					}
+
+					final int[] properties = new int[propertyCount];
+
+					for (int i = 0; i < propertyCount; i++) {
+						properties[i] = in.readInt();
+					}
+
+					final int tradeCount = in.readInt();
+
+					if (tradeCount < 0 || tradeCount > 256) {
+						throw new IOException("bad window of " + tradeCount + " trades for " + bot);
+					}
+
+					final List<BotWindow.Trade> trades = new ArrayList<BotWindow.Trade>(tradeCount);
+
+					for (int i = 0; i < tradeCount; i++) {
+						trades.add(new BotWindow.Trade(readItem(in), readItem(in), readItem(in), in.readBoolean()));
+					}
+
+					end(in, type);
+					bots.onWindow(bot, new BotWindow(windowType, own, cursor, slots, properties, trades));
+					break;
+				}
+
 				case PROFILE: {
 					final int id = in.readInt();
 					final String reason = readString(in);
@@ -460,6 +544,34 @@ public final class FleetProtocol {
 			frame.out.writeByte(button);
 			frame.out.writeByte(mode);
 			frame.out.writeInt(id);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] tradeSelect(String bot, int trade) {
+		final Frame frame = new Frame(TRADE_SELECT);
+
+		try {
+			writeString(frame.out, bot);
+			frame.out.writeInt(trade);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] action(String bot, String json) {
+		final Frame frame = new Frame(ACTION);
+
+		try {
+			writeString(frame.out, bot);
+			final byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+			frame.out.writeInt(bytes.length);
+			frame.out.write(bytes);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

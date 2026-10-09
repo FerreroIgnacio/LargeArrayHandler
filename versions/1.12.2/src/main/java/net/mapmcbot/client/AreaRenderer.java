@@ -14,6 +14,7 @@ import net.minecraft.client.render.Tessellator;
 import net.minecraft.client.render.VertexFormats;
 import net.minecraft.entity.Entity;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import org.lwjgl.opengl.GL11;
 
 /**
@@ -43,11 +44,12 @@ public final class AreaRenderer {
 		}
 
 		final AreaStore store = MapMcBotClient.areas();
-		final BlockPos target = AreaPick.isActive() ? AreaPick.target(client) : null;
+		final BlockPos target = AreaPick.isActive() ? AreaPick.target(client) : TargetPick.isActive() ? TargetPick.target(client) : null;
+		final Box entityTarget = TargetPick.isActive() ? TargetPick.entityBox(client) : null;
 		final BotRegistry bots = MapMcBotClient.botsOrNull();
 		final Map<String, int[]> paths = bots == null ? Collections.<String, int[]>emptyMap() : bots.getPaths();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && paths.isEmpty()) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty()) {
 			return;
 		}
 
@@ -84,6 +86,10 @@ public final class AreaRenderer {
 		if (target != null) {
 			drawBox(target.getX(), target.getY(), target.getZ(),
 					target.getX() + 1, target.getY() + 1, target.getZ() + 1, 0xFFFFFF, camX, camY, camZ);
+		}
+
+		if (entityTarget != null) {
+			drawBox(entityTarget.minX, entityTarget.minY, entityTarget.minZ, entityTarget.maxX, entityTarget.maxY, entityTarget.maxZ, 0xFFFFFF, camX, camY, camZ);
 		}
 
 		// TODO(world): a bot may be on another server or dimension than this client's (a relay's, or a local

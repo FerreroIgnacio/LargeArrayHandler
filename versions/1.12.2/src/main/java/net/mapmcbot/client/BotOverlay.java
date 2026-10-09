@@ -42,7 +42,7 @@ public final class BotOverlay {
 		int y = MARGIN;
 
 		for (String name : names) {
-			final String line = name + " " + bots.getStatus(name);
+			final String line = client.textRenderer.trimToWidth(name + " " + bots.getStatus(name), window.getWidth() / 2);
 			client.textRenderer.drawWithShadow(line, window.getWidth() - MARGIN - client.textRenderer.getStringWidth(line), y, 0xFFFFFF);
 			y += client.textRenderer.fontHeight + 2;
 		}

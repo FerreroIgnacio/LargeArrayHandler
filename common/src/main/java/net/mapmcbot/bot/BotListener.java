@@ -14,6 +14,12 @@ public interface BotListener {
 	/** Its inventory window changed: the whole of it now. */
 	void onInventory(String bot, BotInventory inventory);
 
+	/** What it is doing now (see BotStatus). */
+	void onState(String bot, BotStatus status);
+
+	/** The window it has open changed: the whole of it now, null once none is open. */
+	void onWindow(String bot, BotWindow window);
+
 	/** Left the server; its chunks are the fleet's, unloaded as the fleet's last bot lets each go. */
 	void onGone(String bot);
 

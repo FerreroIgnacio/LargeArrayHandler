@@ -8,6 +8,7 @@ const { Vec3 } = require('vec3')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const protocol = require('./protocol')
 const states = require('./states')
+const actions = require('./actions')
 const { botMeter } = require('./profiler')
 
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
@@ -46,6 +47,26 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
 
   let tools
   const blockStates = () => (tools ??= states(bot.registry))
+  // The items' own class, prismarine-item's for the server's version.
+  let itemClass
+  const Item = () => (itemClass ??= require('prismarine-item')(bot.registry))
+
+  // The bot's primitives and state (see actions.js); its pathfinder takes the goals they walk to.
+  const act = actions({
+    bot,
+    name,
+    log,
+    publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message)),
+    walk: goal => {
+      setSearching(true)
+      log(`goto ${spot(goal)} from ${at()}`)
+      bot.pathfinder.setGoal(goal)
+    },
+    // The villager window's trades as the server listed them, and the one picked shown in its result.
+    trades: window => trades.id === window.id ? trades.recipes : null,
+    selectTrade: (window, trade) => pickTrade(window, trade),
+    blockStates
+  })
 
   function held (x, z) {
     const key = columns.get(`${x >> 4},${z >> 4}`)
@@ -105,6 +126,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     bot.pathfinder.thinkTimeout = Infinity
     log('spawned')
     out(protocol.botSpawned(name))
+    out(protocol.state(name, 0, '', ''))
   })
   // Every spawn, the first and each respawn or change of dimension: the fleet keeps where each bot is.
   bot.on('spawn', () => report({ world: world() }))
@@ -220,102 +242,321 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     setImmediate(sendInventory)
   }
   bot.once('spawn', () => {
-    bot.inventory.doubleClick = pickupAll
     bot.inventory.on('updateSlot', queueInventory)
     bot.on('heldItemChanged', queueInventory)
     // The server's own word on slots and the cursor, mineflayer's handlers run first.
-    bot._client.on('set_slot', queueInventory)
-    bot._client.on('window_items', queueInventory)
+    bot._client.on('set_slot', () => { queueInventory(); queueWindow() })
+    bot._client.on('window_items', () => { queueInventory(); queueWindow() })
     queueInventory()
   })
 
-  // A double click with an item on the cursor (pickup all, mode 6), as the server does it, for
-  // mineflayer's window to know what the click left (prismarine-windows has none): over an empty slot
-  // the cursor takes the same item from every other slot, up to a full stack, the partly filled
-  // stacks first and the full ones after, from the first slot on (the last on, right button). The
-  // crafting result is left out.
-  function pickupAll (click) {
-    const cursor = this.selectedItem
-    if (!cursor || this.slots[click.slot]) return []
-    // The items' own class (prismarine-item's, made for this version).
-    const Item = cursor.constructor
-    const changed = []
-    const order = this.slots.map((_, i) => i)
-    if (click.mouseButton !== 0) order.reverse()
-    for (const fullOnes of [false, true]) {
-      for (const i of order) {
-        if (cursor.count >= cursor.stackSize) break
-        const it = this.slots[i]
-        if (i === this.craftingResultSlot || !it || !Item.equal(it, cursor, false)) continue
-        if (!fullOnes && it.count === it.stackSize) continue
-        const n = Math.min(cursor.stackSize - cursor.count, it.count)
-        cursor.count += n
-        it.count -= n
-        this.updateSlot(i, it.count === 0 ? null : it)
-        changed.push(i)
-      }
-    }
-    return changed
+  // A copy of the item with that many in it, null for none.
+  const withCount = (item, count) => count === 0 ? null : Object.assign(Object.create(Object.getPrototypeOf(item)), item, { count })
+  // The same item as the cursor's (the items' own class, prismarine-item's made for this version), the count aside.
+  const stacksWith = (cursor, it) => cursor.constructor.equal(it, cursor, false)
+
+  // The clicks prismarine-windows has no model of, a drag (5) and a double click (6), sent as the
+  // client sends them: the item the server answers them with is always none, mineflayer's own
+  // clickWindow would send the slot's. Each under an action number of its own, counting down from
+  // -1 (mineflayer's count up from 1): mineflayer answers their transactions as ones it did not
+  // send, accepted, which the server takes as nothing. Done once the server confirms it; a click it
+  // rejects is fatal, as mineflayer's.
+  let rawAction = 0
+  const rawPending = new Map()
+  bot._client.on('transaction', ({ windowId, action, accepted }) => {
+    const pending = rawPending.get(action)
+    if (!pending || pending.windowId !== windowId) return
+    rawPending.delete(action)
+    if (accepted) pending.resolve()
+    else pending.reject(new Error(`${name}: the server rejected click ${pending.what} on window ${windowId}`))
+  })
+  function rawClick (window, slot, button, mode) {
+    rawAction = rawAction === -32768 ? -1 : rawAction - 1
+    const action = rawAction
+    const done = new Promise((resolve, reject) => {
+      rawPending.set(action, { windowId: window.id, what: `slot ${slot}, button ${button}, mode ${mode}`, resolve, reject })
+    })
+    bot._client.write('window_click', { windowId: window.id, slot, mouseButton: button, action, mode, item: { blockId: -1 } })
+    return done
   }
 
-  // The mod's clicks on the bot's inventory, one after the other as a client's window takes them,
-  // each id told back once done (lastClick). mineflayer clicks modes 0 to 4, and 6 with pickupAll;
-  // a drag (5) is done as the clicks that leave the same.
+  // A double click with an item on the cursor (pickup all, mode 6), worked out as the server does it
+  // on the window as it is before it is sent, and returned to be done on it once confirmed: the server
+  // sends the slots it emptied before its confirmation, so worked out then it would find them taken
+  // already, the cursor left as it was. Over an empty slot the cursor takes the same item from every
+  // other slot, up to a full stack, the partly filled stacks first and the full ones after, from the
+  // first slot on (the last on, right button). The crafting result is left out.
+  function pickupAll (window, slot, button) {
+    const cursor = window.selectedItem
+    if (!cursor || window.slots[slot]) return () => {}
+    let count = cursor.count
+    // Slot: [its item before, what it is left with].
+    const taken = new Map()
+    const order = window.slots.map((_, i) => i)
+    if (button !== 0) order.reverse()
+    for (const fullOnes of [false, true]) {
+      for (const i of order) {
+        if (count >= cursor.stackSize) break
+        const it = window.slots[i]
+        const left = taken.has(i) ? taken.get(i)[1] : it?.count
+        if (i === window.craftingResultSlot || !it || left === 0 || !stacksWith(cursor, it)) continue
+        if (!fullOnes && left === it.stackSize) continue
+        const n = Math.min(cursor.stackSize - count, left)
+        count += n
+        taken.set(i, [it, left - n])
+      }
+    }
+    return () => {
+      for (const [i, [it, left]] of taken) window.updateSlot(i, withCount(it, left))
+      window.selectedItem = withCount(cursor, count)
+    }
+  }
+
+  // A drag's slot (stage 1) as the server takes it: the cursor holding something, the slot empty or
+  // holding the same item, while the cursor has more than the slots taken (one each at least); the
+  // crafting result is left out.
+  function dragTakes (drag, slot) {
+    const cursor = drag.window.selectedItem
+    if (!cursor || slot < 0 || slot === drag.window.craftingResultSlot || drag.slots.includes(slot)) return false
+    const it = drag.window.slots[slot]
+    return (!it || stacksWith(cursor, it)) && cursor.count > drag.slots.length
+  }
+
+  // A drag's end (stage 2) as the server does it: the cursor split evenly over the slots taken
+  // (limit 0) or one in each (limit 1), each slot as full as it takes, the rest left on the cursor.
+  // The creative one (2) the server leaves undone but in creative, which the bot is never in.
+  function dragOver ({ window, limit, slots }) {
+    const cursor = window.selectedItem
+    if (!cursor || slots.length === 0 || limit === 2 || cursor.count < slots.length) return
+    const each = limit === 0 ? Math.floor(cursor.count / slots.length) : 1
+    let left = cursor.count
+    for (const slot of slots) {
+      const it = window.slots[slot]
+      if (it && !stacksWith(cursor, it)) continue
+      const there = it ? it.count : 0
+      const count = Math.min(cursor.stackSize, there + each)
+      left -= count - there
+      window.updateSlot(slot, withCount(cursor, count))
+    }
+    window.selectedItem = withCount(cursor, left)
+  }
+
+  // The mod's clicks on the bot's inventory, or on the window it has open when it has one (the slots
+  // are then the window's own, the inventory's after them, as the mod numbers them), one after the other as a client's window takes them,
+  // each id told back once done (lastClick). mineflayer clicks modes 0 to 4; a drag (5) and a double
+  // click (6) are sent as the client sends them (see rawClick), what they leave worked out here.
   let clicks = Promise.resolve()
   let drag = null
   async function click (slot, button, mode) {
-    if (bot.currentWindow) throw new Error(`${name}: a click on its inventory while ${bot.currentWindow.type} is open`)
+    const window = bot.currentWindow || bot.inventory
     if (mode === 5) {
       const stage = button & 3
       if (stage === 0) {
-        drag = { limit: button >> 2, slots: [] }
-      } else if (stage === 1) {
-        if (!drag) throw new Error(`${name}: a drag slot outside a drag`)
-        drag.slots.push(slot)
-      } else if (stage === 2) {
-        if (!drag) throw new Error(`${name}: a drag end outside a drag`)
-        const ended = drag
-        drag = null
-        await dragOver(ended)
+        if (drag) throw new Error(`${name}: a drag started inside a drag`)
+        drag = { window, limit: button >> 2, slots: [], sent: [rawClick(window, slot, button, mode)] }
+        return
       }
+      if (!drag) throw new Error(`${name}: a drag click outside a drag`)
+      // Its slots and end go to the window it started on, as the server's drag is that window's.
+      drag.sent.push(rawClick(drag.window, slot, button, mode))
+      if (stage === 1) {
+        if (dragTakes(drag, slot)) drag.slots.push(slot)
+        return
+      }
+      const ended = drag
+      drag = null
+      await Promise.all(ended.sent)
+      dragOver(ended)
+      return
+    }
+    if (mode === 6) {
+      const done = pickupAll(window, slot, button)
+      await rawClick(window, slot, button, mode)
+      done()
       return
     }
     await bot.clickWindow(slot, button, mode)
   }
 
-  // A drag as the clicks that leave the same: the cursor split evenly over the slots (limit 0) or
-  // one in each (limit 1), each slot as full as it takes, the rest left on the cursor. Only slots
-  // empty or holding the same item take any, checked as each one comes.
-  async function dragOver ({ limit, slots }) {
-    const cursor = bot.inventory.selectedItem
-    if (!cursor) return
-    if (limit === 2) {
-      log('a creative drag is not supported')
-      return
-    }
-    const same = it => it.type === cursor.type && it.metadata === cursor.metadata && JSON.stringify(it.nbt) === JSON.stringify(cursor.nbt)
-    const fits = slot => {
-      const it = bot.inventory.slots[slot]
-      return !it || (same(it) && it.count < it.stackSize)
-    }
-    const targets = slots.filter(fits)
-    if (targets.length === 0) return
-    const each = limit === 0 ? Math.floor(cursor.count / targets.length) : 1
-    for (const slot of targets) {
-      const held = bot.inventory.selectedItem
-      if (!held || !fits(slot)) continue
-      const there = bot.inventory.slots[slot]?.count ?? 0
-      const n = Math.min(each, held.stackSize - there, held.count)
-      // All the cursor holds: one left click puts it down (merged up to a full stack).
-      if (n === held.count) {
-        await bot.clickWindow(slot, 0, 0)
-        continue
+  // The bot's open window for the mod: sent whole once anything in it changed, once per turn.
+  let windowQueued = false
+  // The properties the server set on the window of that id (a furnace's burn and cook times), by index.
+  let properties = { id: null, values: [] }
+  // The trades the server listed for the villager window of that id: for the mod (list), and as the
+  // items' own class to work out the result slot with (recipes).
+  let trades = { id: null, list: [], recipes: [] }
+  // A trade list read by hand: the channel's parser (mineflayer's) is built for the client's default
+  // version, not the server's, and has no slot type for 1.12. Its fields as the server writes them.
+  function readTrades (data) {
+    let at = 0
+    const i8 = () => { const v = data.readInt8(at); at += 1; return v }
+    const i16 = () => { const v = data.readInt16BE(at); at += 2; return v }
+    const i32 = () => { const v = data.readInt32BE(at); at += 4; return v }
+    function slot () {
+      const id = i16()
+      if (id === -1) return null
+      const count = i8()
+      const metadata = i16()
+      let tag = null
+      if (data[at] === 0) at += 1
+      else {
+        const parsed = nbt.protos.big.parsePacketBuffer('nbt', data.subarray(at))
+        tag = parsed.data
+        at += parsed.metadata.size
       }
-      for (let i = 0; i < n; i++) await bot.clickWindow(slot, 1, 0)
+      if (!bot.registry.items[id]) throw new Error(`${name}: a villager trades item ${id}, not in ${bot.version}`)
+      return new (Item())(id, count, metadata, tag)
     }
+    const windowId = i32()
+    const list = []
+    const recipes = []
+    for (let n = i8() & 0xff; n > 0; n--) {
+      const first = slot()
+      const result = slot()
+      const second = data[at++] ? slot() : null
+      const disabled = data[at++] !== 0
+      i32() // uses
+      i32() // max uses
+      recipes.push({ first, second, result, disabled })
+      list.push({ first: itemOut(first), second: itemOut(second), result: itemOut(result), disabled })
+    }
+    if (at !== data.length) throw new Error(`${name}: a trade list of ${data.length} bytes, read ${at}`)
+    return { id: windowId, list, recipes }
   }
 
+  // The villager's result slot. The 1.12 server never sends it: each client works it out from the inputs
+  // and the trade picked, and takes the price off the inputs itself as the result is taken (the server
+  // does the same without a word), as the game's InventoryMerchant and SlotMerchantResult do. Done here
+  // on the window, so the bot sees the result and its click on it is the server's.
+  let tradeIndex = 0
+  // While the result is set here: any other change of it is the bot's click taking it.
+  let settingResult = false
+  // The trade the result shown is of, whose price a take pays.
+  let shownRecipe = null
+  // The game's NBTUtil.areNBTEquals: every tag of the wanted one in the other, lists alike whole.
+  const tagsIn = (want, have) => {
+    if (want === null || typeof want !== 'object' || Array.isArray(want)) return JSON.stringify(want) === JSON.stringify(have)
+    return have !== null && typeof have === 'object' && !Array.isArray(have) && Object.keys(want).every(k => k in have && tagsIn(want[k], have[k]))
+  }
+  // The game's areItemStacksExactlyEqual: the same item and damage, and the wanted one's tags on it.
+  const sameAs = (stack, want) => stack.type === want.type && stack.metadata === want.metadata &&
+    (!want.nbt || (Boolean(stack.nbt) && tagsIn(nbt.simplify(want.nbt), nbt.simplify(stack.nbt))))
+  const pays = (stack, want) => Boolean(stack) && sameAs(stack, want) && stack.count >= want.count
+  // The game's canRecipeBeUsed: the trade picked if the inputs pay it (any other only when the first is picked), else none.
+  function usable (a, b) {
+    const matches = r => pays(a, r.first) && (r.second ? pays(b, r.second) : !b)
+    const recipes = trades.recipes
+    if (tradeIndex > 0 && tradeIndex < recipes.length) return matches(recipes[tradeIndex]) ? recipes[tradeIndex] : null
+    return recipes.find(matches) ?? null
+  }
+  // The trade picked, by the arrows or select_trade: the server told, the result worked out again.
+  function pickTrade (window, trade) {
+    bot._client.writeChannel('MC|TrSel', trade)
+    tradeIndex = trade
+    merchantResult(window)
+  }
+  function merchantResult (window) {
+    if (trades.id !== window.id) return
+    let a = window.slots[0]
+    let b = window.slots[1]
+    if (!a) {
+      a = b
+      b = null
+    }
+    let recipe = a ? usable(a, b) : null
+    if ((!recipe || recipe.disabled) && b) recipe = usable(b, a)
+    if (recipe?.disabled) recipe = null
+    shownRecipe = recipe
+    const result = recipe && new (Item())(recipe.result.type, recipe.result.count, recipe.result.metadata, recipe.result.nbt)
+    const there = window.slots[2]
+    if (!result && !there) return
+    if (result && there && Item().equal(result, there) && result.count === there.count) return
+    settingResult = true
+    window.updateSlot(2, result)
+    settingResult = false
+  }
+  // The game's doTrade: the price off the inputs that pay it, false when they do not.
+  function payWith (window, recipe, first, second) {
+    const a = window.slots[first]
+    const b = window.slots[second]
+    if (!pays(a, recipe.first)) return false
+    if (recipe.second ? !pays(b, recipe.second) : b) return false
+    const shrink = (slot, stack, n) => window.updateSlot(slot, stack.count === n ? null : Object.assign(Object.create(Object.getPrototypeOf(stack)), stack, { count: stack.count - n }))
+    shrink(first, a, recipe.first.count)
+    if (recipe.second) shrink(second, b, recipe.second.count)
+    return true
+  }
+  function merchant (window) {
+    tradeIndex = 0
+    shownRecipe = null
+    window.on('updateSlot', (slot, oldItem, newItem) => {
+      if (slot === 2 && !settingResult && oldItem && (!newItem || newItem.count < oldItem.count)) {
+        // Taken: its trade paid off the inputs, each of which works out the result again.
+        const recipe = shownRecipe
+        if (!recipe) throw new Error(`${name}: the villager's result taken with no trade shown`)
+        if (!payWith(window, recipe, 0, 1) && !payWith(window, recipe, 1, 0)) {
+          throw new Error(`${name}: the villager's result taken, its inputs ${JSON.stringify([window.slots[0], window.slots[1]].map(itemOut))} do not pay its trade`)
+        }
+        return
+      }
+      if (slot === 0 || slot === 1) merchantResult(window)
+    })
+    merchantResult(window)
+  }
+  function sendWindow () {
+    windowQueued = false
+    const window = bot.currentWindow
+    const values = window && properties.id === window.id ? properties.values : []
+    out(protocol.windowState(name, window && {
+      type: act.windowType(window),
+      containerSlots: window.inventoryStart,
+      cursor: itemOut(window.selectedItem),
+      slots: window.slots.map(itemOut),
+      properties: Array.from(values, value => value ?? 0),
+      trades: trades.id === window.id ? trades.list : []
+    }))
+  }
+  function queueWindow () {
+    if (windowQueued) return
+    windowQueued = true
+    setImmediate(sendWindow)
+  }
+  bot.on('windowOpen', window => {
+    // mineflayer leaves the inventory as it was while a window is open (the server's word on it comes
+    // through the window's slots), copied back only as the bot closes it, not when the server does:
+    // mirrored as each slot changes, so its hand (heldItem) and the inventory are the server's.
+    const offset = window.inventoryStart - bot.inventory.inventoryStart
+    const mirror = slot => {
+      if (slot < window.inventoryStart || slot >= window.inventoryEnd) return
+      const item = window.slots[slot]
+      bot._setSlot(slot - offset, item && Object.assign(Object.create(Object.getPrototypeOf(item)), item))
+    }
+    for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) mirror(slot)
+    window.on('updateSlot', mirror)
+    window.on('updateSlot', queueWindow)
+    if (act.windowType(window) === 'minecraft:villager') merchant(window)
+    queueWindow()
+  })
+  bot.on('windowClose', queueWindow)
+  // A window's properties may come before mineflayer has it open: kept by its id.
+  // The villager's trades: the channel mineflayer's villager plugin registered (by spawn), its parser
+  // replaced by the raw bytes (see readTrades).
+  bot.once('spawn', () => {
+    bot._client.registerChannel('MC|TrList', 'restBuffer')
+  })
+  bot._client.on('MC|TrList', data => {
+    trades = readTrades(data)
+    if (bot.currentWindow?.id === trades.id) merchantResult(bot.currentWindow)
+    queueWindow()
+  })
+  bot._client.on('craft_progress_bar', ({ windowId, property, value }) => {
+    if (properties.id !== windowId) properties = { id: windowId, values: [] }
+    properties.values[property] = value
+    queueWindow()
+  })
+
   bot.on('end', reason => {
+    act.cancel()
     // mineflayer's dig timer outlives the connection: it would set the block to air in a world, and
     // shared columns, this bot no longer holds.
     // The digging plugin is only there once the bot got to be injected; one that ended before has no timer.
@@ -356,17 +597,30 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // A click on its inventory window from the mod (see click above), after the ones before it; the
     // inventory goes back to the mod once it is done, whatever the server made of it.
     click (slot, button, mode, id) {
+      // A click the server rejects is fatal, as everything: the rejection says the mod and the bot disagreed.
       clicks = clicks.then(() => click(slot, button, mode)).then(() => {
         lastClick = id
         queueInventory()
+        queueWindow()
       })
     },
 
-    // Walks to the spot: its own search, from where it stands.
+    // The villager trade its open window shows, picked by the mod's arrows, after the clicks before it.
+    selectTrade (trade) {
+      clicks = clicks.then(() => {
+        if (!bot.currentWindow) throw new Error(`${name}: trade ${trade} picked with no window open`)
+        pickTrade(bot.currentWindow, trade)
+      })
+    },
+
+    // A primitive from the mod (see actions.js).
+    action (a) {
+      act.run(a)
+    },
+
+    // Walks to the spot (the formation's order): the goto primitive.
     goto (spot) {
-      setSearching(true)
-      log(`goto ${spot.x},${spot.y},${spot.z} from ${at()}`)
-      bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
+      act.run({ action: 'goto', spot })
     }
   }
 }

@@ -92,6 +92,8 @@ public class MapMcBotClient implements ClientModInitializer {
 			// Mid-pick the key backs out of the pick instead of reopening the editor.
 			if (AreaPick.isActive()) {
 				AreaPick.cancel(client);
+			} else if (TargetPick.isActive()) {
+				TargetPick.cancel(client);
 			} else {
 				client.setScreen(new AreaScreen());
 			}
@@ -172,6 +174,10 @@ public class MapMcBotClient implements ClientModInitializer {
 			// For a relay started after the game: knock on the ones listed that are not connected.
 			bots();
 			relays.connectMissing();
+			return true;
+		}
+
+		if (BotCommands.handle(MinecraftClient.getInstance(), line)) {
 			return true;
 		}
 
@@ -351,6 +357,7 @@ public class MapMcBotClient implements ClientModInitializer {
 		}
 
 		AreaPick.reset();
+		TargetPick.reset();
 	}
 
 	/** The areas of the world being played, reloaded when the world changes; null outside a world. */

@@ -43,6 +43,12 @@ public final class BotRegistry implements BotListener {
 	/** The path each walking bot is on, from its PATH frames. */
 	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
+	/** What each bot is doing, from its STATE frames. */
+	private final Map<String, BotStatus> statuses = new ConcurrentHashMap<String, BotStatus>();
+
+	/** The window each bot has open, from its WINDOW frames. */
+	private final Map<String, BotWindow> windows = new ConcurrentHashMap<String, BotWindow>();
+
 	/** Each bot's inventory window, from its INVENTORY frames. */
 	private final Map<String, BotInventory> inventories = new ConcurrentHashMap<String, BotInventory>();
 
@@ -77,13 +83,42 @@ public final class BotRegistry implements BotListener {
 		return Collections.unmodifiableSet(spawned);
 	}
 
-	/** connecting, idle or walking. */
+	/** connecting, or what the bot is doing (see BotStatus). */
 	public String getStatus(String bot) {
 		if (!spawned.contains(bot)) {
 			return "connecting";
 		}
 
-		return paths.containsKey(bot) ? "walking" : "idle";
+		return statuses.getOrDefault(bot, BotStatus.IDLE).toString();
+	}
+
+	/** What the bot is doing; idle before its first report. */
+	public BotStatus getState(String bot) {
+		return statuses.getOrDefault(bot, BotStatus.IDLE);
+	}
+
+	/** The window the bot has open, null for none. */
+	public BotWindow getWindow(String bot) {
+		return windows.get(bot);
+	}
+
+	/** A primitive for the bot as JSON, on the fleet running it (see FleetProtocol#ACTION). */
+	public void action(String bot, String json) {
+		final Integer rid = fleetOf.get(bot);
+
+		if (rid == null) {
+			throw new IllegalStateException("no bot named " + bot + " to order " + json);
+		}
+
+		if (!spawned.contains(bot)) {
+			throw new IllegalStateException(bot + " is not in the world yet to order " + json);
+		}
+
+		if (rid == 0) {
+			channel.action(bot, json);
+		} else {
+			relays.action(rid, bot, json);
+		}
 	}
 
 	/** The bot's inventory window as last reported, null before its first. */
@@ -128,6 +163,21 @@ public final class BotRegistry implements BotListener {
 			channel.windowClick(bot, slot, button, mode, id);
 		} else {
 			relays.windowClick(rid, bot, slot, button, mode, id);
+		}
+	}
+
+	/** The villager trade the bot's open window shows, on the fleet running it (see FleetProtocol#TRADE_SELECT). */
+	public void tradeSelect(String bot, int trade) {
+		final Integer rid = fleetOf.get(bot);
+
+		if (rid == null) {
+			throw new IllegalStateException("no bot named " + bot + " to pick trade " + trade + " for");
+		}
+
+		if (rid == 0) {
+			channel.tradeSelect(bot, trade);
+		} else {
+			relays.tradeSelect(rid, bot, trade);
 		}
 	}
 
@@ -260,6 +310,20 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
+	public void onState(String bot, BotStatus status) {
+		statuses.put(bot, status);
+	}
+
+	@Override
+	public void onWindow(String bot, BotWindow window) {
+		if (window == null) {
+			windows.remove(bot);
+		} else {
+			windows.put(bot, window);
+		}
+	}
+
+	@Override
 	public void onPathCleared(String bot) {
 		paths.remove(bot);
 	}
@@ -277,6 +341,8 @@ public final class BotRegistry implements BotListener {
 		paths.remove(bot);
 		inventories.remove(bot);
 		clicksSent.remove(bot);
+		statuses.remove(bot);
+		windows.remove(bot);
 	}
 
 	/** The mod's own fleet is gone: its bots with it. */
@@ -312,6 +378,8 @@ public final class BotRegistry implements BotListener {
 			paths.remove(bot);
 			inventories.remove(bot);
 			clicksSent.remove(bot);
+			statuses.remove(bot);
+			windows.remove(bot);
 
 			if (bots.remove(bot)) {
 				names.give(bot);
@@ -328,5 +396,7 @@ public final class BotRegistry implements BotListener {
 		paths.clear();
 		inventories.clear();
 		clicksSent.clear();
+		statuses.clear();
+		windows.clear();
 	}
 }

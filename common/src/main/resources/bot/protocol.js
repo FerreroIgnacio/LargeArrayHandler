@@ -20,6 +20,8 @@ const TYPES = {
   UPDATING: 14,
   UPDATE_FAILED: 15,
   INVENTORY: 24,
+  STATE: 26,
+  WINDOW: 27,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
@@ -28,7 +30,9 @@ const TYPES = {
   PROFILE_REQUEST: 21,
   HELLO: 22,
   GOTO: 23,
-  WINDOW_CLICK: 25
+  WINDOW_CLICK: 25,
+  ACTION: 28,
+  TRADE_SELECT: 29
 }
 
 class Writer {
@@ -107,6 +111,14 @@ class Reader {
   i32 () {
     const value = this.buffer.readInt32BE(this.offset)
     this.offset += 4
+    return value
+  }
+
+  bytes () {
+    const length = this.i32()
+    if (length < 0 || this.offset + length > this.buffer.length) throw new Error('truncated bytes')
+    const value = this.buffer.subarray(this.offset, this.offset + length)
+    this.offset += length
     return value
   }
 
@@ -253,6 +265,43 @@ function item (w, it) {
   w.bytes(it.nbt)
 }
 
+// What the bot is doing: kind 0 idle, 1 doing `primitive`, 2 error in `primitive` with `message`
+// (what was expected and what was found). The bot stays in an error until its next primitive.
+function state (bot, kind, primitive, message) {
+  const w = new Writer(TYPES.STATE)
+  w.str(bot)
+  w.u8(kind)
+  w.str(primitive)
+  w.bytes(Buffer.from(message, 'utf8'))
+  return w.frame()
+}
+
+// The window the bot has open, null when none: its type ("minecraft:furnace"), how many of its
+// slots are the window's own (the bot's inventory follows them), every slot's item, the item on its cursor,
+// its properties (a furnace's burn and cook times) by index and a villager's trades.
+function windowState (bot, window) {
+  const w = new Writer(TYPES.WINDOW)
+  w.str(bot)
+  w.u8(window ? 1 : 0)
+  if (window) {
+    w.str(window.type)
+    w.i32(window.containerSlots)
+    w.i32(window.slots.length)
+    for (const slot of window.slots) item(w, slot)
+    item(w, window.cursor)
+    w.i32(window.properties.length)
+    for (const value of window.properties) w.i32(value)
+    w.i32(window.trades.length)
+    for (const trade of window.trades) {
+      item(w, trade.first)
+      item(w, trade.second)
+      item(w, trade.result)
+      w.u8(trade.disabled ? 1 : 0)
+    }
+  }
+  return w.frame()
+}
+
 // The fleet crashed: its error, for the mod to keep. Only a relay sends it (the mod has its own fleet's output). No bot: an empty name.
 function crash (text) {
   const w = new Writer(TYPES.CRASH)
@@ -345,6 +394,14 @@ function decode (frame) {
     case TYPES.GOTO:
       message = { type, bot: r.str(), spot: { x: r.i32(), y: r.i32(), z: r.i32() } }
       break
+    case TYPES.TRADE_SELECT:
+      // The villager trade the bot's open window shows, as the game's arrows pick it.
+      message = { type, bot: r.str(), trade: r.i32() }
+      break
+    case TYPES.ACTION:
+      // A primitive for the bot as JSON (see actions.js for each one's fields).
+      message = { type, bot: r.str(), action: JSON.parse(r.bytes().toString('utf8')) }
+      break
     case TYPES.HELLO:
       // version: the commit the mod was built at.
       message = { type, bot: r.str(), version: r.str() }
@@ -371,4 +428,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, windowState, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

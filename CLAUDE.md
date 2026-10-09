@@ -3,6 +3,7 @@
 ## Todo event driven
 - Prohibido usar timeouts, timers, reintentos por tiempo (tryouts), polling, busy waits, autosaves periódicos o cualquier lógica basada en "esperar X ms / cada N ticks".
 - Todo se dispara por eventos: el cambio que ocurre es el que provoca la acción.
+- Excepciones autorizadas: las de `timingExceptions.txt` (el deadline de las primitivas con condición esperada, el profile cada 1 s). Cualquier otro uso del tiempo sigue prohibido; una excepción nueva se anota ahí.
 - Si no queda otra que usar algo basado en tiempo, consultar antes. Nunca implementarlo sin preguntar.
 
 ## Fallar fuerte

@@ -1,0 +1,5 @@
+Excepciones a la regla "todo event driven" (CLAUDE.md), autorizadas una por una.
+
+1. Deadline de las primitivas con condición esperada (interact, break, place, wait_slot): solo sirve para fallar; el evento que confirma el efecto lo resuelve antes. (actions.js, deadline)
+
+2. Profile una vez por segundo: ProfileRegistry pide un profile cada 1 s (PROFILE_EVERY) al fleet local y a cada relay, salvo que el anterior no haya llegado. Antes se pedía cada 5000 frames del fleet local, y con los bots quietos no se pedía nunca (el CPU de los relays quedaba en "--"). (ProfileRegistry, hilo mapmcbot-profile-timer)

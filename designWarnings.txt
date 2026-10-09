@@ -1,0 +1,7 @@
+Puntos débiles de diseño conocidos, aceptados por ahora.
+
+1. Clicks crudos sin confirmación: el drag (mode 5) y el doble click (mode 6) se mandan a mano y esperan la confirmación del server sin timeout. Si nunca llega (la window se cerró en el medio y el server ignora el click), la cola de clicks de ese bot queda trabada para siempre. (bot.js, rawClick)
+
+2. Click rechazado = bot caído: si el server rechaza un click crudo, se rechaza la promesa y el bot se cae, igual que con los clicks de mineflayer. Un rechazo del inicio o de un slot del drag llega antes de que el fin lo espere y sale como unhandled rejection. (bot.js, rawClick / click)
+
+3. Window sin lastClick: el estado de la window que manda el bot no dice qué clicks ya hizo, así que BotScreen lo aplica apenas llega, aunque haya clicks pendientes. Un reporte viejo puede pisar un rato la predicción local hasta que llega el del último click. El inventario sí lo filtra (coversClicks). (BotScreen.refreshWindow)

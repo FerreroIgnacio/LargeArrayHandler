@@ -44,8 +44,14 @@ public interface FleetChannel {
 	/** The bot walks to stand at x, y, z. */
 	void gotoSpot(String bot, int x, int y, int z);
 
+	/** A primitive for the bot, as JSON (see FleetProtocol#ACTION). */
+	void action(String bot, String json);
+
 	/** A click on the bot's inventory window (see FleetProtocol#WINDOW_CLICK). */
 	void windowClick(String bot, int slot, int button, int mode, int id);
+
+	/** The villager trade the bot's open window shows (see FleetProtocol#TRADE_SELECT). */
+	void tradeSelect(String bot, int trade);
 
 	/** The columns file the fleet loads every chunk into, one slot each (see FleetProtocol). */
 	File columns();

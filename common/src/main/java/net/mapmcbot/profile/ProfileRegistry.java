@@ -20,7 +20,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import net.mapmcbot.bot.RelayHub;
@@ -31,9 +30,9 @@ import net.mapmcbot.fleet.FleetChannel;
  * {@link ProfileReport} each time one is taken, kept for the profiler screen and always appended to
  * the log file, whether the screen is open or not.
  *
- * Nothing is sampled on a timer. A profile is taken when someone asks for one (the screen opening,
- * its refresh, the player leaving the world), every FRAMES_PER_PROFILE frames through the channel,
- * and when the fleet takes one on an event of its own (a bot in a world or gone):
+ * A profile is taken once a second (the one use of time here, see timingExceptions.txt), when someone
+ * asks for one (the screen opening, its refresh, the player leaving the world), and when the fleet
+ * takes one on an event of its own (a bot in a world or gone):
  * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
  * the mod's part alone. Each relay answers every request with its own, logged with its rows scoped
  * "relay<rid>." before the fleet's own scopes.
@@ -54,11 +53,8 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 	 */
 	private static final long MIN_INTERVAL = 1000;
 
-	/** A profile is taken every this many frames through the channel, either way: as often as the fleet is busy, never while it is idle. */
-	private static final long FRAMES_PER_PROFILE = 5000;
-
-	/** Frames since the last profile taken for them. */
-	private final AtomicLong frames = new AtomicLong();
+	/** A profile is taken every this many ms (see timingExceptions.txt), unless the one before is still on its way. */
+	private static final long PROFILE_EVERY = 1000;
 
 	private final FleetChannel channel;
 	private final RelayHub relays;
@@ -118,6 +114,24 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 
 		channel.setProfileListener(this);
 		relays.setProfileSink(this);
+
+		// Not an executor's: one would keep what the request throws to itself. Thrown here, it ends the
+		// thread with its trace, and the profiles with it.
+		final Thread every = new Thread(() -> {
+			while (true) {
+				try {
+					Thread.sleep(PROFILE_EVERY);
+				} catch (InterruptedException e) {
+					throw new IllegalStateException("the profile timer was interrupted", e);
+				}
+
+				if (!isWaiting()) {
+					request("1 s");
+				}
+			}
+		}, "mapmcbot-profile-timer");
+		every.setDaemon(true);
+		every.start();
 	}
 
 	public File getLogFile() {
@@ -185,7 +199,7 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		ProfileReport base = relayBase.get(rid);
 
 		// As for the mod's: rates against the newest report at least MIN_INTERVAL older.
-		if (latest != null && (base == null || now - latest.getTime() >= MIN_INTERVAL)) {
+		if (latest != null && now - latest.getTime() >= MIN_INTERVAL) {
 			base = latest;
 			relayBase.put(rid, base);
 		}
@@ -201,16 +215,9 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		relayBase.remove(rid);
 	}
 
+	/** The profiles come once a second (see PROFILE_EVERY), not by frames. */
 	@Override
 	public void onFrame() {
-		if (frames.incrementAndGet() % FRAMES_PER_PROFILE != 0) {
-			return;
-		}
-
-		// One still on its way covers these frames too; the next one is FRAMES_PER_PROFILE frames on.
-		if (!isWaiting()) {
-			request(FRAMES_PER_PROFILE + " frames");
-		}
 	}
 
 	private synchronized void record(String reason, List<ProfileReport.Row> rows) {
