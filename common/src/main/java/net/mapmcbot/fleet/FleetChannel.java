@@ -41,6 +41,9 @@ public interface FleetChannel {
 
 	void quit(String bot);
 
+	/** The bot walks to stand at x, y, z. */
+	void gotoSpot(String bot, int x, int y, int z);
+
 	/** The columns file the fleet loads every chunk into, one slot each (see FleetProtocol). */
 	File columns();
 

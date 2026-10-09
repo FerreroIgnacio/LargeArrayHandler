@@ -18,7 +18,8 @@ const LOG_SEARCH_NODES = 1000
 // its last frame sent; chunks holds the columns of its thread (see sharedChunks.js).
 module.exports = function startBot ({ name, host, port, chunks, send, report, onEnd }) {
   const server = `${host}:${port}`
-  const bot = mineflayer.createBot({ username: name, host, port, auth: 'offline' })
+  // Always the fewest chunks it can ask for; a 1.12.2 server (a LAN world) sends its own view distance whatever it asks.
+  const bot = mineflayer.createBot({ username: name, host, port, viewDistance: 2, auth: 'offline' })
   const log = line => console.log(`[${name}] ${line}`)
   // The time its handlers take on the thread: mineflayer's events and the client's packets.
   const meter = botMeter()

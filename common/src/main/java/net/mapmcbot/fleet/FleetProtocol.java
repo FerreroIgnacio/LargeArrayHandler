@@ -98,6 +98,8 @@ public final class FleetProtocol {
 	 * WELCOME once it is at that commit (updating itself first when not) or UPDATE_FAILED.
 	 */
 	public static final int HELLO = 22;
+	/** bot name, i32 x, y, z: the bot walks to stand on that block. */
+	public static final int GOTO = 23;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -397,6 +399,21 @@ public final class FleetProtocol {
 			writeString(frame.out, bot);
 			writeString(frame.out, host);
 			frame.out.writeInt(port);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] gotoSpot(String bot, int x, int y, int z) {
+		final Frame frame = new Frame(GOTO);
+
+		try {
+			writeString(frame.out, bot);
+			frame.out.writeInt(x);
+			frame.out.writeInt(y);
+			frame.out.writeInt(z);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

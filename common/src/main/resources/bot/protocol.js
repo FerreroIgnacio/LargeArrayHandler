@@ -25,7 +25,8 @@ const TYPES = {
   SPAWN: 17,
   QUIT: 18,
   PROFILE_REQUEST: 21,
-  HELLO: 22
+  HELLO: 22,
+  GOTO: 23
 }
 
 class Writer {
@@ -306,6 +307,9 @@ function decode (frame) {
       break
     case TYPES.PROFILE_REQUEST:
       message = { type, bot: r.str(), id: r.i32(), reason: r.str() }
+      break
+    case TYPES.GOTO:
+      message = { type, bot: r.str(), spot: { x: r.i32(), y: r.i32(), z: r.i32() } }
       break
     case TYPES.HELLO:
       // version: the commit the mod was built at.

@@ -445,6 +445,10 @@ function onFrame (frame) {
       // Already gone: its BOT_GONE is on the way to the mod.
       bots.get(message.bot)?.worker.postMessage({ type: 'quit', bot: message.bot })
       break
+    case protocol.TYPES.GOTO:
+      // Already gone: its BOT_GONE is on the way to the mod.
+      bots.get(message.bot)?.worker.postMessage({ type: 'goto', bot: message.bot, spot: message.spot })
+      break
     case protocol.TYPES.RELEASE:
       // The mod has the snapshot of an unloaded column: done with its slot.
       onRelease(message.slot)

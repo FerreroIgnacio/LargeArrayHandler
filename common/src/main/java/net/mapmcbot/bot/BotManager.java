@@ -199,6 +199,11 @@ public final class BotManager implements FleetChannel {
 	}
 
 	@Override
+	public void gotoSpot(String bot, int x, int y, int z) {
+		send(FleetProtocol.gotoSpot(bot, x, y, z));
+	}
+
+	@Override
 	public File columns() {
 		return columns;
 	}

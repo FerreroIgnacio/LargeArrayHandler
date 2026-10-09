@@ -59,6 +59,11 @@ public final class BotRegistry implements BotListener {
 		return Collections.unmodifiableSet(bots);
 	}
 
+	/** The bots in the world, ready for orders. */
+	public Set<String> getSpawned() {
+		return Collections.unmodifiableSet(spawned);
+	}
+
 	/** connecting, idle or walking. */
 	public String getStatus(String bot) {
 		if (!spawned.contains(bot)) {
@@ -136,6 +141,21 @@ public final class BotRegistry implements BotListener {
 		}
 
 		return best;
+	}
+
+	/** The bot walks to stand at x, y, z, on the fleet running it. */
+	public void gotoSpot(String bot, int x, int y, int z) {
+		final Integer rid = fleetOf.get(bot);
+
+		if (rid == null) {
+			throw new IllegalStateException("no bot named " + bot + " to send to " + x + "," + y + "," + z);
+		}
+
+		if (rid == 0) {
+			channel.gotoSpot(bot, x, y, z);
+		} else {
+			relays.gotoSpot(rid, bot, x, y, z);
+		}
 	}
 
 	/** Each bot leaves; the fleet unloads each chunk once no bot holds it. The fleets stay up. */

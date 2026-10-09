@@ -1,7 +1,13 @@
 package net.mapmcbot.client;
 
 import java.io.File;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -25,6 +31,9 @@ import net.minecraft.scoreboard.Scoreboard;
 import net.minecraft.scoreboard.Team;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.LiteralText;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
 import org.lwjgl.input.Keyboard;
 
 /**
@@ -137,16 +146,107 @@ public class MapMcBotClient implements ClientModInitializer {
 		return BOT_COLORS.computeIfAbsent(bot, name -> Color.values()[BOT_COLORS.size() % Color.values().length]);
 	}
 
-	/** A chat line for the mod: #relays connects to the relays listed that are not connected yet. False when it is not one. */
+	/**
+	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
+	 * #formation sends every bot in the world to a spot around the player. False when it is not one.
+	 */
 	public static boolean command(String line) {
-		if (!line.equals("#relays")) {
-			return false;
+		if (line.equals("#relays")) {
+			// For a relay started after the game: knock on the ones listed that are not connected.
+			bots();
+			relays.connectMissing();
+			return true;
 		}
 
-		// For a relay started after the game: knock on the ones listed that are not connected.
-		bots();
-		relays.connectMissing();
-		return true;
+		if (line.equals("#formation")) {
+			formation(MinecraftClient.getInstance());
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * The spots around the player, one per bot: the centre stands on the first solid block at or
+	 * below the player (mid-air too), then the nearest blocks to stand on, 8-connected and up to one
+	 * up or down from the spot they are reached from, so they fill a square around it.
+	 */
+	private static void formation(MinecraftClient client) {
+		final List<String> fleet = new ArrayList<String>(bots().getSpawned());
+		Collections.sort(fleet);
+
+		BlockPos ground = new BlockPos(client.player);
+
+		while (ground.getY() >= 0 && !solid(client.world, ground)) {
+			ground = ground.down();
+		}
+
+		if (ground.getY() < 0) {
+			chat(client, "formation_err: no solid ground found");
+			return;
+		}
+
+		final BlockPos centre = ground.up();
+		final List<BlockPos> spots = new ArrayList<BlockPos>();
+		// One bot per column: never one standing on another.
+		final Set<Long> columns = new HashSet<Long>();
+		final Set<BlockPos> seen = new HashSet<BlockPos>();
+		final ArrayDeque<BlockPos> queue = new ArrayDeque<BlockPos>();
+		seen.add(centre);
+		queue.add(centre);
+
+		while (!queue.isEmpty() && spots.size() < fleet.size()) {
+			final BlockPos spot = queue.poll();
+
+			// The centre always counts, its head room aside: the player is there.
+			if (spot != centre && !standable(client.world, spot)) {
+				continue;
+			}
+
+			if (!columns.add((long) spot.getX() << 32 | spot.getZ() & 0xFFFFFFFFL)) {
+				continue;
+			}
+
+			spots.add(spot);
+
+			for (int dx = -1; dx <= 1; dx++) {
+				for (int dz = -1; dz <= 1; dz++) {
+					if (dx == 0 && dz == 0) {
+						continue;
+					}
+
+					for (int dy : new int[] {0, 1, -1}) {
+						final BlockPos next = spot.add(dx, dy, dz);
+
+						if (seen.add(next)) {
+							queue.add(next);
+						}
+					}
+				}
+			}
+		}
+
+		if (spots.size() < fleet.size()) {
+			chat(client, "formation_err: " + spots.size() + " spots around " + centre.getX() + "," + centre.getY() + "," + centre.getZ() + " for " + fleet.size() + " bots");
+		}
+
+		for (int i = 0; i < spots.size(); i++) {
+			final BlockPos spot = spots.get(i);
+			bots().gotoSpot(fleet.get(i), spot.getX(), spot.getY(), spot.getZ());
+		}
+	}
+
+	private static boolean solid(World world, BlockPos pos) {
+		return world.getBlockState(pos).getMaterial().blocksMovement();
+	}
+
+	/** Solid ground under it, room for the feet and the head. */
+	private static boolean standable(World world, BlockPos pos) {
+		return solid(world, pos.down()) && !solid(world, pos) && !solid(world, pos.up());
+	}
+
+	private static void chat(MinecraftClient client, String message) {
+		client.inGameHud.getChatHud().addMessage(new LiteralText(message));
 	}
 
 	private static void leaveWorld() {

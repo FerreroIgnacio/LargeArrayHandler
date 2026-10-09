@@ -249,6 +249,10 @@ public final class RelayHub {
 		relay(rid).send(FleetProtocol.quit(bot));
 	}
 
+	public void gotoSpot(int rid, String bot, int x, int y, int z) {
+		relay(rid).send(FleetProtocol.gotoSpot(bot, x, y, z));
+	}
+
 	/** Asks every relay connected for its profile; each answers with a PROFILE the sink hears. */
 	public void requestProfile(String reason) {
 		for (Relay relay : relays.values()) {
