@@ -22,6 +22,9 @@ const TYPES = {
   INVENTORY: 24,
   STATE: 26,
   WINDOW: 27,
+  CHEST_LID: 30,
+  CHEST: 31,
+  COLUMN_GONE: 32,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
@@ -276,6 +279,37 @@ function state (bot, kind, primitive, message) {
   return w.frame()
 }
 
+// How many players have the chest at x, y, z open, as the server shows its lid: sent as it changes.
+function chestLid (bot, pos, viewers) {
+  const w = new Writer(TYPES.CHEST_LID)
+  w.str(bot)
+  w.i32(pos.x)
+  w.i32(pos.y)
+  w.i32(pos.z)
+  w.u8(viewers)
+  return w.frame()
+}
+
+// A chest (type "minecraft:chest" or "minecraft:trapped_chest") is at pos (world) in the column, or
+// none is any more (type empty). Not a column frame: relays send it too, the mod keeps the chests.
+function chest (bot, key, pos, type) {
+  const w = new Writer(TYPES.CHEST)
+  w.header(bot, key)
+  w.i32(pos.x)
+  w.i32(pos.y)
+  w.i32(pos.z)
+  w.str(type)
+  return w.frame()
+}
+
+// The fleet let the column go: what the mod knows of its chests may go stale from here on. Not a
+// column frame: relays send it too.
+function columnGone (bot, key) {
+  const w = new Writer(TYPES.COLUMN_GONE)
+  w.header(bot, key)
+  return w.frame()
+}
+
 // The window the bot has open, null when none: its type ("minecraft:furnace"), how many of its
 // slots are the window's own (the bot's inventory follows them), every slot's item, the item on its cursor,
 // its properties (a furnace's burn and cook times) by index and a villager's trades.
@@ -428,4 +462,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, windowState, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

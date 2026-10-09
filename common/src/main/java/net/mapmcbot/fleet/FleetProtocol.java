@@ -104,6 +104,12 @@ public final class FleetProtocol {
 	 * anything in it changed; closed when not open.
 	 */
 	public static final int WINDOW = 27;
+	/** bot name, i32 x, y, z, u8 viewers: how many players have the chest there open, sent as its lid moves. */
+	public static final int CHEST_LID = 30;
+	/** bot name, the column's key (as CLAIM), i32 x, y, z, the chest's block ("minecraft:chest"), empty once none is there: a chest that showed up or went. */
+	public static final int CHEST = 31;
+	/** bot name, the column's key (as CLAIM): the fleet let the column go. */
+	public static final int COLUMN_GONE = 32;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -409,6 +415,34 @@ public final class FleetProtocol {
 
 					end(in, type);
 					bots.onWindow(bot, new BotWindow(windowType, own, cursor, slots, properties, trades));
+					break;
+				}
+
+				case CHEST: {
+					final ChunkKey key = readKey(in);
+					final int x = in.readInt();
+					final int y = in.readInt();
+					final int z = in.readInt();
+					final String block = readString(in);
+					end(in, type);
+					bots.onChest(bot, key, x, y, z, block);
+					break;
+				}
+
+				case COLUMN_GONE: {
+					final ChunkKey key = readKey(in);
+					end(in, type);
+					bots.onColumnGone(bot, key);
+					break;
+				}
+
+				case CHEST_LID: {
+					final int x = in.readInt();
+					final int y = in.readInt();
+					final int z = in.readInt();
+					final int viewers = in.readUnsignedByte();
+					end(in, type);
+					bots.onChestLid(bot, x, y, z, viewers);
 					break;
 				}
 

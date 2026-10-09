@@ -2,11 +2,14 @@ package net.mapmcbot.bot;
 
 import java.net.InetSocketAddress;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import net.mapmcbot.chunk.ChunkKey;
 import net.mapmcbot.fleet.FleetChannel;
 
 /**
@@ -59,6 +62,63 @@ public final class BotRegistry implements BotListener {
 
 	private volatile InventoryListener inventoryListener;
 
+	/** Hears each state as it comes; called on the channel's thread. */
+	public interface StateListener {
+		void onState(String bot, BotStatus status);
+	}
+
+	/**
+	 * Hears each primitive sent to a bot, once it is on its way; internal when the mod sent it on its own
+	 * (a step of the job, a part of a grab), not as an order from outside.
+	 */
+	public interface ActionListener {
+		void onAction(String bot, String json, boolean internal);
+	}
+
+	/** Hears each window as it comes, null once closed; called on the channel's thread. */
+	public interface WindowListener {
+		void onWindow(String bot, BotWindow window);
+	}
+
+	/** Hears each chest lid as it moves; called on the channel's thread. */
+	public interface LidListener {
+		void onChestLid(String bot, int x, int y, int z, int viewers);
+	}
+
+	/** Hears the chests the fleets see as they show up or go, and the columns they let go; called on the channel's thread. */
+	public interface ChestListener {
+		void onChest(String bot, ChunkKey key, int x, int y, int z, String block);
+
+		void onColumnGone(String bot, ChunkKey key);
+	}
+
+	private final List<ChestListener> chestListeners = new CopyOnWriteArrayList<ChestListener>();
+
+	public void addChestListener(ChestListener listener) {
+		chestListeners.add(listener);
+	}
+
+	private final List<StateListener> stateListeners = new CopyOnWriteArrayList<StateListener>();
+	private final List<ActionListener> actionListeners = new CopyOnWriteArrayList<ActionListener>();
+	private final List<WindowListener> windowListeners = new CopyOnWriteArrayList<WindowListener>();
+	private final List<LidListener> lidListeners = new CopyOnWriteArrayList<LidListener>();
+
+	public void addStateListener(StateListener listener) {
+		stateListeners.add(listener);
+	}
+
+	public void addActionListener(ActionListener listener) {
+		actionListeners.add(listener);
+	}
+
+	public void addWindowListener(WindowListener listener) {
+		windowListeners.add(listener);
+	}
+
+	public void addLidListener(LidListener listener) {
+		lidListeners.add(listener);
+	}
+
 	/** The id of the last click sent to each bot's inventory window, counting up from 1. */
 	private final Map<String, Integer> clicksSent = new ConcurrentHashMap<String, Integer>();
 
@@ -108,6 +168,15 @@ public final class BotRegistry implements BotListener {
 
 	/** A primitive for the bot as JSON, on the fleet running it (see FleetProtocol#ACTION). */
 	public void action(String bot, String json) {
+		send(bot, json, false);
+	}
+
+	/** A primitive the mod sends on its own (see ActionListener). */
+	public void actionInternal(String bot, String json) {
+		send(bot, json, true);
+	}
+
+	private void send(String bot, String json, boolean internal) {
 		final Integer rid = fleetOf.get(bot);
 
 		if (rid == null) {
@@ -123,6 +192,21 @@ public final class BotRegistry implements BotListener {
 		} else {
 			relays.action(rid, bot, json);
 		}
+
+		for (ActionListener listener : actionListeners) {
+			listener.onAction(bot, json, internal);
+		}
+	}
+
+	/** The server the bot joins, as the fleet keys its columns: host:port. */
+	public String getServer(String bot) {
+		final InetSocketAddress server = serverOf.get(bot);
+
+		if (server == null) {
+			throw new IllegalStateException("no bot named " + bot + " to tell the server of");
+		}
+
+		return server.getHostString() + ":" + server.getPort();
 	}
 
 	/** The bot's inventory window as last reported, null before its first. */
@@ -318,6 +402,9 @@ public final class BotRegistry implements BotListener {
 	@Override
 	public void onState(String bot, BotStatus status) {
 		statuses.put(bot, status);
+		for (StateListener listener : stateListeners) {
+			listener.onState(bot, status);
+		}
 	}
 
 	@Override
@@ -326,6 +413,31 @@ public final class BotRegistry implements BotListener {
 			windows.remove(bot);
 		} else {
 			windows.put(bot, window);
+		}
+
+		for (WindowListener listener : windowListeners) {
+			listener.onWindow(bot, window);
+		}
+	}
+
+	@Override
+	public void onChest(String bot, ChunkKey key, int x, int y, int z, String block) {
+		for (ChestListener listener : chestListeners) {
+			listener.onChest(bot, key, x, y, z, block);
+		}
+	}
+
+	@Override
+	public void onColumnGone(String bot, ChunkKey key) {
+		for (ChestListener listener : chestListeners) {
+			listener.onColumnGone(bot, key);
+		}
+	}
+
+	@Override
+	public void onChestLid(String bot, int x, int y, int z, int viewers) {
+		for (LidListener listener : lidListeners) {
+			listener.onChestLid(bot, x, y, z, viewers);
 		}
 	}
 

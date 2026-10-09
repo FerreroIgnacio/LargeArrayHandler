@@ -13,11 +13,14 @@ import java.util.Objects;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.GlStateManager;
+import net.mapmcbot.area.Area;
 import net.mapmcbot.bot.BotInventory;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.BotStatus;
 import net.mapmcbot.bot.BotWindow;
+import net.mapmcbot.job.JobRunner;
 import net.minecraft.client.render.DiffuseLighting;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -36,6 +39,7 @@ import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.ItemAction;
+import org.lwjgl.input.Mouse;
 
 /**
  * The bot window (B): a card for each bot on the left, the inventory of the one picked on the right,
@@ -91,6 +95,8 @@ public class BotScreen extends HandledScreen {
 			{"Hotbar", null},
 			{"Trade", "#trade %s %d"},
 			{"Stop", "#stop %s"},
+			{"Grab", null},
+			{"Index", null},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
@@ -117,6 +123,19 @@ public class BotScreen extends HandledScreen {
 	private static final int PANEL_VALUE_X = 76;
 	private static final int START_ID = 100;
 	private static final int CANCEL_ID = 101;
+	private static final int START_JOB_ID = 102;
+	private static final int STOP_JOB_ID = 103;
+	/** The row of the job's Start and Stop under the primitives' buttons. */
+	private static final int JOB_ROW = 22;
+	private static final int JOB_BUTTON_WIDTH = (3 * BUTTON_WIDTH + 2) / 2;
+
+	/** The job panel at the right edge: its width, a step card's height, the little buttons on a card, the record button's height. */
+	private static final int JOB_WIDTH = 150;
+	private static final int STEP_HEIGHT = 26;
+	private static final int STEP_BUTTON = 10;
+	private static final int RECORD_HEIGHT = 20;
+	private static final int STEP_RUNNING = 0xE0284A30;
+	private static final int RECORDING = 0xE0803030;
 
 	/**
 	 * What a click on a slot does instead of reaching the bot: move's origin then its destination, or a
@@ -124,7 +143,7 @@ public class BotScreen extends HandledScreen {
 	 * wait's item, the slot holding the item it waits for; or the hotbar slot to take into its hand.
 	 */
 	private enum Pick {
-		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS
+		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, INDEX
 	}
 
 	private Pick pick = Pick.NONE;
@@ -132,6 +151,11 @@ public class BotScreen extends HandledScreen {
 	/** The items an item fill moves and the slots it fills with them. */
 	private ItemFilter fillFilter;
 	private final List<Integer> fillTargets = new ArrayList<Integer>();
+	/** The item a grab takes, the area it takes it from (by id) and how many. */
+	private ItemFilter grabFilter;
+	private String grabArea;
+	private TextFieldWidget grabCount;
+	private ButtonWidget grabAreaButton;
 	/** While dragging over the slots: whether they are being selected (true) or deselected (false), by the first one; null with no drag. */
 	private Boolean fillDrag;
 	/** The wait whose item is being picked (WAIT_ITEM). */
@@ -141,6 +165,10 @@ public class BotScreen extends HandledScreen {
 	private ItemFilter editing;
 	private ButtonWidget startButton;
 	private ButtonWidget cancelButton;
+	private ButtonWidget startJobButton;
+	private ButtonWidget stopJobButton;
+	/** The first step card shown in the job panel. */
+	private int jobScroll;
 
 	/** Each bot's wait sent, its slots lit until it ends: kept between openings. */
 	private static final Map<String, Sent> sent = new HashMap<String, Sent>();
@@ -240,6 +268,13 @@ public class BotScreen extends HandledScreen {
 
 		startButton = new ButtonWidget(START_ID, 0, 0, BUTTON_WIDTH, 20, "Start");
 		cancelButton = new ButtonWidget(CANCEL_ID, 0, 0, BUTTON_WIDTH, 20, "Cancel");
+		final String countText = grabCount == null ? "64" : grabCount.getText();
+		grabCount = new TextFieldWidget(3, textRenderer, 0, 0, 40, 18);
+		grabCount.setMaxLength(5);
+		grabCount.setText(countText);
+		grabAreaButton = new ButtonWidget(0, 0, 0, 2 * BUTTON_WIDTH + 1, 20, "");
+		startJobButton = new ButtonWidget(START_JOB_ID, 0, 0, JOB_BUTTON_WIDTH, 20, "Start job");
+		stopJobButton = new ButtonWidget(STOP_JOB_ID, 0, 0, JOB_BUTTON_WIDTH, 20, "Stop job");
 
 		final List<String> names = names();
 
@@ -254,13 +289,17 @@ public class BotScreen extends HandledScreen {
 	private void launch(int index) {
 		if (ACTIONS[index][1] == null) {
 			final String label = ACTIONS[index][0];
-			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : Pick.WAIT;
-			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS);
+			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Index") ? Pick.INDEX : Pick.WAIT;
+			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS) || (start == Pick.GRAB_ITEM && pick == Pick.GRAB);
 			resetPick();
 
 			// The same button again leaves the pick.
 			if (!again) {
 				pick = start;
+
+				if (start == Pick.INDEX && areaName(grabArea) == null) {
+					grabArea = nextArea(null);
+				}
 			}
 
 			return;
@@ -347,7 +386,7 @@ public class BotScreen extends HandledScreen {
 		held = -1;
 	}
 
-	private static ItemStack stackOf(BotInventory.Item item) {
+	static ItemStack stackOf(BotInventory.Item item) {
 		if (item == null) {
 			return ItemStack.EMPTY;
 		}
@@ -390,11 +429,47 @@ public class BotScreen extends HandledScreen {
 		}
 
 		final int id = slot != null ? slot.id : slotId;
+		final ItemStack carried = client.player.inventory.getCursorStack();
+
+		// A double click in a window, the item in the hand: not all of them gathered onto the cursor, but
+		// every stack of it on the clicked side moved to the other, as far as the other has room.
+		if (action == ItemAction.PICKUP_ALL && shownWindow != null && slot != null && !carried.isEmpty()) {
+			final ItemStack item = carried.copy();
+			final boolean container = id < shownWindow.getContainerSlots();
+			// The hand's stack back where it was taken from.
+			click(id, 0, ItemAction.PICKUP);
+			final List<Integer> from = new ArrayList<Integer>();
+
+			for (Slot candidate : screenHandler.slots) {
+				if ((candidate.id < shownWindow.getContainerSlots()) == container && candidate.hasStack() && sameItem(candidate.getStack(), item)) {
+					from.add(candidate.id);
+				}
+			}
+
+			for (int source : from) {
+				click(source, 0, ItemAction.QUICK_MOVE);
+			}
+
+			return;
+		}
+
+		click(id, button, action);
+	}
+
+	/** One click on the bot, and as the client does it, done here at once. */
+	private void click(int id, int button, ItemAction action) {
 		bots.windowClick(selected, id, button, action.ordinal());
 
 		if (action != ItemAction.SWAP && action != ItemAction.CLONE) {
 			screenHandler.method_3252(id, button, action, client.player);
 		}
+	}
+
+	/** The same item, damage and NBT, whatever the counts. */
+	private static boolean sameItem(ItemStack a, ItemStack b) {
+		final ItemStack counted = a.copy();
+		counted.setCount(b.getCount());
+		return ItemStack.equalsAll(counted, b);
 	}
 
 	@Override
@@ -429,10 +504,163 @@ public class BotScreen extends HandledScreen {
 		tradeField.y = tradeButton.y + 1;
 		tradeField.render();
 
-		// The bot's whole state under the buttons: an error with its message.
-		textRenderer.drawTrimmed(bots.getStatus(selected), x, top + ACTION_ROWS * 21 + 4, backgroundWidth, TEXT);
-		drawPickPanel(top + ACTION_ROWS * 21 + 16, mouseX, mouseY);
+		// Start and Stop job under them, the one lit being the one that can be pressed.
+		final JobRunner job = MapMcBotClient.job();
+		final boolean running = job.isRunning(selected);
+		startJobButton.x = x;
+		startJobButton.y = top + ACTION_ROWS * 21 + 1;
+		startJobButton.active = !running && job.getJob().size() > 0;
+		startJobButton.method_891(client, mouseX, mouseY, tickDelta);
+		stopJobButton.x = x + JOB_BUTTON_WIDTH + 2;
+		stopJobButton.y = startJobButton.y;
+		stopJobButton.active = running;
+		stopJobButton.method_891(client, mouseX, mouseY, tickDelta);
+
+		// The bot's whole state under the buttons: an error with its message; its grab's while it has one.
+		final String grabStatus = MapMcBotClient.grab().status(selected);
+		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
+		drawPickPanel(top + ACTION_ROWS * 21 + JOB_ROW + 16, mouseX, mouseY);
 		drawMatchPanel(mouseX, mouseY);
+		drawJobPanel(mouseX, mouseY);
+	}
+
+	private int jobLeft() {
+		return width - MARGIN - JOB_WIDTH;
+	}
+
+	/** The room the steps' cards have, between the title and the record button. */
+	private int stepsTop() {
+		return MARGIN + 14;
+	}
+
+	private int recordTop() {
+		return height - MARGIN - RECORD_HEIGHT;
+	}
+
+	private int visibleSteps() {
+		return Math.max(1, (recordTop() - 4 - stepsTop()) / (STEP_HEIGHT + 2));
+	}
+
+	/** A step as a card shows it: its primitive, then what it was sent with. */
+	private static String[] describe(String json) {
+		final JsonObject step = new JsonParser().parse(json).getAsJsonObject();
+		final StringBuilder args = new StringBuilder();
+
+		for (Map.Entry<String, com.google.gson.JsonElement> entry : step.entrySet()) {
+			if (entry.getKey().equals("area") && entry.getValue().isJsonPrimitive()) {
+				final String name = areaName(entry.getValue().getAsString());
+				args.append(args.length() == 0 ? "" : " ").append("area=").append(name == null ? "(gone) " + entry.getValue().getAsString() : name);
+			} else if (!entry.getKey().equals("action")) {
+				args.append(args.length() == 0 ? "" : " ").append(entry.getKey()).append('=').append(entry.getValue());
+			}
+		}
+
+		return new String[] {step.get("action").getAsString(), args.toString()};
+	}
+
+	/** The job, right of everything: a card for each step, the one the selected bot is on lit, and the record button under them. */
+	private void drawJobPanel(int mouseX, int mouseY) {
+		final JobRunner job = MapMcBotClient.job();
+		final List<String> steps = job.getJob().getSteps();
+		final int left = jobLeft();
+		final int onStep = selected == null ? -1 : job.stepOf(selected);
+		textRenderer.drawWithShadow("Job (" + steps.size() + " steps)", left, MARGIN, TEXT);
+		jobScroll = Math.max(0, Math.min(jobScroll, steps.size() - visibleSteps()));
+		String tooltip = null;
+
+		for (int i = jobScroll; i < steps.size() && i < jobScroll + visibleSteps(); i++) {
+			final int top = stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2);
+			final String[] text = describe(steps.get(i));
+			fill(left, top, left + JOB_WIDTH, top + STEP_HEIGHT, i == onStep ? STEP_RUNNING : CARD);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth((i + 1) + ". " + text[0], JOB_WIDTH - 4 - STEP_BUTTON - 4), left + 4, top + 3, TEXT);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[1], JOB_WIDTH - 8), left + 4, top + 14, DIM);
+			drawStepButton(left, top, 0, "^", mouseX, mouseY);
+			drawStepButton(left, top, 1, "v", mouseX, mouseY);
+			drawStepButton(left, top, 2, "x", mouseX, mouseY);
+
+			if (mouseX >= left && mouseX < left + JOB_WIDTH - STEP_BUTTON - 4 && mouseY >= top && mouseY < top + STEP_HEIGHT) {
+				tooltip = text[0] + " " + text[1];
+			}
+		}
+
+		final boolean armed = job.isArmed();
+		fill(left, recordTop(), left + JOB_WIDTH, recordTop() + RECORD_HEIGHT, armed ? RECORDING : overRecord(mouseX, mouseY) ? CARD_SELECTED : CARD);
+		drawCenteredString(textRenderer, armed ? "Recording: do a primitive" : "Record step", left + JOB_WIDTH / 2, recordTop() + 6, TEXT);
+
+		if (tooltip != null) {
+			renderTooltip(tooltip, mouseX, mouseY);
+		}
+	}
+
+	/** One of a card's three little buttons (up, down, delete), stacked at its right edge. */
+	private void drawStepButton(int left, int top, int index, String label, int mouseX, int mouseY) {
+		final int bx = left + JOB_WIDTH - STEP_BUTTON - 2;
+		final int by = top + 2 + index * (STEP_BUTTON + 1);
+		final boolean over = mouseX >= bx && mouseX < bx + STEP_BUTTON && mouseY >= by && mouseY < by + STEP_BUTTON;
+		fill(bx, by, bx + STEP_BUTTON, by + STEP_BUTTON, over ? CARD_SELECTED : 0xFF000000 | 0x20242B);
+		drawCenteredString(textRenderer, label, bx + STEP_BUTTON / 2, by + 1, TEXT);
+	}
+
+	private boolean overRecord(int mouseX, int mouseY) {
+		return mouseX >= jobLeft() && mouseX < jobLeft() + JOB_WIDTH && mouseY >= recordTop() && mouseY < recordTop() + RECORD_HEIGHT;
+	}
+
+	/** A click on the job panel: the record button or a card's little buttons; whether it was on the panel. */
+	private boolean clickJobPanel(int mouseX, int mouseY, int button) {
+		final int left = jobLeft();
+
+		if (mouseX < left || mouseX >= left + JOB_WIDTH) {
+			return false;
+		}
+
+		if (button != 0) {
+			return true;
+		}
+
+		final JobRunner job = MapMcBotClient.job();
+
+		if (overRecord(mouseX, mouseY)) {
+			job.setArmed(!job.isArmed());
+			return true;
+		}
+
+		final int size = job.getJob().size();
+
+		for (int i = jobScroll; i < size && i < jobScroll + visibleSteps(); i++) {
+			final int top = stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2);
+			final int bx = left + JOB_WIDTH - STEP_BUTTON - 2;
+
+			if (mouseX < bx || mouseX >= bx + STEP_BUTTON) {
+				continue;
+			}
+
+			final int which = (mouseY - top - 2) / (STEP_BUTTON + 1);
+
+			if (mouseY >= top + 2 && which >= 0 && which <= 2 && (mouseY - top - 2) % (STEP_BUTTON + 1) < STEP_BUTTON) {
+				if (which == 0) {
+					job.getJob().move(i, -1);
+				} else if (which == 1) {
+					job.getJob().move(i, 1);
+				} else {
+					job.getJob().remove(i);
+				}
+
+				return true;
+			}
+		}
+
+		return true;
+	}
+
+	@Override
+	public void handleMouse() {
+		super.handleMouse();
+		final int wheel = Mouse.getDWheel();
+
+		if (wheel != 0) {
+			// Clamped by the next frame's draw.
+			jobScroll += wheel > 0 ? -1 : 1;
+		}
 	}
 
 	/** A row of the match panel: a field of the item, whether it counts, and what turns it on or off. */
@@ -556,6 +784,9 @@ public class BotScreen extends HandledScreen {
 				: pick == Pick.HOTBAR ? "Hotbar: click the hotbar slot to hold"
 				: pick == Pick.FILL_ITEM ? "ItemFill: click a slot holding the item to fill with"
 				: pick == Pick.FILL_TARGETS ? "ItemFill: click the slots to fill"
+				: pick == Pick.GRAB_ITEM ? "Grab: click a slot holding the item to grab"
+				: pick == Pick.GRAB ? "Grab: the area to take it from and how many"
+				: pick == Pick.INDEX ? "Index: the area whose chests to look in"
 				: "Wait: click the slots to wait on, an item to change it";
 		textRenderer.drawWithShadow(prompt, x, top, TEXT);
 		int rowY = top + 12;
@@ -603,7 +834,36 @@ public class BotScreen extends HandledScreen {
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
-		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS ? x + BUTTON_WIDTH + 1 : x;
+		if (pick == Pick.GRAB) {
+			textRenderer.drawWithShadow(grabFilter.reference.getName() + " (" + grabFilter.label() + ")", x, rowY + 2, DIM);
+			rowY += 12;
+			grabAreaButton.x = x;
+			grabAreaButton.y = rowY + 2;
+			grabAreaButton.message = "Area: " + areaName(grabArea);
+			grabAreaButton.method_891(client, mouseX, mouseY, 0);
+			grabCount.x = x + 2 * BUTTON_WIDTH + 4;
+			grabCount.y = rowY + 3;
+			grabCount.render();
+			rowY += 22;
+			startButton.x = x;
+			startButton.y = rowY + 2;
+			startButton.active = grabArea != null && !grabCount.getText().isEmpty() && Integer.parseInt(grabCount.getText()) > 0;
+			startButton.method_891(client, mouseX, mouseY, 0);
+		}
+
+		if (pick == Pick.INDEX) {
+			grabAreaButton.x = x;
+			grabAreaButton.y = rowY + 2;
+			grabAreaButton.message = "Area: " + areaName(grabArea);
+			grabAreaButton.method_891(client, mouseX, mouseY, 0);
+			rowY += 22;
+			startButton.x = x;
+			startButton.y = rowY + 2;
+			startButton.active = grabArea != null;
+			startButton.method_891(client, mouseX, mouseY, 0);
+		}
+
+		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS || pick == Pick.GRAB || pick == Pick.INDEX ? x + BUTTON_WIDTH + 1 : x;
 		cancelButton.y = rowY + 2;
 		cancelButton.method_891(client, mouseX, mouseY, 0);
 
@@ -621,7 +881,7 @@ public class BotScreen extends HandledScreen {
 
 	/** The top of the wait's row, as drawPickPanel lays them. */
 	private int rowTop(int index) {
-		return y + backgroundHeight + 6 + ACTION_ROWS * 21 + 16 + 12 + index * WAIT_ROW;
+		return y + backgroundHeight + 6 + ACTION_ROWS * 21 + JOB_ROW + 16 + 12 + index * WAIT_ROW;
 	}
 
 	private void drawItem(ItemStack stack, int itemX, int itemY) {
@@ -641,6 +901,7 @@ public class BotScreen extends HandledScreen {
 		pick = Pick.NONE;
 		moveFrom = -1;
 		fillFilter = null;
+		grabFilter = null;
 		editing = null;
 		fillTargets.clear();
 		fillDrag = null;
@@ -689,6 +950,29 @@ public class BotScreen extends HandledScreen {
 				pick = Pick.FILL_TARGETS;
 				return;
 			}
+
+			case GRAB_ITEM: {
+				final BotInventory.Item there = itemOn(slot);
+
+				// An empty slot names no item: the pick goes on.
+				if (there == null) {
+					return;
+				}
+
+				grabFilter = new ItemFilter(there);
+				editing = grabFilter;
+
+				if (areaName(grabArea) == null) {
+					grabArea = nextArea(null);
+				}
+
+				pick = Pick.GRAB;
+				return;
+			}
+
+			case GRAB:
+			case INDEX:
+				return;
 
 			case FILL_TARGETS:
 				fillDrag = !fillTargets.contains(slot);
@@ -796,6 +1080,55 @@ public class BotScreen extends HandledScreen {
 		bots.action(selected, a.toString());
 	}
 
+	/** The grab started on the selected bot, as an order from outside: recorded when armed. */
+	private void startGrab() {
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", "grab");
+		a.addProperty("area", grabArea);
+		a.add("item", grabFilter.toJson());
+		a.addProperty("count", Integer.parseInt(grabCount.getText()));
+		resetPick();
+		order(a);
+	}
+
+	/** A grab or an index on the selected bot, as an order from outside: recorded when armed. */
+	private void order(JsonObject a) {
+		MapMcBotClient.job().ordered(selected, a.toString());
+		MapMcBotClient.grab().start(selected, a.toString(), new JobRunner.Listener() {
+			@Override
+			public void done() {
+			}
+
+			@Override
+			public void failed() {
+			}
+		});
+	}
+
+	/** The area's name, null for no such area. */
+	private static String areaName(String id) {
+		for (Area area : MapMcBotClient.areas().getAreas()) {
+			if (area.getId().equals(id)) {
+				return area.getName();
+			}
+		}
+
+		return null;
+	}
+
+	/** The id of the area after this one, the first after none or the last; null with no areas. */
+	private static String nextArea(String id) {
+		final List<Area> areas = MapMcBotClient.areas().getAreas();
+
+		for (int i = 0; i < areas.size(); i++) {
+			if (areas.get(i).getId().equals(id)) {
+				return areas.get((i + 1) % areas.size()).getId();
+			}
+		}
+
+		return areas.isEmpty() ? null : areas.get(0).getId();
+	}
+
 	/** The item fill sent: the items its match takes onto the slots picked. */
 	private void startFill() {
 		final JsonObject a = new JsonObject();
@@ -897,7 +1230,7 @@ public class BotScreen extends HandledScreen {
 
 	/** Right of the cards, centred in what they leave, the match panel's room aside while it shows. */
 	private void place() {
-		x = LEFT + Math.max(0, (width - LEFT - backgroundWidth - (editing != null ? PANEL_WIDTH + MARGIN : 0)) / 2);
+		x = LEFT + Math.max(0, (width - LEFT - JOB_WIDTH - MARGIN * 2 - backgroundWidth - (editing != null ? PANEL_WIDTH + MARGIN : 0)) / 2);
 	}
 
 	/** The window's name as the game titles it, else its type's. */
@@ -1351,6 +1684,10 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
+		if (clickJobPanel(mouseX, mouseY, button)) {
+			return;
+		}
+
 		final String card = cardAt(mouseX, mouseY);
 
 		if (card != null) {
@@ -1384,6 +1721,17 @@ public class BotScreen extends HandledScreen {
 						return;
 					}
 				}
+
+				if (startJobButton.active && startJobButton.isMouseOver(client, mouseX, mouseY)) {
+					resetPick();
+					MapMcBotClient.job().start(selected);
+					return;
+				}
+
+				if (stopJobButton.active && stopJobButton.isMouseOver(client, mouseX, mouseY)) {
+					MapMcBotClient.job().stop(selected);
+					return;
+				}
 			}
 
 			if (pick == Pick.NONE) {
@@ -1400,6 +1748,29 @@ public class BotScreen extends HandledScreen {
 			if (button == 0 && pick == Pick.FILL_TARGETS && !fillTargets.isEmpty() && startButton.isMouseOver(client, mouseX, mouseY)) {
 				startFill();
 				return;
+			}
+
+			if (button == 0 && pick == Pick.GRAB && startButton.active && startButton.isMouseOver(client, mouseX, mouseY)) {
+				startGrab();
+				return;
+			}
+
+			if (button == 0 && pick == Pick.INDEX && startButton.active && startButton.isMouseOver(client, mouseX, mouseY)) {
+				final JsonObject a = new JsonObject();
+				a.addProperty("action", "index");
+				a.addProperty("area", grabArea);
+				resetPick();
+				order(a);
+				return;
+			}
+
+			if (button == 0 && (pick == Pick.GRAB || pick == Pick.INDEX) && grabAreaButton.isMouseOver(client, mouseX, mouseY)) {
+				grabArea = nextArea(grabArea);
+				return;
+			}
+
+			if (pick == Pick.GRAB) {
+				grabCount.method_920(mouseX, mouseY, button);
 			}
 
 			if (button == 0 && clickMatchPanel(mouseX, mouseY)) {
@@ -1476,6 +1847,14 @@ public class BotScreen extends HandledScreen {
 			if (tradeField.isFocused()) {
 				if (Character.isDigit(character) || character < ' ') {
 					tradeField.keyPressed(character, keyCode);
+				}
+
+				return;
+			}
+
+			if (pick == Pick.GRAB && grabCount.isFocused()) {
+				if (Character.isDigit(character) || character < ' ') {
+					grabCount.keyPressed(character, keyCode);
 				}
 
 				return;

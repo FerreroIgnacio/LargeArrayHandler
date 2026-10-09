@@ -99,10 +99,23 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       return
     }
     const { stateName, stateIdOf } = blockStates()
+    const type = states.blockName(stateName(stateIdOf(bot.blockAt(new Vec3(location.x, location.y, location.z)))))
     out(protocol.blockEntityUpdate(name, key, location, {
-      type: states.blockName(stateName(stateIdOf(bot.blockAt(new Vec3(location.x, location.y, location.z))))),
+      type,
       nbt: nbt.writeUncompressed({ ...tag, name: tag.name ?? '' })
     }))
+    if (CHESTS.has(type)) out(protocol.chest(name, key, location, type))
+  }
+
+  // The chests the mod keeps (see protocol.chest), as they show up or go.
+  const CHESTS = new Set(['minecraft:chest', 'minecraft:trapped_chest'])
+  function reportChestChange (oldBlock, newBlock) {
+    const { stateName, stateIdOf } = blockStates()
+    const was = states.blockName(stateName(stateIdOf(oldBlock)))
+    const is = states.blockName(stateName(stateIdOf(newBlock)))
+    if (was === is) return
+    if (CHESTS.has(is)) out(protocol.chest(name, held(newBlock.position.x, newBlock.position.z), newBlock.position, is))
+    else if (CHESTS.has(was)) out(protocol.chest(name, held(newBlock.position.x, newBlock.position.z), newBlock.position, ''))
   }
 
   // Those of the map_chunk packets this bot loaded into the shared column.
@@ -217,12 +230,16 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     markChanged(x, z)
   })
 
+  // A chest's lid: the mod tells a player's opening from its bots' own by how many have it open.
+  bot.on('chestLidMove', (block, viewers) => out(protocol.chestLid(name, block.position, viewers)))
+
   bot.on('blockUpdate', (oldBlock, newBlock) => {
     // The column is shared: the first bot of the fleet to get the change already wrote it there.
     // The rest see no change, and the column is snapshotted once instead of once per bot.
     const { stateIdOf } = blockStates()
     if (stateIdOf(oldBlock) === stateIdOf(newBlock)) return
     markChanged(newBlock.position.x, newBlock.position.z)
+    reportChestChange(oldBlock, newBlock)
   })
 
   // The bot's inventory for the mod (its bot window): sent whole once anything in it changed, a slot,
@@ -373,6 +390,18 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       const done = pickupAll(window, slot, button)
       await rawClick(window, slot, button, mode)
       done()
+      return
+    }
+    if (mode === 1) {
+      // 1.12's server answers a shift click with the stack it moved (empty only when nothing moved), and takes it
+      // as accepted only when the click carries that same stack; mineflayer's feature table says to send none.
+      const supports = bot.supportFeature
+      bot.supportFeature = f => f === 'quickMoveClickSendsEmptyItem' ? false : supports.call(bot, f)
+      try {
+        await bot.clickWindow(slot, button, mode)
+      } finally {
+        bot.supportFeature = supports
+      }
       return
     }
     await bot.clickWindow(slot, button, mode)

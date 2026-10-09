@@ -5,6 +5,11 @@ import java.util.List;
 
 import net.mapmcbot.area.Area;
 import net.mapmcbot.area.AreaStore;
+import net.mapmcbot.area.ChestStore;
+import net.mapmcbot.bot.BotInventory;
+import net.minecraft.client.render.DiffuseLighting;
+import net.minecraft.item.ItemStack;
+import com.mojang.blaze3d.platform.GlStateManager;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
@@ -16,12 +21,16 @@ import org.lwjgl.input.Mouse;
  *
  * Edits go into the area as they are typed, so its box in the world follows along. Coordinates
  * only commit once they all parse, so a half-typed minus sign does not collapse the area.
+ *
+ * Right of the editor, the chests of the selected area as last seen, a page at a time: each framed
+ * green while known exactly (clean), yellow while it may have changed since (dirty).
  */
 public class AreaScreen extends Screen {
 	private static final int BUTTON_ADD = 1;
 	private static final int BUTTON_DELETE = 2;
 	private static final int BUTTON_COLOR = 3;
 	private static final int BUTTON_DONE = 4;
+	private static final int BUTTON_ALL_DIRTY = 5;
 
 	private static final int LIST_WIDTH = 132;
 	private static final int ROW_HEIGHT = 22;
@@ -41,6 +50,17 @@ public class AreaScreen extends Screen {
 	private final List<TextFieldWidget> fields = new ArrayList<TextFieldWidget>();
 
 	private int scroll;
+	/** The page of the selected area's chests shown. */
+	private int page;
+
+	private static final int CHESTS_X = LIST_WIDTH + 16 + 176;
+	private static final int SLOT = 18;
+	/** A chest's cell: its title, six rows (a double chest's), and the gap after it. */
+	private static final int CELL_WIDTH = 9 * SLOT + 8;
+	private static final int CELL_HEIGHT = 12 + 6 * SLOT + 8;
+	private static final int PAGER_HEIGHT = 20;
+	private static final int CLEAN = 0xFF40C040;
+	private static final int DIRTY = 0xFFE0C020;
 
 	@Override
 	public void init() {
@@ -66,6 +86,7 @@ public class AreaScreen extends Screen {
 
 		addButton(new ButtonWidget(BUTTON_COLOR, editorX, LIST_TOP + 116, 100, 20, "Colour"));
 		addButton(new ButtonWidget(BUTTON_DELETE, editorX, LIST_TOP + 140, 100, 20, "Delete area"));
+		addButton(new ButtonWidget(BUTTON_ALL_DIRTY, editorX, LIST_TOP + 184, 100, 20, "Mark all dirty"));
 		addButton(new ButtonWidget(BUTTON_ADD, 8, height - 52, LIST_WIDTH, 20, "Add area"));
 		addButton(new ButtonWidget(BUTTON_DONE, 8, height - 28, LIST_WIDTH, 20, "Done"));
 
@@ -91,13 +112,22 @@ public class AreaScreen extends Screen {
 	}
 
 	private void select(Area area) {
+		if (area != selected) {
+			page = 0;
+		}
+
+		// The chests of the area the fleets see, into the store to be shown.
+		if (area != null) {
+			MapMcBotClient.grab().scanChests(area);
+		}
+
 		selected = area;
 		final boolean enabled = area != null;
 
 		for (int i = 0; i < buttons.size(); i++) {
 			final ButtonWidget button = buttons.get(i);
 
-			if (button.id == BUTTON_DELETE || button.id == BUTTON_COLOR) {
+			if (button.id == BUTTON_DELETE || button.id == BUTTON_COLOR || button.id == BUTTON_ALL_DIRTY) {
 				button.active = enabled;
 			}
 		}
@@ -181,6 +211,14 @@ public class AreaScreen extends Screen {
 				}
 				break;
 
+			case BUTTON_ALL_DIRTY:
+				if (selected != null) {
+					for (ChestStore.Chest chest : chests()) {
+						MapMcBotClient.chests().markDirty(chest);
+					}
+				}
+				break;
+
 			case BUTTON_DONE:
 				client.setScreen(null);
 				break;
@@ -215,7 +253,12 @@ public class AreaScreen extends Screen {
 
 		drawList();
 		drawEditor();
+		final ItemStack hovered = drawChests(mouseX, mouseY);
 		super.render(mouseX, mouseY, tickDelta);
+
+		if (hovered != null) {
+			renderTooltip(hovered, mouseX, mouseY);
+		}
 
 		for (int i = 0; i < fields.size(); i++) {
 			if (fields.get(i).isVisible()) {
@@ -285,6 +328,127 @@ public class AreaScreen extends Screen {
 				+ "  =  " + selected.getVolume() + " blocks", x, LIST_TOP + 168, COLOR_DIM_TEXT);
 	}
 
+	/** How many chest cells a page has across and down. */
+	private int columns() {
+		return Math.max(1, (width - CHESTS_X - 4) / CELL_WIDTH);
+	}
+
+	private int rows() {
+		return Math.max(1, (height - LIST_TOP - PAGER_HEIGHT - 8) / CELL_HEIGHT);
+	}
+
+	private List<ChestStore.Chest> chests() {
+		final ChestStore chests = MapMcBotClient.chests();
+		return selected == null || chests == null ? new ArrayList<ChestStore.Chest>() : chests.in(selected);
+	}
+
+	private int pages(int count) {
+		return Math.max(1, (count + columns() * rows() - 1) / (columns() * rows()));
+	}
+
+	private int pagerY() {
+		return height - PAGER_HEIGHT - 4;
+	}
+
+	/** The page of chests, and the pager under them; the item under the mouse, null for none. */
+	private ItemStack drawChests(int mouseX, int mouseY) {
+		if (selected == null) {
+			return null;
+		}
+
+		final List<ChestStore.Chest> chests = chests();
+		final int perPage = columns() * rows();
+		page = Math.max(0, Math.min(page, pages(chests.size()) - 1));
+		ItemStack hovered = null;
+
+		if (chests.isEmpty()) {
+			textRenderer.draw("No chests known in this area", CHESTS_X, LIST_TOP, COLOR_DIM_TEXT);
+		}
+
+		for (int i = page * perPage; i < chests.size() && i < (page + 1) * perPage; i++) {
+			final ChestStore.Chest chest = chests.get(i);
+			final int cellX = CHESTS_X + ((i - page * perPage) % columns()) * CELL_WIDTH;
+			final int cellY = LIST_TOP + ((i - page * perPage) / columns()) * CELL_HEIGHT;
+			final List<BotInventory.Item> contents = chest.getContents();
+			final int slots = contents != null ? contents.size() : chest.getBlocks().size() * 27;
+			final int bottom = cellY + 12 + (slots / 9) * SLOT;
+			final int frame = chest.isDirty() ? DIRTY : CLEAN;
+			final int[] first = chest.getBlocks().get(0);
+			textRenderer.draw(first[0] + "," + first[1] + "," + first[2] + (contents == null ? "  never seen" : chest.isDirty() ? "  dirty" : ""), cellX + 1, cellY + 1, chest.isDirty() ? DIRTY : COLOR_TEXT);
+			fill(cellX - 1, cellY + 10, cellX + 9 * SLOT + 1, bottom + 1, frame);
+			fill(cellX, cellY + 11, cellX + 9 * SLOT, bottom, 0xFF8B8B8B);
+
+			for (int slot = 0; slot < slots; slot++) {
+				final int slotX = cellX + (slot % 9) * SLOT + 1;
+				final int slotY = cellY + 12 + (slot / 9) * SLOT;
+				fill(slotX, slotY, slotX + 16, slotY + 16, 0xFF373737);
+
+				final BotInventory.Item item = contents == null ? null : contents.get(slot);
+
+				if (item != null) {
+					final ItemStack stack = BotScreen.stackOf(item);
+					drawItem(stack, slotX, slotY);
+
+					if (mouseX >= slotX && mouseX < slotX + 16 && mouseY >= slotY && mouseY < slotY + 16) {
+						hovered = stack;
+					}
+				}
+			}
+		}
+
+		final int pages = pages(chests.size());
+
+		if (pages > 1) {
+			final int y = pagerY();
+			fill(CHESTS_X, y, CHESTS_X + 20, y + PAGER_HEIGHT, page > 0 ? COLOR_ROW_SELECTED : COLOR_ROW);
+			textRenderer.draw("<", CHESTS_X + 8, y + 6, COLOR_TEXT);
+			textRenderer.draw("Page " + (page + 1) + " / " + pages + "  (" + chests.size() + " chests)", CHESTS_X + 28, y + 6, COLOR_TEXT);
+			final int nextX = CHESTS_X + 36 + textRenderer.getStringWidth("Page " + (page + 1) + " / " + pages + "  (" + chests.size() + " chests)");
+			fill(nextX, y, nextX + 20, y + PAGER_HEIGHT, page < pages - 1 ? COLOR_ROW_SELECTED : COLOR_ROW);
+			textRenderer.draw(">", nextX + 8, y + 6, COLOR_TEXT);
+		}
+
+		return hovered;
+	}
+
+	/** A click on the pager's arrows: the page before or after; whether it was on one. */
+	private boolean clickPager(int mouseX, int mouseY) {
+		final List<ChestStore.Chest> chests = chests();
+		final int pages = pages(chests.size());
+		final int y = pagerY();
+
+		if (pages <= 1 || mouseY < y || mouseY >= y + PAGER_HEIGHT) {
+			return false;
+		}
+
+		final int nextX = CHESTS_X + 36 + textRenderer.getStringWidth("Page " + (page + 1) + " / " + pages + "  (" + chests.size() + " chests)");
+
+		if (mouseX >= CHESTS_X && mouseX < CHESTS_X + 20) {
+			page = Math.max(0, page - 1);
+			return true;
+		}
+
+		if (mouseX >= nextX && mouseX < nextX + 20) {
+			page = Math.min(pages - 1, page + 1);
+			return true;
+		}
+
+		return false;
+	}
+
+	private void drawItem(ItemStack stack, int itemX, int itemY) {
+		GlStateManager.pushMatrix();
+		DiffuseLighting.enable();
+		GlStateManager.enableRescaleNormal();
+		GlStateManager.enableColorMaterial();
+		GlStateManager.enableLighting();
+		itemRenderer.method_12461(stack, itemX, itemY);
+		itemRenderer.renderGuiItemOverlay(textRenderer, stack, itemX, itemY);
+		GlStateManager.disableLighting();
+		DiffuseLighting.disable();
+		GlStateManager.popMatrix();
+	}
+
 	@Override
 	public void handleMouse() {
 		super.handleMouse();
@@ -306,6 +470,10 @@ public class AreaScreen extends Screen {
 			if (fields.get(i).isVisible()) {
 				fields.get(i).method_920(mouseX, mouseY, button);
 			}
+		}
+
+		if (button == 0 && clickPager(mouseX, mouseY)) {
+			return;
 		}
 
 		if (store == null || button != 0 || mouseX > LIST_WIDTH || mouseY < LIST_TOP) {

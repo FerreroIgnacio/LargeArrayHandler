@@ -263,6 +263,7 @@ function onChunkRequest (thread, request) {
       // The mod snapshots it once more as it goes: the changes of this turn not sent yet go with it.
       changed.delete(request.release)
       send(protocol.unload(request.bot, column.chunk))
+      send(protocol.columnGone(request.bot, column.chunk))
     }
   } else if (request.ready !== undefined) {
     // Its first bot loaded it into the slot: the mod reads it from here on, and snapshots it.

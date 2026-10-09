@@ -15,6 +15,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.mapmcbot.area.AreaStore;
+import net.mapmcbot.area.ChestStore;
 import net.mapmcbot.bot.BotManager;
 import net.mapmcbot.bot.BotProfile;
 import net.mapmcbot.bot.BotProfileStore;
@@ -23,6 +24,8 @@ import net.mapmcbot.bot.NameList;
 import net.mapmcbot.bot.RelayHub;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
+import net.mapmcbot.job.JobRunner;
+import net.mapmcbot.job.JobStore;
 import net.mapmcbot.profile.ProfileRegistry;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ServerInfo;
@@ -60,7 +63,11 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	private static AreaStore areas;
 	private static String areasWorldId;
+	private static ChestStore chests;
+	private static String chestsWorldId;
+	private static Grab grab;
 	private static BotRegistry bots;
+	private static JobRunner job;
 	private static BotProfileStore botProfiles;
 	private static RelayHub relays;
 	private static ChunkRegistry chunks;
@@ -389,6 +396,34 @@ public class MapMcBotClient implements ClientModInitializer {
 		return areas;
 	}
 
+	/** The chests of the areas of the world being played, reloaded when the world changes; null outside a world. */
+	public static synchronized ChestStore chests() {
+		final MinecraftClient client = MinecraftClient.getInstance();
+
+		if (client.world == null) {
+			return null;
+		}
+
+		final String worldId = worldId(client);
+
+		if (worldId == null) {
+			return null;
+		}
+
+		if (!worldId.equals(chestsWorldId)) {
+			chests = new ChestStore(new File(dataDirectory(client), worldId + "/chests.tsv"));
+			chestsWorldId = worldId;
+		}
+
+		return chests;
+	}
+
+	/** The grabs of the bots; created with the bots. */
+	static Grab grab() {
+		bots();
+		return grab;
+	}
+
 	public static BotRegistry bots() {
 		if (bots == null) {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
@@ -397,7 +432,10 @@ public class MapMcBotClient implements ClientModInitializer {
 			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
 			seedProfiles();
 			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles);
+			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
+			grab = new Grab(bots, new ChestTracker(bots));
+			job.setResolver(grab);
 			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
 			relays.start();
 		}
@@ -435,8 +473,19 @@ public class MapMcBotClient implements ClientModInitializer {
 	}
 
 	/** The bots, or null while none was ever started. */
+	/** The grabs, null before the bots are created. */
+	static Grab grabOrNull() {
+		return grab;
+	}
+
 	public static BotRegistry botsOrNull() {
 		return bots;
+	}
+
+	/** The job and what runs it; created with the bots. */
+	public static JobRunner job() {
+		bots();
+		return job;
 	}
 
 	/** The chunks the bots hold; created with the bots. */

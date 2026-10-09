@@ -19,7 +19,8 @@ import org.lwjgl.opengl.GL11;
 
 /**
  * Each area as a coloured box in the world, plus the block a click would pick while picking, and
- * the path each walking bot is on with its target.
+ * the path each walking bot is on with its target, and the chests of each grab going on: the one
+ * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour.
  *
  * Drawn at the end of entity rendering, where the camera transform is set with the camera at the
  * origin: boxes are shifted by the interpolated camera position, the raw one makes them jitter.
@@ -48,8 +49,10 @@ public final class AreaRenderer {
 		final Box entityTarget = TargetPick.isActive() ? TargetPick.entityBox(client) : null;
 		final BotRegistry bots = MapMcBotClient.botsOrNull();
 		final Map<String, int[]> paths = bots == null ? Collections.<String, int[]>emptyMap() : bots.getPaths();
+		final Grab grab = MapMcBotClient.grabOrNull();
+		final List<Grab.Highlight> chests = grab == null ? Collections.<Grab.Highlight>emptyList() : grab.highlights();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty()) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty()) {
 			return;
 		}
 
@@ -99,6 +102,28 @@ public final class AreaRenderer {
 			final int rgb = MapMcBotClient.colorOf(entry.getKey()).getRgb();
 			drawBox(path[0], path[1], path[2], path[0] + 1, path[1] + 1, path[2] + 1, rgb, camX, camY, camZ);
 			drawPath(path, rgb, camX, camY, camZ);
+		}
+
+		for (Grab.Highlight chest : chests) {
+			int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+			int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+
+			for (int[] block : chest.chest.getBlocks()) {
+				minX = Math.min(minX, block[0]);
+				minY = Math.min(minY, block[1]);
+				minZ = Math.min(minZ, block[2]);
+				maxX = Math.max(maxX, block[0]);
+				maxY = Math.max(maxY, block[1]);
+				maxZ = Math.max(maxZ, block[2]);
+			}
+
+			final int rgb = MapMcBotClient.colorOf(chest.bot).getRgb();
+
+			if (chest.current) {
+				drawBox(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1, rgb, camX, camY, camZ);
+			} else {
+				drawOutline(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1, rgb, camX, camY, camZ);
+			}
 		}
 
 		// Line width is global state the rest of the frame would inherit.
@@ -163,6 +188,23 @@ public final class AreaRenderer {
 		tessellator.draw();
 
 		// ...but the outline ignores it, so an area behind a hill can still be found.
+		drawOutline(x0, y0, z0, x1, y1, z1, rgb, camX, camY, camZ);
+	}
+
+	/** The edges of the box alone, over everything. */
+	private static void drawOutline(double x0, double y0, double z0, double x1, double y1, double z1,
+			int rgb, double camX, double camY, double camZ) {
+		final double ax = x0 - EXPANSION - camX;
+		final double ay = y0 - EXPANSION - camY;
+		final double az = z0 - EXPANSION - camZ;
+		final double bx = x1 + EXPANSION - camX;
+		final double by = y1 + EXPANSION - camY;
+		final double bz = z1 + EXPANSION - camZ;
+		final int r = (rgb >> 16) & 0xFF;
+		final int g = (rgb >> 8) & 0xFF;
+		final int b = rgb & 0xFF;
+		final Tessellator tessellator = Tessellator.getInstance();
+		final BufferBuilder buffer = tessellator.getBuffer();
 		GlStateManager.disableDepthTest();
 		buffer.begin(GL11.GL_LINES, VertexFormats.POSITION_COLOR);
 

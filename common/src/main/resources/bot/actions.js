@@ -165,8 +165,12 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   // --- A. movement
 
   function goto (action, a) {
-    const goal = a.area ? new AreaGoal(a.area) : new goals.GoalBlock(required(a.spot, 'spot').x, a.spot.y, a.spot.z)
-    const where = a.area ? `area ${at({ x: a.area.minX, y: a.area.minY, z: a.area.minZ })}..${at({ x: a.area.maxX, y: a.area.maxY, z: a.area.maxZ })}` : at(a.spot)
+    // look: a block to stand where one of its faces is in reach and in sight, to interact with it.
+    const goal = a.area ? new AreaGoal(a.area)
+      : a.look ? new goals.GoalLookAtBlock(new Vec3(a.look.x, a.look.y, a.look.z), bot.world, { reach: REACH_BLOCK })
+        : new goals.GoalBlock(required(a.spot, 'spot').x, a.spot.y, a.spot.z)
+    const where = a.area ? `area ${at({ x: a.area.minX, y: a.area.minY, z: a.area.minZ })}..${at({ x: a.area.maxX, y: a.area.maxY, z: a.area.maxZ })}`
+      : a.look ? `sight of ${at(a.look)}` : at(a.spot)
     const stood = () => at({ x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) })
     // Arrived the walk is over; any other end (failed, replaced, stopped, a death) stops it, the bot
     // never left walking to a goal no primitive waits on. Not on a bot gone: its connection is closed.
@@ -529,19 +533,32 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
         const n = Math.min(item.count, room, limit - moved)
         if (n <= 0) continue
         const before = there?.count ?? 0
-        await bot.clickWindow(src, 0, 0)
-        if (action.over) return
-        if (n === Math.min(item.count, room)) {
+        if (n < Math.min(item.count, room)) {
+          // Part of the stack, the fewest clicks: the whole or half of it (right click) in the hand,
+          // then one at a time back onto the source until n are left for the target, or n one at a
+          // time onto the target and the rest back.
+          const half = Math.ceil(item.count / 2)
+          const ways = [
+            { button: 0, back: item.count - n },
+            { button: 0, onto: n }
+          ]
+          if (n <= half) ways.push({ button: 1, back: half - n }, { button: 1, onto: n })
+          const way = ways.reduce((best, w) => (w.back ?? w.onto) < (best.back ?? best.onto) ? w : best)
+          await bot.clickWindow(src, way.button, 0)
+          if (action.over) return
+          const ones = way.back ?? way.onto
+          for (let i = 0; i < ones; i++) {
+            await bot.clickWindow(way.back !== undefined ? src : tgt, 1, 0)
+            if (action.over) return
+          }
+          await bot.clickWindow(way.back !== undefined ? tgt : src, 0, 0)
+        } else {
+          await bot.clickWindow(src, 0, 0)
+          if (action.over) return
           await bot.clickWindow(tgt, 0, 0)
           if (action.over) return
           // What does not fit goes back where it came from.
           if (window.selectedItem) await bot.clickWindow(src, 0, 0)
-        } else {
-          for (let i = 0; i < n; i++) {
-            await bot.clickWindow(tgt, 1, 0)
-            if (action.over) return
-          }
-          await bot.clickWindow(src, 0, 0)
         }
         if (action.over) return
         if (window.selectedItem) throw new Error(`expected an empty cursor after moving ${full(item.name)} from slot ${src} to slot ${tgt}, found ${describeItem(window.selectedItem)}`)

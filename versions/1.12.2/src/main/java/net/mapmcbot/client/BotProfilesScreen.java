@@ -1,10 +1,13 @@
 package net.mapmcbot.client;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-import com.mojang.blaze3d.platform.GlStateManager;
 import net.mapmcbot.bot.BotProfile;
 import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.ingame.SurvivalInventoryScreen;
+import net.minecraft.entity.LivingEntity;
 import org.lwjgl.input.Keyboard;
 
 /**
@@ -13,10 +16,9 @@ import org.lwjgl.input.Keyboard;
  * goes back to the bot window.
  */
 public class BotProfilesScreen extends Screen {
-	private static final int CARD_WIDTH = 110;
-	private static final int CARD_HEIGHT = 54;
+	private static final int CARD_WIDTH = 90;
+	private static final int CARD_HEIGHT = 110;
 	private static final int GAP = 6;
-	private static final int HEAD = 32;
 	private static final int CARD = 0xC0101216;
 	private static final int CARD_HOVER = 0xE0303A48;
 	private static final int TEXT = 0xFFE6E8EB;
@@ -27,6 +29,7 @@ public class BotProfilesScreen extends Screen {
 	private final List<BotProfile> profiles = MapMcBotClient.botProfiles().getProfiles();
 	/** The profile whose details are shown, null for the cards. */
 	private BotProfile open;
+	private final Map<String, PreviewPlayer> previews = new HashMap<String, PreviewPlayer>();
 
 	private int columns() {
 		return Math.max(1, (width - GAP) / (CARD_WIDTH + GAP));
@@ -58,7 +61,7 @@ public class BotProfilesScreen extends Screen {
 		renderBackground();
 
 		if (open != null) {
-			drawDetails(open);
+			drawDetails(open, mouseX, mouseY);
 			super.render(mouseX, mouseY, tickDelta);
 			return;
 		}
@@ -71,17 +74,16 @@ public class BotProfilesScreen extends Screen {
 			final int x = cardX(i);
 			final int y = cardY(i);
 			fill(x, y, x + CARD_WIDTH, y + CARD_HEIGHT, i == hovered ? CARD_HOVER : CARD);
-			drawHead(profile.getSkinName(), x + 6, y + 11, HEAD);
-			textRenderer.drawWithShadow(textRenderer.trimToWidth(profile.getName(), CARD_WIDTH - HEAD - 18), x + HEAD + 12, y + 14, TEXT);
-			textRenderer.drawWithShadow(textRenderer.trimToWidth(profile.getLinkedAccount() == null ? "cracked" : profile.getLinkedAccount(), CARD_WIDTH - HEAD - 18), x + HEAD + 12, y + 28, DIM);
+			drawCenteredString(textRenderer, textRenderer.trimToWidth(profile.getName(), CARD_WIDTH - 8), x + CARD_WIDTH / 2, y + 6, TEXT);
+			drawBody(profile, x + CARD_WIDTH / 2, y + CARD_HEIGHT - 8, 30, mouseX, mouseY);
 		}
 
 		super.render(mouseX, mouseY, tickDelta);
 	}
 
-	private void drawDetails(BotProfile profile) {
+	private void drawDetails(BotProfile profile, int mouseX, int mouseY) {
 		drawCenteredString(textRenderer, profile.getName(), width / 2, 12, TEXT);
-		drawHead(profile.getSkinName(), 20, 30, 64);
+		drawBody(profile, 60, 135, 45, mouseX, mouseY);
 
 		final String[][] rows = {
 				{"Linked account", profile.getLinkedAccount() == null ? "none (cracked)" : profile.getLinkedAccount()},
@@ -91,44 +93,41 @@ public class BotProfilesScreen extends Screen {
 		};
 
 		for (int i = 0; i < rows.length; i++) {
-			textRenderer.drawWithShadow(rows[i][0], 100, 30 + i * 14, DIM);
-			textRenderer.drawWithShadow(rows[i][1], 230, 30 + i * 14, TEXT);
+			textRenderer.drawWithShadow(rows[i][0], 120, 30 + i * 14, DIM);
+			textRenderer.drawWithShadow(rows[i][1], 260, 30 + i * 14, TEXT);
 		}
 
-		textRenderer.drawWithShadow("Servers joined", 20, 108, DIM);
+		textRenderer.drawWithShadow("Servers joined", 20, 150, DIM);
 		final List<BotProfile.Join> joins = profile.getJoins();
 
 		if (joins.isEmpty()) {
-			textRenderer.drawWithShadow("none yet", 20, 122, TEXT);
+			textRenderer.drawWithShadow("none yet", 20, 164, TEXT);
 			return;
 		}
 
 		// Newest first, as many as fit.
 		final long now = System.currentTimeMillis();
 
-		for (int i = 0; i < joins.size() && 122 + i * 12 < height - 12; i++) {
+		for (int i = 0; i < joins.size() && 164 + i * 12 < height - 12; i++) {
 			final BotProfile.Join join = joins.get(joins.size() - 1 - i);
-			textRenderer.drawWithShadow(join.getServer(), 20, 122 + i * 12, TEXT);
-			textRenderer.drawWithShadow(ago(now - join.getJoinedAt()), 160, 122 + i * 12, DIM);
-			textRenderer.drawWithShadow("password: " + join.getPassword(), 230, 122 + i * 12, DIM);
+			textRenderer.drawWithShadow(join.getServer(), 20, 164 + i * 12, TEXT);
+			textRenderer.drawWithShadow(ago(now - join.getJoinedAt()), 160, 164 + i * 12, DIM);
+			textRenderer.drawWithShadow("password: " + join.getPassword(), 230, 164 + i * 12, DIM);
 		}
 	}
 
-	/** The skin's face and hat layer at (x, y), size by size; a grey square until the skin arrives. */
-	private void drawHead(String skinName, int x, int y, int size) {
-		final SkinCache.Skin skin = SkinCache.of(skinName);
+	/**
+	 * The profile's bot as the inventory draws the player (feet at (x, y), looking at the mouse): the
+	 * bot itself while it is in the world, else a standing copy in its skin.
+	 */
+	private void drawBody(BotProfile profile, int x, int y, int scale, int mouseX, int mouseY) {
+		LivingEntity entity = client.world.getPlayerByName(profile.getName());
 
-		if (skin == null) {
-			fill(x, y, x + size, y + size, 0xFF3A3F47);
-			return;
+		if (entity == null) {
+			entity = previews.computeIfAbsent(profile.getName(), name -> new PreviewPlayer(name, profile.getSkinName()));
 		}
 
-		GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
-		client.getTextureManager().bindTexture(skin.getTexture());
-		drawTexture(x, y, 8, 8, 8, 8, size, size, 64, 64);
-		GlStateManager.enableBlend();
-		drawTexture(x, y, 40, 8, 8, 8, size, size, 64, 64);
-		GlStateManager.disableBlend();
+		SurvivalInventoryScreen.renderEntity(x, y, scale, x - mouseX, y - scale * 5 / 3 - mouseY, entity);
 	}
 
 	/** How long ago, in its biggest unit. */
