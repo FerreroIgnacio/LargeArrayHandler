@@ -1064,7 +1064,14 @@ public class BotScreen extends HandledScreen {
 		}
 	}
 
+	/** The profiles button, under the cards at the bottom left. */
+	private boolean overProfilesButton(int mouseX, int mouseY) {
+		return mouseX >= MARGIN && mouseX < MARGIN + CARD_WIDTH && mouseY >= height - 26 && mouseY < height - 6;
+	}
+
 	private void drawCards(int mouseX, int mouseY) {
+		fill(MARGIN, height - 26, MARGIN + CARD_WIDTH, height - 6, overProfilesButton(mouseX, mouseY) ? CARD_SELECTED : CARD);
+		drawCenteredString(textRenderer, "Bot profiles", MARGIN + CARD_WIDTH / 2, height - 20, TEXT);
 		final List<String> names = names();
 
 		for (int i = 0; i < names.size(); i++) {
@@ -1339,6 +1346,11 @@ public class BotScreen extends HandledScreen {
 
 	@Override
 	protected void mouseClicked(int mouseX, int mouseY, int button) {
+		if (button == 0 && overProfilesButton(mouseX, mouseY)) {
+			client.setScreen(new BotProfilesScreen());
+			return;
+		}
+
 		final String card = cardAt(mouseX, mouseY);
 
 		if (card != null) {

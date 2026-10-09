@@ -18,16 +18,10 @@ import net.minecraft.world.GameMode;
 /**
  * Debug only, loaded by runClient alone (its own source set, never in the mod's jar): clicks through
  * Singleplayer and the first world as a player would, opens it to LAN in survival as soon as it is
- * up, then adds PandaBot2 to PandaBot128 on the LAN port. Removing it is deleting src/debug and its block in
+ * up, then adds the bot profiles' bots on the LAN port. Removing it is deleting src/debug and its block in
  * build.gradle.
  */
 public class AutoStart implements ClientModInitializer {
-	/** Every bot's name starts with it; BotSkinMixin tells the bots apart by it. */
-	public static final String BOT_PREFIX = MapMcBotClient.NAME_PREFIX;
-
-	/** PandaBot2 to PandaBot32, from the mod's name list. */
-	private static final int BOT_COUNT = 4;
-
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
 	private static final int MAX_PLAYERS = 128;
 
@@ -46,15 +40,8 @@ public class AutoStart implements ClientModInitializer {
 	private int nextBot;
 	private int port;
 
-	/** The skin BotSkinMixin puts on every bot; a missing one would only show as the purple checkerboard. */
-	private static final String BOT_SKIN = "/assets/mapmcbot_debug/textures/entity/bot_skin.png";
-
 	@Override
 	public void onInitializeClient() {
-		if (AutoStart.class.getResource(BOT_SKIN) == null) {
-			throw new IllegalStateException("missing the bots' skin: put a 64x64 skin png at src/debug/resources" + BOT_SKIN);
-		}
-
 		ClientTickEvents.END_CLIENT_TICK.register(this::tick);
 	}
 
@@ -105,7 +92,7 @@ public class AutoStart implements ClientModInitializer {
 				MapMcBotClient.bots().create("localhost", port);
 				nextBot++;
 				wait = BOT_GAP_TICKS;
-				step = nextBot < BOT_COUNT ? Step.BOTS : Step.DONE;
+				step = nextBot < MapMcBotClient.botProfiles().getProfiles().size() ? Step.BOTS : Step.DONE;
 				break;
 
 			default:

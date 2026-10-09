@@ -10,13 +10,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.mapmcbot.area.AreaStore;
 import net.mapmcbot.bot.BotManager;
+import net.mapmcbot.bot.BotProfile;
+import net.mapmcbot.bot.BotProfileStore;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.NameList;
 import net.mapmcbot.bot.RelayHub;
@@ -41,11 +42,12 @@ import org.lwjgl.input.Keyboard;
  * the rest of the mod reaches through the static getters.
  */
 public class MapMcBotClient implements ClientModInitializer {
-	/** Every bot's name starts with it, then a number from 2 (1 being the player's). */
+	/** Every bot's name starts with it, then its number. */
 	public static final String NAME_PREFIX = "PandaBot";
 
-	/** The names there are, so the bots there can be at once. */
-	private static final int MAX_BOTS = 127;
+	/** The skins of the seed profiles, in order. */
+	private static final String[] SEED_SKINS = {"TimedHades11835", "spikeydealdoughs", "hlk0d", "ali123456789000"};
+	private static final String DEFAULT_CRACKED_PASSWORD = "pandabot";
 
 	private static final String CATEGORY = "key.categories.mapmcbot";
 
@@ -59,6 +61,7 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static AreaStore areas;
 	private static String areasWorldId;
 	private static BotRegistry bots;
+	private static BotProfileStore botProfiles;
 	private static RelayHub relays;
 	private static ChunkRegistry chunks;
 	private static ProfileRegistry profile;
@@ -391,13 +394,32 @@ public class MapMcBotClient implements ClientModInitializer {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
 			final BotManager fleet = new BotManager(new File(directory, "bot"));
 			relays = new RelayHub(new File(directory, "relays.txt"));
-			bots = new BotRegistry(fleet, relays, new NameList(IntStream.rangeClosed(2, MAX_BOTS + 1).mapToObj(i -> NAME_PREFIX + i).collect(Collectors.toList())));
+			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
+			seedProfiles();
+			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles);
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
 			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
 			relays.start();
 		}
 
 		return bots;
+	}
+
+	/** The bots' profiles, kept on disk; created with the bots. */
+	public static BotProfileStore botProfiles() {
+		bots();
+		return botProfiles;
+	}
+
+	/** The first run's profiles: PandaBot1 to PandaBot4, cracked, each in the skin of a real player. */
+	private static void seedProfiles() {
+		if (!botProfiles.getProfiles().isEmpty()) {
+			return;
+		}
+
+		for (int i = 0; i < SEED_SKINS.length; i++) {
+			botProfiles.add(new BotProfile(NAME_PREFIX + (i + 1), null, SEED_SKINS[i], DEFAULT_CRACKED_PASSWORD, null));
+		}
 	}
 
 	/** The relays connected; created with the bots. */

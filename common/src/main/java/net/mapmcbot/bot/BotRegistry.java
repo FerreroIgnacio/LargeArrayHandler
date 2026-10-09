@@ -62,13 +62,17 @@ public final class BotRegistry implements BotListener {
 	/** The id of the last click sent to each bot's inventory window, counting up from 1. */
 	private final Map<String, Integer> clicksSent = new ConcurrentHashMap<String, Integer>();
 
-	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names) {
+	/** The profiles of the bots: each join is recorded on its bot's. */
+	private final BotProfileStore profiles;
+
+	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names, BotProfileStore profiles) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
 		}
 
 		this.channel = channel;
 		this.names = names;
+		this.profiles = profiles;
 		this.relays = relays;
 		channel.setBotListener(this);
 		relays.setBots(this);
@@ -209,6 +213,8 @@ public final class BotRegistry implements BotListener {
 
 			serverOf.put(name, InetSocketAddress.createUnresolved(host, port));
 			spawnOn(leastLoadedFleet(), name);
+			final BotProfile profile = profiles.get(name);
+			profiles.recordJoin(name, host + ":" + port, profile.getDefaultCrackedPassword());
 		} catch (RuntimeException e) {
 			if (bots.remove(name)) {
 				fleetOf.remove(name);
