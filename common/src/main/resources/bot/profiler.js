@@ -47,20 +47,43 @@ function threadProfiler (scope) {
 // The time a bot's handlers take on its thread: every emit of the emitters given is timed, those
 // running inside another of the same bot's counted once (mineflayer emits its events from inside
 // the client's packet events).
+//
+// decodeMs: the time its packets take before any handler (split, decompressed, parsed), the
+// handlers they set off along the way left out.
 function botMeter () {
-  const meter = { ms: 0, events: 0, depth: 0 }
+  const meter = { ms: 0, events: 0, depth: 0, decodeMs: 0, decodeDepth: 0 }
+  // fn timed as a handler, unless inside one already.
+  meter.run = function (fn, args = [], self = undefined) {
+    if (meter.depth > 0) return fn.apply(self, args)
+    meter.depth++
+    meter.events++
+    const began = performance.now()
+    try {
+      return fn.apply(self, args)
+    } finally {
+      meter.depth--
+      meter.ms += performance.now() - began
+    }
+  }
   meter.wrap = emitter => {
     const emit = emitter.emit
     emitter.emit = function (...args) {
-      if (meter.depth > 0) return emit.apply(this, args)
-      meter.depth++
-      meter.events++
+      return meter.run(emit, args, this)
+    }
+  }
+  // A stream of the client's way in: its transforms timed as decoding, once however they nest.
+  meter.wrapDecode = stream => {
+    const transform = stream._transform
+    stream._transform = function (...args) {
+      if (meter.decodeDepth > 0) return transform.apply(this, args)
+      meter.decodeDepth++
+      const handlers = meter.ms
       const began = performance.now()
       try {
-        return emit.apply(this, args)
+        return transform.apply(this, args)
       } finally {
-        meter.depth--
-        meter.ms += performance.now() - began
+        meter.decodeDepth--
+        meter.decodeMs += performance.now() - began - (meter.ms - handlers)
       }
     }
   }

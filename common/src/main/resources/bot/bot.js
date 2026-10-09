@@ -10,10 +10,6 @@ const protocol = require('./protocol')
 const states = require('./states')
 const { botMeter } = require('./profiler')
 
-// Searches past this many nodes go to the log, with how long they took to be done (taking turns with
-// the other searches of the thread included).
-const LOG_SEARCH_NODES = 1000
-
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
 // its last frame sent; chunks holds the columns of its thread (see sharedChunks.js).
 module.exports = function startBot ({ name, host, port, chunks, send, report, onEnd }) {
@@ -25,6 +21,14 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   const meter = botMeter()
   meter.wrap(bot)
   meter.wrap(bot._client)
+  // And apart, the time its packets take to be split, decompressed and parsed before any handler.
+  meter.wrapDecode(bot._client.splitter)
+  meter.wrapDecode(bot._client.deserializer)
+  const setCompressionThreshold = bot._client.setCompressionThreshold
+  bot._client.setCompressionThreshold = function (threshold) {
+    setCompressionThreshold.call(this, threshold)
+    if (this.decompressor) meter.wrapDecode(this.decompressor)
+  }
 
   function dimension () {
     const d = bot.game.dimension
@@ -80,14 +84,24 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   }
 
   // Those of the map_chunk packets this bot loaded into the shared column.
-  chunks.attach(bot, name, world, tag => reportBlockEntity({ x: tag.value.x.value, y: tag.value.y.value, z: tag.value.z.value }, tag))
+  chunks.attach(bot, name, world, tag => reportBlockEntity({ x: tag.value.x.value, y: tag.value.y.value, z: tag.value.z.value }, tag), meter)
 
   bot.loadPlugin(pathfinder)
   // Pathfinder's time per tick, in ms, once the pool thread has shared its own out (see poolThread.js).
   let tickTimeout = null
   bot.once('spawn', () => {
-    bot.pathfinder.setMovements(new Movements(bot))
+    const movements = new Movements(bot)
+    // Walking only: a bot breaking blocks resets the paths of every bot through them, and it has no
+    // blocks to place (each try a place_error and a new search).
+    movements.canDig = false
+    movements.allow1by1towers = false
+    movements.scafoldingBlocks = []
+    bot.pathfinder.setMovements(movements)
     if (tickTimeout !== null) bot.pathfinder.tickTimeout = tickTimeout
+    // Never a timeout: pathfinder walks a timed out search's best path and never searches again,
+    // the bot left stuck with its goal. Without one a search goes on in parts (partial) while it
+    // walks, until the goal or noPath (said in the log).
+    bot.pathfinder.thinkTimeout = Infinity
     log('spawned')
     out(protocol.botSpawned(name))
   })
@@ -100,14 +114,31 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   }
   bot.on('path_update', result => {
     if (result.status === 'noPath') log('no path' + (result.reason ? ` (${result.reason})` : ''))
-    if (result.visitedNodes > LOG_SEARCH_NODES) log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
+    // Every search once it is over, with how long it took (taking turns with the other searches of the
+    // thread included); not its parts while it goes on, one a tick.
+    if (result.status !== 'partial') log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
     if (result.status === 'noPath' || !target) out(protocol.path(name, null))
     else out(protocol.path(name, target, result.path))
   })
-  bot.on('goal_reached', () => out(protocol.path(name, null)))
-  bot.on('path_stop', () => out(protocol.path(name, null)))
-  bot.on('path_reset', () => out(protocol.path(name, null)))
+  // For debugging the paths drawn: where the bot stands and where it is going each time a path ends.
+  const at = () => {
+    const p = bot.entity.position
+    return `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
+  }
+  const spot = g => g ? `${g.x},${g.y},${g.z}` : 'none'
+  bot.on('goal_reached', goal => {
+    log(`goal reached at ${at()} (goal ${spot(goal)})`)
+    out(protocol.path(name, null))
+  })
+  bot.on('path_stop', () => {
+    log(`path stopped at ${at()} (goal ${spot(goalOf())})`)
+    out(protocol.path(name, null))
+  })
+  bot.on('path_reset', reason => {
+    log(`path reset (${reason}) at ${at()} (goal ${spot(goalOf())})`)
+    out(protocol.path(name, null))
+  })
 
   bot.on('kicked', reason => log('kicked: ' + reason))
   bot.on('error', err => log('error: ' + err.message))
@@ -159,6 +190,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       const socket = bot._client.socket
       return [
         [scope, 'cpu.handlers', 'ms', meter.ms],
+        [scope, 'cpu.decode', 'ms', meter.decodeMs],
         [scope, 'events', 'n', meter.events],
         [scope, 'net.in', 'bytes', socket ? socket.bytesRead : 0],
         [scope, 'net.out', 'bytes', socket ? socket.bytesWritten : 0],
@@ -177,6 +209,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
 
     // Walks to the spot: its own search, from where it stands.
     goto (spot) {
+      log(`goto ${spot.x},${spot.y},${spot.z} from ${at()}`)
       bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
     }
   }

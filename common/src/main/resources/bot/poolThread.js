@@ -11,7 +11,7 @@ const { threadProfiler } = require('./profiler')
 
 openColumns(workerData.columnsFile)
 const port = workerData.chunkPort
-const chunks = sharedChunks(port, new Int32Array(workerData.signal), post)
+const chunks = sharedChunks(port, post, workerData.serializerPorts)
 const bots = new Map()
 const scope = `node.thread:pool:${workerData.index}`
 const prof = threadProfiler(scope)

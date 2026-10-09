@@ -209,6 +209,21 @@ function chunkOf (key) {
   return { server: parts[0], dimension: parts[1], x, z }
 }
 
+// The serializer pool: threads that parse the columns into their slots, off the pool threads (see
+// columnSerializer.js). One for now.
+const SERIALIZER_THREADS = 1
+const serializers = []
+for (let i = 0; i < SERIALIZER_THREADS; i++) {
+  const worker = new Worker(path.join(__dirname, 'columnSerializer.js'), { workerData: { index: i, columnsFile } })
+  worker.on('message', message => {
+    if (message.profile === undefined) throw new Error('a serializer thread sent something besides its profile rows')
+    onProfileRows(worker, message.profile, message.rows)
+  })
+  worker.on('error', err => { throw err })
+  worker.on('exit', code => { throw new Error(`serializer thread exited (code ${code})`) })
+  serializers.push(worker)
+}
+
 // What a pool thread sends, in the order it happened there (see poolThread.js).
 function onThreadMessage (thread, message) {
   if (message.profile !== undefined) {
@@ -237,10 +252,8 @@ function onChunkRequest (thread, request) {
       send(protocol.claim(request.bot, column.chunk, column.claim, column.slot, request.version))
     }
     column.threads.add(thread)
-    // The thread waits on the signal, then takes the answer straight off its port.
-    thread.chunkPort.postMessage({ header: column.header, slot: column.slot, load })
-    Atomics.store(thread.signal, 0, 1)
-    Atomics.notify(thread.signal, 0)
+    // Never waited on: the thread's bots go on until it lands.
+    thread.chunkPort.postMessage({ acquired: request.acquire, header: column.header, slot: column.slot, load })
   } else if (request.release !== undefined) {
     const column = columns.get(request.release)
     if (!column || !column.threads.delete(thread)) throw new Error(`a thread released column ${request.release} it does not hold`)
@@ -293,15 +306,20 @@ function onReport (thread, report) {
 // rather than all at once, so their start (each loads mineflayer and minecraft-data) never takes
 // every core together.
 const threads = []
-const MAX_THREADS = Math.max(1, os.cpus().length)
+const MAX_THREADS = Math.max(1, os.cpus().length - SERIALIZER_THREADS)
 
 function startThread () {
   const { port1, port2 } = new MessageChannel()
-  const signal = new SharedArrayBuffer(4)
-  const thread = { bots: 0, chunkPort: port1, signal: new Int32Array(signal) }
+  const thread = { bots: 0, chunkPort: port1 }
+  // A port to each serializer thread.
+  const serializerPorts = serializers.map(worker => {
+    const channel = new MessageChannel()
+    worker.postMessage({ type: 'client', port: channel.port2 }, [channel.port2])
+    return channel.port1
+  })
   thread.worker = new Worker(path.join(__dirname, 'poolThread.js'), {
-    workerData: { index: threads.length, chunkPort: port2, signal, columnsFile },
-    transferList: [port2]
+    workerData: { index: threads.length, chunkPort: port2, serializerPorts, columnsFile },
+    transferList: [port2, ...serializerPorts]
   })
   thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
   thread.worker.on('error', err => { throw err })
@@ -347,7 +365,7 @@ let nextProfile = 1
 function takeProfile (id, reason) {
   if (closing) return
   const key = nextProfile++
-  const workers = threads.map(t => t.worker)
+  const workers = [...threads.map(t => t.worker), ...serializers]
   const cpu = process.cpuUsage()
   const memory = process.memoryUsage()
   const rows = [

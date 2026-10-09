@@ -230,10 +230,78 @@ public class MapMcBotClient implements ClientModInitializer {
 			chat(client, "formation_err: " + spots.size() + " spots around " + centre.getX() + "," + centre.getY() + "," + centre.getZ() + " for " + fleet.size() + " bots");
 		}
 
-		for (int i = 0; i < spots.size(); i++) {
-			final BlockPos spot = spots.get(i);
-			bots().gotoSpot(fleet.get(i), spot.getX(), spot.getY(), spot.getZ());
+		final Map<String, BlockPos> assigned = assign(client, fleet, spots);
+
+		for (Map.Entry<String, BlockPos> entry : assigned.entrySet()) {
+			final BlockPos spot = entry.getValue();
+			bots().gotoSpot(entry.getKey(), spot.getX(), spot.getY(), spot.getZ());
 		}
+	}
+
+	/**
+	 * Each spot to a bot, nearest first: of every bot the player sees and every spot, the closest pair
+	 * take each other, then the closest of the rest, and so on; a bot already in the formation keeps
+	 * its spot or one by it, the ones far away get those left at its edge. The bots the player does
+	 * not see (no position here) take the spots left after, in order. Bots past the spots get none.
+	 */
+	private static Map<String, BlockPos> assign(MinecraftClient client, List<String> fleet, List<BlockPos> spots) {
+		final List<String> seen = new ArrayList<String>();
+		final List<PlayerEntity> players = new ArrayList<PlayerEntity>();
+		final List<String> unseen = new ArrayList<String>();
+
+		for (String bot : fleet) {
+			final PlayerEntity player = client.world.getPlayerByName(bot);
+
+			if (player == null) {
+				unseen.add(bot);
+			} else {
+				seen.add(bot);
+				players.add(player);
+			}
+		}
+
+		// Every pair, by distance: {distance squared, bot, spot}.
+		final List<double[]> pairs = new ArrayList<double[]>(seen.size() * spots.size());
+
+		for (int b = 0; b < seen.size(); b++) {
+			for (int s = 0; s < spots.size(); s++) {
+				final BlockPos spot = spots.get(s);
+				pairs.add(new double[] {players.get(b).squaredDistanceTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5), b, s});
+			}
+		}
+
+		pairs.sort((x, y) -> Double.compare(x[0], y[0]));
+		final Map<String, BlockPos> assigned = new java.util.LinkedHashMap<String, BlockPos>();
+		final boolean[] taken = new boolean[spots.size()];
+
+		for (double[] pair : pairs) {
+			final String bot = seen.get((int) pair[1]);
+			final int spot = (int) pair[2];
+
+			if (taken[spot] || assigned.containsKey(bot)) {
+				continue;
+			}
+
+			taken[spot] = true;
+			assigned.put(bot, spots.get(spot));
+		}
+
+		int next = 0;
+
+		for (String bot : unseen) {
+			while (next < spots.size() && taken[next]) {
+				next++;
+			}
+
+			if (next == spots.size()) {
+				break;
+			}
+
+			taken[next] = true;
+			assigned.put(bot, spots.get(next));
+		}
+
+		return assigned;
 	}
 
 	private static boolean solid(World world, BlockPos pos) {
