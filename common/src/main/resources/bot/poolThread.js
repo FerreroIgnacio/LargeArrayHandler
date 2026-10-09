@@ -16,14 +16,17 @@ const bots = new Map()
 const scope = `node.thread:pool:${workerData.index}`
 const prof = threadProfiler(scope)
 
-// The time a game tick leaves to the pathfinders of this thread, ms: pathfinder's own tickTimeout
-// for a lone bot. The bots of a thread share it, so each gets its part (at least 1 ms) and a
-// search is cut into as many partial paths as it takes; they take turns, which costs more the more
-// bots there are. Set again each time a bot comes or goes.
-const TICK_BUDGET_MS = 40
+// The time a game tick leaves to the pathfinders of this thread, ms: under pathfinder's own 40 for
+// a lone bot, so the 50 ms tick keeps room for the bots' physics and packets. The bots searching
+// share it, so each gets its part (at least 1 ms) and a search is cut into as many partial paths as
+// it takes; they take turns, which costs more the more of them there are. A thread with none
+// searching spends none of it. Set again each time a bot starts or stops searching, comes or goes.
+const TICK_BUDGET_MS = 30
+// The names of the thread's bots whose pathfinder is searching.
+const searching = new Set()
 
 function shareTickTimeout () {
-  const each = Math.max(1, Math.floor(TICK_BUDGET_MS / bots.size))
+  const each = Math.max(1, Math.floor(TICK_BUDGET_MS / Math.max(1, searching.size)))
   for (const bot of bots.values()) bot.setTickTimeout(each)
 }
 
@@ -87,8 +90,14 @@ parentPort.on('message', message => {
       chunks,
       send,
       report: m => report({ bot: name, ...m }),
+      onSearching: now => {
+        if (now) searching.add(name)
+        else searching.delete(name)
+        shareTickTimeout()
+      },
       onEnd: () => {
         bots.delete(name)
+        searching.delete(name)
         if (bots.size > 0) shareTickTimeout()
         report({ bot: name, end: true })
       }

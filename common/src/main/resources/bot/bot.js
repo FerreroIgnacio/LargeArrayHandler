@@ -11,8 +11,9 @@ const states = require('./states')
 const { botMeter } = require('./profiler')
 
 // send(frame) writes to the mod, report(message) tells the fleet, onEnd() once the bot is gone and
-// its last frame sent; chunks holds the columns of its thread (see sharedChunks.js).
-module.exports = function startBot ({ name, host, port, chunks, send, report, onEnd }) {
+// its last frame sent, onSearching(searching) each time its pathfinder starts or stops searching;
+// chunks holds the columns of its thread (see sharedChunks.js).
+module.exports = function startBot ({ name, host, port, chunks, send, report, onEnd, onSearching }) {
   const server = `${host}:${port}`
   // Always the fewest chunks it can ask for; a 1.12.2 server (a LAN world) sends its own view distance whatever it asks.
   const bot = mineflayer.createBot({ username: name, host, port, viewDistance: 2, auth: 'offline' })
@@ -112,14 +113,44 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     const g = bot.pathfinder.goal
     return g ? { x: g.x, y: g.y, z: g.z } : null
   }
+  // What the mod draws now: { target, coords: the nodes' blocks, x y z each }, null when nothing.
+  // A PATH goes only when that changes: a search's partials are mostly the same path tick after
+  // tick, and comparing them costs less than putting one in a frame.
+  let drawn = null
+  function drawPath (target, nodes) {
+    const coords = new Int32Array(nodes.length * 3)
+    nodes.forEach((n, i) => {
+      coords[i * 3] = Math.floor(n.x)
+      coords[i * 3 + 1] = Math.floor(n.y)
+      coords[i * 3 + 2] = Math.floor(n.z)
+    })
+    if (drawn && drawn.target.x === target.x && drawn.target.y === target.y && drawn.target.z === target.z &&
+        drawn.coords.length === coords.length && drawn.coords.every((c, i) => c === coords[i])) return
+    drawn = { target, coords }
+    out(protocol.path(name, target, nodes))
+  }
+  function clearPath () {
+    if (!drawn) return
+    drawn = null
+    out(protocol.path(name, null))
+  }
+  // Whether its pathfinder is searching: from a goto or a reset until a search is over (success or
+  // noPath) or the walk ends; a search pathfinder starts on its own shows as a partial.
+  let searching = false
+  const setSearching = now => {
+    if (now === searching) return
+    searching = now
+    onSearching(now)
+  }
   bot.on('path_update', result => {
+    setSearching(result.status === 'partial')
     if (result.status === 'noPath') log('no path' + (result.reason ? ` (${result.reason})` : ''))
     // Every search once it is over, with how long it took (taking turns with the other searches of the
     // thread included); not its parts while it goes on, one a tick.
     if (result.status !== 'partial') log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
     const target = goalOf()
-    if (result.status === 'noPath' || !target) out(protocol.path(name, null))
-    else out(protocol.path(name, target, result.path))
+    if (result.status === 'noPath' || !target) clearPath()
+    else drawPath(target, result.path)
   })
   // For debugging the paths drawn: where the bot stands and where it is going each time a path ends.
   const at = () => {
@@ -128,16 +159,19 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   }
   const spot = g => g ? `${g.x},${g.y},${g.z}` : 'none'
   bot.on('goal_reached', goal => {
+    setSearching(false)
     log(`goal reached at ${at()} (goal ${spot(goal)})`)
-    out(protocol.path(name, null))
+    clearPath()
   })
   bot.on('path_stop', () => {
+    setSearching(false)
     log(`path stopped at ${at()} (goal ${spot(goalOf())})`)
-    out(protocol.path(name, null))
+    clearPath()
   })
   bot.on('path_reset', reason => {
+    setSearching(true)
     log(`path reset (${reason}) at ${at()} (goal ${spot(goalOf())})`)
-    out(protocol.path(name, null))
+    clearPath()
   })
 
   bot.on('kicked', reason => log('kicked: ' + reason))
@@ -209,6 +243,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
 
     // Walks to the spot: its own search, from where it stands.
     goto (spot) {
+      setSearching(true)
       log(`goto ${spot.x},${spot.y},${spot.z} from ${at()}`)
       bot.pathfinder.setGoal(new goals.GoalBlock(spot.x, spot.y, spot.z))
     }

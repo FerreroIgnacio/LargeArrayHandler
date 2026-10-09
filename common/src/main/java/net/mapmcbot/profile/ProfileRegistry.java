@@ -35,7 +35,8 @@ import net.mapmcbot.fleet.FleetChannel;
  * its refresh, the player leaving the world), every FRAMES_PER_PROFILE frames through the channel,
  * and when the fleet takes one on an event of its own (a bot in a world or gone):
  * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
- * the mod's part alone.
+ * the mod's part alone. Each relay answers every request with its own, logged with its rows scoped
+ * "relay<rid>." before the fleet's own scopes.
  *
  * Thread-safe: the channel thread feeds it, anyone may read it.
  *
@@ -189,7 +190,9 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 			relayBase.put(rid, base);
 		}
 
-		relayLatest.put(rid, new ProfileReport(now, reason, ProfileReport.parse(text), base));
+		final ProfileReport report = new ProfileReport(now, reason, ProfileReport.parse(text), base);
+		relayLatest.put(rid, report);
+		writeRelay(rid, report);
 	}
 
 	@Override
@@ -298,6 +301,32 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 			for (String scope : report.scopes("")) {
 				for (ProfileReport.Row row : report.rows(scope).values()) {
 					log.write(time + "\t" + reason + "\t" + scope + "\t" + row.getName() + "\t" + row.getUnit() + "\t" + number(row.getValue())
+							+ "\t" + (Double.isNaN(row.getRate()) ? "" : number(row.getRate())));
+					log.newLine();
+				}
+			}
+
+			log.flush();
+		} catch (IOException e) {
+			throw new UncheckedIOException("could not write " + logFile, e);
+		}
+	}
+
+	/** A relay's report in the log as the mod's: its summary line, then its rows, scoped "relay<rid>.". */
+	private void writeRelay(int rid, ProfileReport report) {
+		final String time = LocalDateTime.ofInstant(Instant.ofEpochMilli(report.getTime()), ZoneId.systemDefault()).toString();
+		final String reason = report.getReason().replace('\t', ' ').replace('\n', ' ');
+		final String prefix = "relay" + rid + ".";
+
+		try {
+			log.write("# " + time + " " + prefix + " " + reason + ": " + String.format(Locale.ROOT, "node cpu %s, rss %s, bots %d%s",
+					cpu(report, "node", "cpu.user", "cpu.system"), megabytes(report.value("node", "mem.rss")), (int) report.value("node", "bots"),
+					report.hasRates() ? String.format(Locale.ROOT, " | over %.1f s", report.getInterval() / 1000.0) : ""));
+			log.newLine();
+
+			for (String scope : report.scopes("")) {
+				for (ProfileReport.Row row : report.rows(scope).values()) {
+					log.write(time + "\t" + reason + "\t" + prefix + scope + "\t" + row.getName() + "\t" + row.getUnit() + "\t" + number(row.getValue())
 							+ "\t" + (Double.isNaN(row.getRate()) ? "" : number(row.getRate())));
 					log.newLine();
 				}
