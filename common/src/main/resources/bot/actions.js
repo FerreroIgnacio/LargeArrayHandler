@@ -8,6 +8,7 @@ const { Vec3 } = require('vec3')
 const { goals } = require('mineflayer-pathfinder')
 const nbt = require('prismarine-nbt')
 const { once } = require('events')
+const conv = require('mineflayer/lib/conversions')
 
 const REACH_BLOCK = 4.5
 const REACH_ENTITY = 3
@@ -562,22 +563,24 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     }
   }
 
-  // A shift click sent carrying an item no slot holds (127 of them): the server rejects it, its own move
-  // done all the same, and sends the whole window and the cursor. The window is then the server's,
-  // whatever mineflayer's copy (prismarine-windows) would have made of the move, which is not the
-  // server's for most windows; an accepted click the server never corrects.
+  // A click (a shift click, mode 1; a throw, mode 4) sent carrying an item no slot holds (127 of them):
+  // the server rejects it, its own move done all the same, and sends the whole window and the cursor.
+  // The window is then the server's, whatever mineflayer's copy (prismarine-windows) would have made of
+  // the move, which is not the server's for most windows (and has no throw); an accepted click the
+  // server never corrects.
   const UNHELD = { blockId: 1, itemCount: 127, itemDamage: 0 }
-  async function shiftClick (window, slot, button = 0) {
+  async function syncedClick (window, slot, button, mode) {
     const synced = resyncs
     try {
-      await rawClick(window, slot, button, 1, UNHELD)
+      await rawClick(window, slot, button, mode, UNHELD)
     } catch (e) {
       if (!e.rejected) throw e
       if (resyncs === synced) await once(bot, 'windowResync')
       return
     }
-    throw new Error(`expected the server to reject the shift click on slot ${slot} carrying ${UNHELD.itemCount} of an item, it took it: the window is not the server's`)
+    throw new Error(`expected the server to reject the click (mode ${mode}) on slot ${slot} carrying ${UNHELD.itemCount} of an item, it took it: the window is not the server's`)
   }
+  const shiftClick = (window, slot, button = 0) => syncedClick(window, slot, button, 1)
 
   // The armor slot (5 to 8) or the offhand (45) of the inventory window an item goes to, as the server
   // sees it (MobEntity's slot for it); null for none.
@@ -1012,6 +1015,45 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
+  // Turns to a.yaw and a.pitch, in degrees as the game has them (yaw 0 south, growing towards west;
+  // pitch 90 straight down), at the order's speed: done once the server has seen it get there.
+  async function lookAt (action, a) {
+    const yaw = required(a.yaw, 'yaw')
+    const pitch = required(a.pitch, 'pitch')
+    if (!Number.isFinite(yaw)) throw new Error(`yaw must be a number of degrees, got ${a.yaw}`)
+    if (!Number.isFinite(pitch) || pitch < -90 || pitch > 90) throw new Error(`pitch must be degrees from -90 to 90, got ${a.pitch}`)
+    setTurnSpeed(turnSpeedOf(a))
+    action.cleanups.push(() => setTurnSpeed(DEFAULT_TURN_SPEED))
+    await bot.look(conv.fromNotchianYaw(yaw), conv.fromNotchianPitch(pitch), false)
+    if (!action.over) done(action)
+  }
+
+  // Throws the whole stack of each slot of a.slots (the open window's, or the inventory's with none)
+  // where the bot looks, one throw (ctrl+Q) a slot, the window as the server has it after each (see
+  // syncedClick). An empty slot is passed by; one still holding its stack after its throw fails it.
+  // The window closed under it fails it there.
+  async function drop (action, a) {
+    const window = slotWindow()
+    listen(action, bot, 'windowClose', closed => {
+      if (closed === window) fail(action, 'the window was closed while dropping')
+    })
+    if (!Array.isArray(a.slots) || a.slots.length === 0) throw new Error('slots must list one or more slots')
+    const slots = [...new Set(a.slots.map((s, i) => slotOf(window, s, `slots[${i}]`)))]
+    if (window.selectedItem) throw new Error(`expected an empty cursor to throw from slots, found ${describeItem(window.selectedItem)}`)
+    let dropped = 0
+    for (const slot of slots) {
+      const item = window.slots[slot]
+      if (!item) continue
+      await syncedClick(window, slot, 1, 4)
+      if (action.over) return
+      const left = window.slots[slot]
+      if (left && sameItem(left, item) && left.count === item.count) throw new Error(`expected slot ${slot} emptied by its throw, found ${describeItem(left)} still on it`)
+      dropped += item.count - (left && sameItem(left, item) ? left.count : 0)
+    }
+    log(`drop threw ${dropped} items off ${slots.length} slots`)
+    done(action)
+  }
+
   // --- E. stop
 
   // Whatever it was doing gone, as any primitive that comes takes over: a walk stopped, a dig
@@ -1020,7 +1062,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
-  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, stop }
+  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, look_at: lookAt, drop, stop }
 
   // Dying takes what it was doing with it: the primitive canceled by the death, a walk stopped with it.
   bot.on('death', () => {

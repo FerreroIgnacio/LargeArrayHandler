@@ -101,6 +101,8 @@ public class BotScreen extends HandledScreen {
 			{"Grab", null},
 			{"Deposit", null},
 			{"Index", null},
+			{"Look at", "#lookat %s"},
+			{"Drop", null},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
@@ -163,7 +165,7 @@ public class BotScreen extends HandledScreen {
 	 * wait's item, the slot holding the item it waits for; or the hotbar slot to take into its hand.
 	 */
 	private enum Pick {
-		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, DEPOSIT_ITEM, DEPOSIT, INDEX
+		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, DEPOSIT_ITEM, DEPOSIT, INDEX, DROP
 	}
 
 	private Pick pick = Pick.NONE;
@@ -323,7 +325,7 @@ public class BotScreen extends HandledScreen {
 	private void launch(int index) {
 		if (ACTIONS[index][1] == null) {
 			final String label = ACTIONS[index][0];
-			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : Pick.WAIT;
+			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : label.equals("Drop") ? Pick.DROP : Pick.WAIT;
 			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS) || (start == Pick.GRAB_ITEM && pick == Pick.GRAB) || (start == Pick.DEPOSIT_ITEM && pick == Pick.DEPOSIT);
 			resetPick();
 
@@ -962,6 +964,7 @@ public class BotScreen extends HandledScreen {
 				: pick == Pick.DEPOSIT_ITEM ? "Deposit: click or drag over the slots holding the items to deposit"
 				: pick == Pick.DEPOSIT ? "Deposit: the slots, the area to leave them in and how many"
 				: pick == Pick.INDEX ? "Index: the area whose chests to look in"
+				: pick == Pick.DROP ? "Drop: click or drag over the slots to throw"
 				: "Wait: click the slots to wait on, an item to change it";
 		textRenderer.drawWithShadow(prompt, x, top, TEXT);
 		int rowY = top + 12;
@@ -997,6 +1000,15 @@ public class BotScreen extends HandledScreen {
 			startButton.x = x;
 			startButton.y = rowY + 2;
 			startButton.active = !waits.isEmpty();
+			startButton.method_891(client, mouseX, mouseY, 0);
+		}
+
+		if (pick == Pick.DROP) {
+			textRenderer.drawWithShadow("slots " + fillTargets, x, rowY + 2, DIM);
+			rowY += 12;
+			startButton.x = x;
+			startButton.y = rowY + 2;
+			startButton.active = !fillTargets.isEmpty();
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
@@ -1065,7 +1077,7 @@ public class BotScreen extends HandledScreen {
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
-		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS || pick == Pick.GRAB || pick == Pick.DEPOSIT || pick == Pick.INDEX ? x + BUTTON_WIDTH + 1 : x;
+		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS || pick == Pick.DROP || pick == Pick.GRAB || pick == Pick.DEPOSIT || pick == Pick.INDEX ? x + BUTTON_WIDTH + 1 : x;
 		cancelButton.y = rowY + 2;
 		cancelButton.method_891(client, mouseX, mouseY, 0);
 
@@ -1166,6 +1178,8 @@ public class BotScreen extends HandledScreen {
 			case INDEX:
 				return;
 
+			// The slots to throw, picked as a fill's targets.
+			case DROP:
 			case FILL_TARGETS:
 				fillDrag = !fillTargets.contains(slot);
 				dragOver(slot);
@@ -1912,7 +1926,7 @@ public class BotScreen extends HandledScreen {
 			final Slot hovered = slotAt(mouseX, mouseY);
 
 			if (hovered != null && hovered.id != moveFrom) {
-				fillSlot(hovered.id, pick == Pick.MOVE_FROM ? MOVE_FROM : pick == Pick.MOVE_TO ? MOVE_TO : pick == Pick.WAIT ? WAITED : pick == Pick.HOTBAR ? HOTBAR : pick == Pick.FILL_ITEM ? WAIT_ITEM : pick == Pick.FILL_TARGETS ? MOVE_TO : WAIT_ITEM);
+				fillSlot(hovered.id, pick == Pick.MOVE_FROM ? MOVE_FROM : pick == Pick.MOVE_TO ? MOVE_TO : pick == Pick.WAIT ? WAITED : pick == Pick.HOTBAR ? HOTBAR : pick == Pick.FILL_ITEM ? WAIT_ITEM : pick == Pick.FILL_TARGETS || pick == Pick.DROP ? MOVE_TO : WAIT_ITEM);
 			}
 		}
 
@@ -2014,6 +2028,21 @@ public class BotScreen extends HandledScreen {
 
 			if (button == 0 && pick == Pick.FILL_TARGETS && !fillTargets.isEmpty() && startButton.isMouseOver(client, mouseX, mouseY)) {
 				startFill();
+				return;
+			}
+
+			if (button == 0 && pick == Pick.DROP && !fillTargets.isEmpty() && startButton.isMouseOver(client, mouseX, mouseY)) {
+				final JsonObject a = new JsonObject();
+				a.addProperty("action", "drop");
+				final JsonArray slots = new JsonArray();
+
+				for (int slot : fillTargets) {
+					slots.add(slot);
+				}
+
+				a.add("slots", slots);
+				resetPick();
+				bots.action(selected, a.toString());
 				return;
 			}
 

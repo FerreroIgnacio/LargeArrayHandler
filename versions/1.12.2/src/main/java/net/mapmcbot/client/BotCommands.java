@@ -29,6 +29,8 @@ import net.minecraft.util.math.BlockPos;
  *     SLOT,MIN,exact,NAME,META[,NBT]    that very item, its metadata and NBT (hex) too (a potion's kind)
  * #hotbar BOT SLOT                     the hotbar slot SLOT into its hand
  * #trade BOT TRADE                     the trade TRADE of the open villager window (its arrows)
+ * #lookat BOT                          turned to look where the player looks now
+ * #drop BOT SLOT...                    the whole stack of each slot SLOT thrown where it looks
  * #stop BOT                            whatever it is doing stopped, then idle
  * #status BOT
  * </pre>
@@ -44,7 +46,7 @@ final class BotCommands {
 		final String[] words = line.trim().split("\\s+");
 		final String command = words[0];
 
-		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#stop", "#status").contains(command)) {
+		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#stop", "#status").contains(command)) {
 			return false;
 		}
 
@@ -181,6 +183,28 @@ final class BotCommands {
 				a.addProperty("slot", number(w[2], "SLOT"));
 				bots.action(bot, a.toString());
 				return;
+
+			case "#lookat":
+				a.addProperty("action", "look_at");
+				a.addProperty("yaw", client.player.yaw);
+				a.addProperty("pitch", client.player.pitch);
+				bots.action(bot, a.toString());
+				return;
+
+			case "#drop": {
+				if (w.length < 3) {
+					throw new IllegalArgumentException("#drop BOT SLOT...");
+				}
+
+				a.addProperty("action", "drop");
+				final JsonArray slots = new JsonArray();
+				for (int i = 2; i < w.length; i++) {
+					slots.add(number(w[i], "SLOT"));
+				}
+				a.add("slots", slots);
+				bots.action(bot, a.toString());
+				return;
+			}
 
 			case "#trade":
 				if (w.length != 3) {
