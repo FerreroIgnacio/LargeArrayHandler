@@ -170,6 +170,8 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		errors.remove(bot);
+		// A grab going on is over, this one in its place.
+		takeOver(bot);
 
 		if (area == null) {
 			fail(bot, null, listener, a.get("action").getAsString() + ": no area " + areaId);
@@ -184,9 +186,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 
 			final Task task = new Task(area, null, 0, false, 0, false, listener);
 
-			if (tasks.putIfAbsent(bot, task) != null) {
-				throw new IllegalStateException(bot + " is already grabbing or indexing");
-			}
+			tasks.put(bot, task);
 
 			chests.scan(area);
 			nextChest(bot, task);
@@ -249,9 +249,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 
 		final Task task = new Task(area, items, count, full, had, deposit, listener);
 
-		if (tasks.putIfAbsent(bot, task) != null) {
-			throw new IllegalStateException(bot + " is already grabbing");
-		}
+		tasks.put(bot, task);
 
 		chests.scan(area);
 		nextChest(bot, task);
@@ -471,9 +469,16 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		errors.remove(bot);
+		takeOver(bot);
+	}
+
+	/**
+	 * The bot's grab going on, if any, over: an order from outside (a primitive, another grab started
+	 * by hand or by a job) takes the bot over, its own primitives replacing the grab's on the fleet.
+	 */
+	private void takeOver(String bot) {
 		final Task task = tasks.remove(bot);
 
-		// An order from outside takes the bot over: the grab is over.
 		if (task != null) {
 			task.listener.failed();
 		}

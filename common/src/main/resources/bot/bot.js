@@ -327,8 +327,10 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   // clickWindow would send the slot's. Each under an action number of its own, counting down from
   // -1 (mineflayer's count up from 1): mineflayer answers their transactions as ones it did not
   // send, accepted, which the server takes as nothing. Done once the server confirms it; a click it
-  // rejects is fatal, as mineflayer's (its error rejected). Also the shift clicks, carrying item (see
-  // actions.js shiftClick).
+  // rejects is fatal, as mineflayer's (its error rejected). Also the mod's other clicks and the
+  // fleet's shift clicks and throws, carrying item (see actions.js syncedClick). The server ignores a
+  // click on a window it has closed: one pending as its window closes fails then (its error closed),
+  // when sent closable (the item carrying ones, each awaited; a drag's are not).
   let rawAction = 0
   const rawPending = new Map()
   bot._client.on('transaction', ({ windowId, action, accepted }) => {
@@ -338,11 +340,18 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     if (accepted) pending.resolve()
     else pending.reject(Object.assign(new Error(`${name}: the server rejected click ${pending.what} on window ${windowId}`), { rejected: true }))
   })
-  function rawClick (window, slot, button, mode, item = { blockId: -1 }) {
+  bot.on('windowClose', window => {
+    for (const [action, pending] of rawPending) {
+      if (pending.windowId !== window.id || !pending.closable) continue
+      rawPending.delete(action)
+      pending.reject(Object.assign(new Error(`${name}: window ${window.id} closed before the server answered click ${pending.what}`), { closed: true }))
+    }
+  })
+  function rawClick (window, slot, button, mode, item = { blockId: -1 }, closable = false) {
     rawAction = rawAction === -32768 ? -1 : rawAction - 1
     const action = rawAction
     const done = new Promise((resolve, reject) => {
-      rawPending.set(action, { windowId: window.id, what: `slot ${slot}, button ${button}, mode ${mode}`, resolve, reject })
+      rawPending.set(action, { windowId: window.id, what: `slot ${slot}, button ${button}, mode ${mode}`, closable, resolve, reject })
     })
     bot._client.write('window_click', { windowId: window.id, slot, mouseButton: button, action, mode, item })
     return done
@@ -443,12 +452,17 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       done()
       return
     }
-    if (mode === 1) {
-      // Rejected on purpose, the window the server's after it (see actions.js shiftClick).
-      await act.shiftClick(window, slot, button)
-      return
+    // The rest (0 to 4) rejected on purpose, the window the server's after each (see actions.js
+    // syncedClick): prismarine-windows' guess of a click is not the server's for most windows (a
+    // crafting grid used up by taking its result, a shift click, a throw), and the server never
+    // corrects one it accepted. A window closed before the server answered (it ignores the click
+    // then) leaves the click undone: the window's close goes to the mod as ever.
+    try {
+      await act.syncedClick(window, slot, button, mode)
+    } catch (e) {
+      if (!e.closed) throw e
+      log(e.message)
     }
-    await bot.clickWindow(slot, button, mode)
   }
 
   // The bot's open window for the mod: sent whole once anything in it changed, once per turn.

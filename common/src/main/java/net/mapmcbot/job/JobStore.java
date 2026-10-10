@@ -87,6 +87,26 @@ public final class JobStore {
 			}
 		}
 
+		/** Puts a copy of the step at index right after it. */
+		public void duplicate(int index) {
+			synchronized (JobStore.this) {
+				steps.add(index + 1, steps.get(index));
+				save();
+			}
+		}
+
+		/** Takes the step at from and puts it where to is, the others making room. */
+		public void moveTo(int from, int to) {
+			synchronized (JobStore.this) {
+				if (from == to || from < 0 || to < 0 || from >= steps.size() || to >= steps.size()) {
+					return;
+				}
+
+				steps.add(to, steps.remove(from));
+				save();
+			}
+		}
+
 		/** Moves the step at index by delta places; the ends stay where they are. */
 		public void move(int index, int delta) {
 			synchronized (JobStore.this) {

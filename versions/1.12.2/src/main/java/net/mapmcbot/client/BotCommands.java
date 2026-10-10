@@ -31,6 +31,7 @@ import net.minecraft.util.math.BlockPos;
  * #trade BOT TRADE                     the trade TRADE of the open villager window (its arrows)
  * #lookat BOT                          turned to look where the player looks now
  * #drop BOT SLOT...                    the whole stack of each slot SLOT thrown where it looks
+ * #shiftmove BOT SLOT                  slot SLOT shift-clicked: its stack to the window's other part
  * #stop BOT                            whatever it is doing stopped, then idle
  * #status BOT
  * </pre>
@@ -46,7 +47,7 @@ final class BotCommands {
 		final String[] words = line.trim().split("\\s+");
 		final String command = words[0];
 
-		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#stop", "#status").contains(command)) {
+		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#shiftmove", "#stop", "#status").contains(command)) {
 			return false;
 		}
 
@@ -205,6 +206,16 @@ final class BotCommands {
 				bots.action(bot, a.toString());
 				return;
 			}
+
+			case "#shiftmove":
+				if (w.length != 3) {
+					throw new IllegalArgumentException("#shiftmove BOT SLOT");
+				}
+
+				a.addProperty("action", "shift_move");
+				a.addProperty("slot", number(w[2], "SLOT"));
+				bots.action(bot, a.toString());
+				return;
 
 			case "#trade":
 				if (w.length != 3) {

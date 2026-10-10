@@ -103,6 +103,7 @@ public class BotScreen extends HandledScreen {
 			{"Index", null},
 			{"Look at", "#lookat %s"},
 			{"Drop", null},
+			{"Shift move", null},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
@@ -158,6 +159,9 @@ public class BotScreen extends HandledScreen {
 	private static final int RECORDING = 0xE0803030;
 	private static final int RECORD_DOT = 0xFFE04040;
 	private static final int DANGER = 0xFFFF6060;
+	private static final int ACCENT = 0xFF4C9AFF;
+	private static final int PANEL_EDGE = 0xFF2A3038;
+	private static final int STEP_BUTTONS = 2;
 
 	/**
 	 * What a click on a slot does instead of reaching the bot: move's origin then its destination, or a
@@ -165,7 +169,7 @@ public class BotScreen extends HandledScreen {
 	 * wait's item, the slot holding the item it waits for; or the hotbar slot to take into its hand.
 	 */
 	private enum Pick {
-		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, DEPOSIT_ITEM, DEPOSIT, INDEX, DROP
+		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, DEPOSIT_ITEM, DEPOSIT, INDEX, DROP, SHIFT
 	}
 
 	private Pick pick = Pick.NONE;
@@ -199,6 +203,10 @@ public class BotScreen extends HandledScreen {
 	private TextFieldWidget jobName;
 	/** The first step card shown in the job panel. */
 	private int jobScroll;
+	/** The step card being dragged to another place, -1 for none, and whether the mouse has moved enough to count as a drag. */
+	private int dragStep = -1;
+	private int dragFromY;
+	private boolean dragging;
 	/** Whether Delete was pressed and the next click on it deletes the job; any other click takes it back. */
 	private boolean deleting;
 
@@ -325,7 +333,7 @@ public class BotScreen extends HandledScreen {
 	private void launch(int index) {
 		if (ACTIONS[index][1] == null) {
 			final String label = ACTIONS[index][0];
-			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : label.equals("Drop") ? Pick.DROP : Pick.WAIT;
+			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : label.equals("Drop") ? Pick.DROP : label.equals("Shift move") ? Pick.SHIFT : Pick.WAIT;
 			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS) || (start == Pick.GRAB_ITEM && pick == Pick.GRAB) || (start == Pick.DEPOSIT_ITEM && pick == Pick.DEPOSIT);
 			resetPick();
 
@@ -629,6 +637,7 @@ public class BotScreen extends HandledScreen {
 		final List<String> steps = shown.getSteps();
 		final int left = jobLeft();
 		final int onStep = selected == null || job.jobOf(selected) != shown ? -1 : job.stepOf(selected);
+		fill(left - 5, MARGIN - 5, left + JOB_WIDTH + 5, height - MARGIN + 5, PANEL_EDGE);
 		fill(left - 4, MARGIN - 4, left + JOB_WIDTH + 4, height - MARGIN + 4, JOB_BACKGROUND);
 
 		// The header: the arrows, the one past the last making a new job, and the name between them.
@@ -644,7 +653,7 @@ public class BotScreen extends HandledScreen {
 		final boolean overDelete = over(mouseX, mouseY, deleteLeft, info, DELETE_WIDTH, 12);
 		fill(deleteLeft, info, left + JOB_WIDTH, info + 12, deleting ? RECORDING : overDelete ? CARD_SELECTED : CARD);
 		drawCenteredString(textRenderer, deleting ? "Sure?" : "Delete", deleteLeft + DELETE_WIDTH / 2, info + 2, deleting || overDelete ? DANGER : DIM);
-		fill(left, stepsTop() - 4, left + JOB_WIDTH, stepsTop() - 3, DIVIDER);
+		fill(left, stepsTop() - 4, left + JOB_WIDTH, stepsTop() - 3, ACCENT);
 
 		jobScroll = Math.max(0, Math.min(jobScroll, steps.size() - visibleSteps()));
 		String tooltip = null;
@@ -654,28 +663,54 @@ public class BotScreen extends HandledScreen {
 			drawCenteredString(textRenderer, "Record one below", left + JOB_WIDTH / 2, stepsTop() + 28, DIM);
 		}
 
+		int dropAt = -1;
+
+		if (dragging && dragStep >= 0) {
+			dropAt = Math.max(0, Math.min(steps.size() - 1, jobScroll + (mouseY - stepsTop()) / (STEP_HEIGHT + 2)));
+		}
+
 		for (int i = jobScroll; i < steps.size() && i < jobScroll + visibleSteps(); i++) {
 			final int top = stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2);
 			final String[] text = describe(steps.get(i));
-			final boolean overCard = over(mouseX, mouseY, left, top, JOB_WIDTH, STEP_HEIGHT);
+			final boolean overCard = !dragging && over(mouseX, mouseY, left, top, JOB_WIDTH, STEP_HEIGHT);
+			final boolean lifted = dragging && i == dragStep;
 			fill(left, top, left + JOB_WIDTH, top + STEP_HEIGHT, i == onStep ? STEP_RUNNING : overCard ? CARD_SELECTED : CARD);
-			fill(left, top, left + BADGE_WIDTH, top + STEP_HEIGHT, i == onStep ? BADGE_RUNNING : BADGE);
-			drawCenteredString(textRenderer, String.valueOf(i + 1), left + BADGE_WIDTH / 2, top + (STEP_HEIGHT - 8) / 2, i == onStep ? TEXT : DIM);
+			fill(left, top, left + 2, top + STEP_HEIGHT, i == onStep ? BADGE_RUNNING : overCard ? ACCENT : BADGE);
+			fill(left + 2, top, left + BADGE_WIDTH, top + STEP_HEIGHT, i == onStep ? BADGE_RUNNING : BADGE);
+			drawCenteredString(textRenderer, String.valueOf(i + 1), left + BADGE_WIDTH / 2 + 1, top + (STEP_HEIGHT - 8) / 2, i == onStep ? TEXT : DIM);
 
 			// The little buttons only on the card under the mouse, the title having the card's width otherwise.
 			final int textWidth = JOB_WIDTH - BADGE_WIDTH - 8;
-			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[0], textWidth - (overCard ? 3 * (STEP_BUTTON + 1) + 2 : 0)), left + BADGE_WIDTH + 4, top + 3, TEXT);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[0], textWidth - (overCard ? STEP_BUTTONS * (STEP_BUTTON + 1) + 2 : 0)), left + BADGE_WIDTH + 4, top + 3, lifted ? DIM : TEXT);
 			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[1], textWidth), left + BADGE_WIDTH + 4, top + 14, DIM);
 
+			if (lifted) {
+				fill(left, top, left + JOB_WIDTH, top + STEP_HEIGHT, 0x80000000);
+			}
+
 			if (overCard) {
-				drawStepButton(left, top, 0, "^", mouseX, mouseY);
-				drawStepButton(left, top, 1, "v", mouseX, mouseY);
-				drawStepButton(left, top, 2, "x", mouseX, mouseY);
+				drawStepButton(left, top, 0, "+", mouseX, mouseY);
+				drawStepButton(left, top, 1, "x", mouseX, mouseY);
 
 				if (stepButtonAt(left, top, mouseX, mouseY) < 0) {
 					tooltip = text[0] + " " + text[1];
 				}
 			}
+		}
+
+		// Where the dragged card would land: a line over the card it takes the place of.
+		if (dropAt >= 0 && dropAt != dragStep && dropAt >= jobScroll && dropAt < jobScroll + visibleSteps()) {
+			final int lineTop = stepsTop() + (dropAt - jobScroll) * (STEP_HEIGHT + 2) + (dropAt > dragStep ? STEP_HEIGHT : -1);
+			fill(left, lineTop, left + JOB_WIDTH, lineTop + 2, ACCENT);
+		}
+
+		if (dragging && dragStep >= 0 && dragStep < steps.size()) {
+			final String[] text = describe(steps.get(dragStep));
+			final int ghostTop = mouseY - STEP_HEIGHT / 2;
+			fill(left, ghostTop, left + JOB_WIDTH, ghostTop + STEP_HEIGHT, 0xE0303A48);
+			fill(left, ghostTop, left + 2, ghostTop + STEP_HEIGHT, ACCENT);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[0], JOB_WIDTH - BADGE_WIDTH - 8), left + BADGE_WIDTH + 4, ghostTop + 3, TEXT);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[1], JOB_WIDTH - BADGE_WIDTH - 8), left + BADGE_WIDTH + 4, ghostTop + 14, DIM);
 		}
 
 		// A scroll bar at the right edge while not every step fits.
@@ -692,6 +727,7 @@ public class BotScreen extends HandledScreen {
 		final boolean armed = job.isArmed();
 		final int recordTop = recordTop();
 		fill(left, recordTop, left + JOB_WIDTH, recordTop + RECORD_HEIGHT, armed ? RECORDING : overRecord(mouseX, mouseY) ? CARD_SELECTED : CARD);
+		fill(left, recordTop, left + JOB_WIDTH, recordTop + 1, armed ? RECORD_DOT : ACCENT);
 		fill(left + 8, recordTop + 7, left + 14, recordTop + 13, armed ? TEXT : RECORD_DOT);
 
 		drawCenteredString(textRenderer, armed ? "Recording: do a primitive" : "Record step", left + JOB_WIDTH / 2 + 6, recordTop + 6, TEXT);
@@ -708,14 +744,14 @@ public class BotScreen extends HandledScreen {
 		drawCenteredString(textRenderer, label, left + ARROW_WIDTH / 2, MARGIN + 5, active ? TEXT : DIM);
 	}
 
-	/** The left edge of a card's little button: up, down and delete in a row at its top right. */
+	/** The left edge of a card's little button: duplicate and delete in a row at its top right. */
 	private static int stepButtonLeft(int left, int index) {
-		return left + JOB_WIDTH - 2 - (3 - index) * (STEP_BUTTON + 1) + 1;
+		return left + JOB_WIDTH - 2 - (STEP_BUTTONS - index) * (STEP_BUTTON + 1) + 1;
 	}
 
 	/** The card's little button under the mouse, -1 for none. */
 	private static int stepButtonAt(int left, int top, int mouseX, int mouseY) {
-		for (int index = 0; index < 3; index++) {
+		for (int index = 0; index < STEP_BUTTONS; index++) {
 			if (over(mouseX, mouseY, stepButtonLeft(left, index), top + 2, STEP_BUTTON, STEP_BUTTON)) {
 				return index;
 			}
@@ -729,7 +765,7 @@ public class BotScreen extends HandledScreen {
 		final int by = top + 2;
 		final boolean overButton = over(mouseX, mouseY, bx, by, STEP_BUTTON, STEP_BUTTON);
 		fill(bx, by, bx + STEP_BUTTON, by + STEP_BUTTON, overButton ? CARD_SELECTED : BADGE);
-		drawCenteredString(textRenderer, label, bx + STEP_BUTTON / 2, by + 1, index == 2 && overButton ? DANGER : TEXT);
+		drawCenteredString(textRenderer, label, bx + STEP_BUTTON / 2, by + 1, index == 1 && overButton ? DANGER : TEXT);
 	}
 
 	private boolean overRecord(int mouseX, int mouseY) {
@@ -799,14 +835,20 @@ public class BotScreen extends HandledScreen {
 			final int which = stepButtonAt(left, stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2), mouseX, mouseY);
 
 			if (which == 0) {
-				shown.move(i, -1);
+				shown.duplicate(i);
 			} else if (which == 1) {
-				shown.move(i, 1);
-			} else if (which == 2) {
 				shown.remove(i);
 			}
 
 			if (which >= 0) {
+				return true;
+			}
+
+			// Anywhere else on a card it is picked up, to be dragged to another place.
+			if (over(mouseX, mouseY, left, stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2), JOB_WIDTH, STEP_HEIGHT)) {
+				dragStep = i;
+				dragFromY = mouseY;
+				dragging = false;
 				return true;
 			}
 		}
@@ -965,6 +1007,7 @@ public class BotScreen extends HandledScreen {
 				: pick == Pick.DEPOSIT ? "Deposit: the slots, the area to leave them in and how many"
 				: pick == Pick.INDEX ? "Index: the area whose chests to look in"
 				: pick == Pick.DROP ? "Drop: click or drag over the slots to throw"
+				: pick == Pick.SHIFT ? "Shift move: click the slot to shift-click"
 				: "Wait: click the slots to wait on, an item to change it";
 		textRenderer.drawWithShadow(prompt, x, top, TEXT);
 		int rowY = top + 12;
@@ -1187,6 +1230,11 @@ public class BotScreen extends HandledScreen {
 
 			case HOTBAR:
 				MapMcBotClient.command("#hotbar " + selected + " " + slot);
+				resetPick();
+				return;
+
+			case SHIFT:
+				MapMcBotClient.command("#shiftmove " + selected + " " + slot);
 				resetPick();
 				return;
 
@@ -2130,6 +2178,11 @@ public class BotScreen extends HandledScreen {
 
 	@Override
 	protected void mouseDragged(int mouseX, int mouseY, int button, long held) {
+		if (dragStep >= 0) {
+			dragging = dragging || Math.abs(mouseY - dragFromY) > 3;
+			return;
+		}
+
 		if (fillDrag != null) {
 			final Slot over = slotAt(mouseX, mouseY);
 
@@ -2148,6 +2201,18 @@ public class BotScreen extends HandledScreen {
 	@Override
 	protected void mouseReleased(int mouseX, int mouseY, int button) {
 		fillDrag = null;
+
+		if (dragStep >= 0) {
+			final JobStore.Job shown = MapMcBotClient.job().getSelected();
+
+			if (dragging) {
+				shown.moveTo(dragStep, Math.max(0, Math.min(shown.size() - 1, jobScroll + (mouseY - stepsTop()) / (STEP_HEIGHT + 2))));
+			}
+
+			dragStep = -1;
+			dragging = false;
+			return;
+		}
 
 		if (selected != null && pick == Pick.NONE) {
 			super.mouseReleased(mouseX, mouseY, button);

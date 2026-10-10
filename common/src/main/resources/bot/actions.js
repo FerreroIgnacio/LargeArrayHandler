@@ -172,7 +172,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   function goto (action, a) {
     // look: a block to stand where one of its faces is in reach and in sight, to interact with it.
     const goal = a.area ? new AreaGoal(a.area)
-      : a.look ? new goals.GoalLookAtBlock(new Vec3(a.look.x, a.look.y, a.look.z), bot.world, { reach: REACH_BLOCK })
+      : a.look ? new LookGoal(new Vec3(a.look.x, a.look.y, a.look.z), bot.world, { reach: REACH_BLOCK })
         : new goals.GoalBlock(required(a.spot, 'spot').x, a.spot.y, a.spot.z)
     const where = a.area ? `area ${at({ x: a.area.minX, y: a.area.minY, z: a.area.minZ })}..${at({ x: a.area.maxX, y: a.area.maxY, z: a.area.maxZ })}`
       : a.look ? `sight of ${at(a.look)}` : at(a.spot)
@@ -216,6 +216,15 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       bot.pathfinder.setGoal(goal)
     })
     listen(action, bot, 'path_stop', () => fail(action, `expected to arrive at ${where}, the walk was stopped at ${stood()}`))
+    // Already there as the pathfinder has it when a walk ends (its feet's block or the one above, see
+    // its monitorMovement): it would not have it so from a standstill, and search for another spot.
+    const feet = bot.entity.position.floored()
+    if (a.look && (goal.isEnd(feet) || goal.isEnd(feet.offset(0, 1, 0)))) {
+      log(`goto: already in sight of ${at(a.look)} at ${stood()}`)
+      arrived = true
+      done(action)
+      return
+    }
     walk(goal)
   }
 
@@ -262,7 +271,16 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   // whatever its shape (a lever, a crop, a slab's upper half); the rest by their collision box, as
   // mineflayer has them: what has none (grass, a torch) is seen through, a fence stands 1.5 high.
   function blockAim (block, faces = FACES) {
-    const from = eyes()
+    const { aims, reasons } = aimsAt(block, eyes(), faces)
+    if (aims.length === 0) {
+      throw new Error(`expected ${full(block.name)} at ${at(block.position)} in reach and in sight, found ${reasons.length ? reasons.join('; ') : 'no face of it turned to the eyes'}`)
+    }
+    return aims.reduce((a, b) => b.distance < a.distance ? b : a)
+  }
+
+  // The faces of the block (of faces) in reach and in sight from eyes at from, as blockAim takes them:
+  // { aims: [{ point, face, distance }], reasons: why each other face is not }.
+  function aimsAt (block, from, faces = FACES) {
     const pos = block.position
     const aims = []
     const reasons = []
@@ -285,10 +303,20 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       }
       aims.push({ point, face, distance })
     }
-    if (aims.length === 0) {
-      throw new Error(`expected ${full(block.name)} at ${at(pos)} in reach and in sight, found ${reasons.length ? reasons.join('; ') : 'no face of it turned to the eyes'}`)
+    return { aims, reasons }
+  }
+
+  // Standing where the block is in reach and in sight as the interact will have it (see blockAim), the
+  // eyes over the middle of the spot: GoalLookAtBlock's own end (its spot's corner 1.6 up to the block's
+  // corner, within reach) misses spots the interact reaches from, a chest three blocks up among them.
+  class LookGoal extends goals.GoalLookAtBlock {
+    isEnd (node) {
+      const block = bot.blockAt(this.pos)
+      if (!block) return false
+      const from = new Vec3(node.x + 0.5, node.y + bot.entity.eyeHeight, node.z + 0.5)
+      if (from.distanceTo(this.pos.offset(0.5, 0.5, 0.5)) > REACH_BLOCK + 1) return false
+      return aimsAt(block, from).aims.length > 0
     }
-    return aims.reduce((a, b) => b.distance < a.distance ? b : a)
   }
 
   function checkEntityReach (entity) {
@@ -444,9 +472,14 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     return window
   }
 
+  // Done once the server has it closed: it never says so, but it takes packets in order, so a click it
+  // rejects (outside the inventory, carrying an item it does not have) answered means the close came
+  // before it. mineflayer's windowClose is its own copy closed, at the moment it sends.
   function closeWindow (action) {
     const window = openWindow('close')
-    listen(action, bot, 'windowClose', () => done(action))
+    listen(action, bot, 'windowClose', () => {
+      syncedClick(bot.inventory, -999, 0, 0).then(() => done(action), e => fail(action, e.message))
+    })
     bot.closeWindow(window)
   }
 
@@ -572,7 +605,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   async function syncedClick (window, slot, button, mode) {
     const synced = resyncs
     try {
-      await rawClick(window, slot, button, mode, UNHELD)
+      await rawClick(window, slot, button, mode, UNHELD, true)
     } catch (e) {
       if (!e.rejected) throw e
       if (resyncs === synced) await once(bot, 'windowResync')
@@ -1028,6 +1061,25 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     if (!action.over) done(action)
   }
 
+  // Shift-clicks slot a.slot (the open window's, or the inventory's with none): its stack moved where the
+  // server puts it (the other part of the window), the window as the server has it after (see
+  // syncedClick). An empty slot fails it; the window closed under it too.
+  async function shiftMove (action, a) {
+    const window = slotWindow()
+    listen(action, bot, 'windowClose', closed => {
+      if (closed === window) fail(action, 'the window was closed while shift-clicking')
+    })
+    const slot = slotOf(window, a.slot, 'slot')
+    const item = window.slots[slot]
+    if (!item) throw new Error(`expected an item on slot ${slot} to shift-click, found none`)
+    if (window.selectedItem) throw new Error(`expected an empty cursor to shift-click, found ${describeItem(window.selectedItem)}`)
+    await shiftClick(window, slot)
+    if (action.over) return
+    const left = window.slots[slot]
+    log(`shift_move moved ${item.count - (left && sameItem(left, item) ? left.count : 0)} of ${describeItem(item)} off slot ${slot}`)
+    done(action)
+  }
+
   // Throws the whole stack of each slot of a.slots (the open window's, or the inventory's with none)
   // where the bot looks, one throw (ctrl+Q) a slot, the window as the server has it after each (see
   // syncedClick). An empty slot is passed by; one still holding its stack after its throw fails it.
@@ -1062,7 +1114,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
-  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, look_at: lookAt, drop, stop }
+  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, look_at: lookAt, drop, shift_move: shiftMove, stop }
 
   // Dying takes what it was doing with it: the primitive canceled by the death, a walk stopped with it.
   bot.on('death', () => {
@@ -1072,7 +1124,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   return {
     windowType,
     cancel,
-    shiftClick,
+    syncedClick,
 
     // An order from the mod: a primitive, run to its end by the events that confirm it. A failure,
     // from the primitive or from what it threw, is the bot's error state, not the process's.
