@@ -65,6 +65,8 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		ChestStore.Chest chest;
 		/** Set before the task is shown (status reads it on the render thread): walking to its first chest. */
 		volatile Phase phase = Phase.WALK;
+		/** A primitive sent and not yet seen going: an idle before that is the end of the one before it, not of this. */
+		volatile boolean starting;
 		/** The close_window went idle: the chest is left once the window's close comes too. */
 		boolean closeIdle;
 		/** The window as last seen while one was open, its inventory part what the bot has. */
@@ -355,6 +357,11 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		final JsonObject a = new JsonObject();
 		a.addProperty("action", "goto");
 		a.add("look", look);
+		send(bot, task, a);
+	}
+
+	private void send(String bot, Task task, JsonObject a) {
+		task.starting = true;
 		bots.actionInternal(bot, a.toString());
 	}
 
@@ -362,7 +369,16 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 	public void onState(String bot, BotStatus status) {
 		final Task task = tasks.get(bot);
 
-		if (task == null || status.getKind() == BotStatus.Kind.DOING) {
+		if (task == null) {
+			return;
+		}
+
+		if (status.getKind() == BotStatus.Kind.DOING) {
+			task.starting = false;
+			return;
+		}
+
+		if (task.starting && status.getKind() == BotStatus.Kind.IDLE) {
 			return;
 		}
 
@@ -384,7 +400,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 				a.addProperty("action", "interact");
 				a.addProperty("button", "right");
 				a.add("target", target);
-				bots.actionInternal(bot, a.toString());
+				send(bot, task, a);
 				return;
 			}
 
@@ -405,7 +421,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 				task.closeIdle = false;
 				final JsonObject a = new JsonObject();
 				a.addProperty("action", "close_window");
-				bots.actionInternal(bot, a.toString());
+				send(bot, task, a);
 				return;
 			}
 
@@ -551,7 +567,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		a.add("sources", sources);
 		a.add("targets", targets);
 		a.addProperty("count", wanted);
-		bots.actionInternal(bot, a.toString());
+		send(bot, task, a);
 	}
 
 	/** The inventory's items the chest has room for, into it, no more than still to leave; with no room or none to leave, closed. */
@@ -598,7 +614,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		a.add("sources", sources);
 		a.add("targets", targets);
 		a.addProperty("count", wanted);
-		bots.actionInternal(bot, a.toString());
+		send(bot, task, a);
 	}
 
 	/** The task's name as its failures start: "index: ", "deposit: " or "grab: ". */
