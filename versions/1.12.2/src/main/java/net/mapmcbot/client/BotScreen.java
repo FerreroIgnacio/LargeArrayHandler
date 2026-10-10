@@ -171,7 +171,7 @@ public class BotScreen extends HandledScreen {
 	/** The items an item fill moves and the slots it fills with them. */
 	private ItemFilter fillFilter;
 	private final List<Integer> fillTargets = new ArrayList<Integer>();
-	/** The items a grab or deposit means, each with the slot it was picked on (parallel lists), the area (by id) and how many, or all (full). */
+	/** The items a grab or deposit means, each with the slot it was picked on (parallel lists), the area (by id) and how many, or the inventory filled/emptied (full). */
 	private final List<ItemFilter> grabFilters = new ArrayList<ItemFilter>();
 	private final List<Integer> grabSlots = new ArrayList<Integer>();
 	private boolean grabFull;
@@ -1030,7 +1030,7 @@ public class BotScreen extends HandledScreen {
 			grabAreaButton.y = rowY + 2;
 			grabAreaButton.message = "Area: " + areaName(grabArea);
 			grabAreaButton.method_891(client, mouseX, mouseY, 0);
-			// Full: all it can, in place of how many.
+			// Full: the inventory filled (emptied, a deposit), in place of how many.
 			fullBoxX = x + AREA_WIDTH + 4;
 			fullBoxY = rowY + 7;
 			fill(fullBoxX, fullBoxY, fullBoxX + 10, fullBoxY + 10, 0xFF8B8B8B);

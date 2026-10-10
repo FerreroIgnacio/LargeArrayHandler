@@ -25,11 +25,14 @@ import net.mapmcbot.bot.BotInventory;
  * The chests of one world the mod knows of: each one (a double chest is one, of two blocks) with the
  * last contents a bot saw in it, and whether those can have changed since (dirty). A chest is clean
  * only while it is known exactly: seen by a bot and, since, never opened by a player that is not a
- * bot nor let go by the fleet. One that has no contents yet is dirty.
+ * bot nor let go by the fleet. One that has no contents yet is dirty, and so is every one read back
+ * from the file: the fleet held none of them while the mod was not running.
+ *
+ * A chest is any block with an inventory the mod keeps (see ChestTracker), its block name with it.
  *
  * Kept in a tab-separated file, one chest per line: its blocks (x,y,z joined by ;), dirty (0 or 1),
- * and its contents (- for none yet): each slot as name,count,metadata,nbt in hex, empty for nothing,
- * joined by ;. Written the moment it changes.
+ * its contents (- for none yet): each slot as name,count,metadata,nbt in hex, empty for nothing,
+ * joined by ;, and its block. Written the moment it changes.
  *
  * Thread-safe: the channel thread feeds it, the screens read it.
  */
@@ -37,17 +40,24 @@ public final class ChestStore {
 	/** One chest: its blocks, its last contents (null before any) and whether they can be stale. */
 	public static final class Chest {
 		private final List<int[]> blocks;
+		/** The block's name: "minecraft:chest", "minecraft:hopper"... */
+		private String block;
 		private List<BotInventory.Item> contents;
 		private boolean dirty;
 
-		Chest(List<int[]> blocks, List<BotInventory.Item> contents, boolean dirty) {
+		Chest(List<int[]> blocks, String block, List<BotInventory.Item> contents, boolean dirty) {
 			this.blocks = Collections.unmodifiableList(blocks);
+			this.block = block;
 			this.contents = contents;
 			this.dirty = dirty;
 		}
 
 		public List<int[]> getBlocks() {
 			return blocks;
+		}
+
+		public String getBlock() {
+			return block;
 		}
 
 		/** The slots as last seen, null before any; empty slots null. */
@@ -141,28 +151,34 @@ public final class ChestStore {
 	}
 
 	/**
-	 * The chest made of exactly these blocks: the one known, or a new one with no contents yet in
-	 * place of any it overlaps (a single chest grown into a double, a double broken in two).
+	 * The chest made of exactly these blocks, of that block: the one known (its block as it is now, a
+	 * furnace lit), or a new one with no contents yet in place of any it overlaps (a single chest grown
+	 * into a double, a double broken in two).
 	 */
-	public synchronized Chest chestOf(List<int[]> blocks) {
+	public synchronized Chest chestOf(List<int[]> blocks, String block) {
 		final Chest known = byBlock.get(key(blocks.get(0)[0], blocks.get(0)[1], blocks.get(0)[2]));
 
 		if (known != null && sameBlocks(known.blocks, blocks)) {
+			if (!known.block.equals(block)) {
+				known.block = block;
+				save();
+			}
+
 			return known;
 		}
 
-		for (int[] block : blocks) {
-			final Chest overlapping = byBlock.get(key(block[0], block[1], block[2]));
+		for (int[] at : blocks) {
+			final Chest overlapping = byBlock.get(key(at[0], at[1], at[2]));
 
 			if (overlapping != null) {
 				removeChest(overlapping);
 			}
 		}
 
-		final Chest chest = new Chest(new ArrayList<int[]>(blocks), null, true);
+		final Chest chest = new Chest(new ArrayList<int[]>(blocks), block, null, true);
 
-		for (int[] block : blocks) {
-			byBlock.put(key(block[0], block[1], block[2]), chest);
+		for (int[] at : blocks) {
+			byBlock.put(key(at[0], at[1], at[2]), chest);
 		}
 
 		save();
@@ -241,7 +257,8 @@ public final class ChestStore {
 	private Chest parse(String line) {
 		final String[] parts = line.split("\t", -1);
 
-		if (parts.length != 3 || !(parts[1].equals("0") || parts[1].equals("1"))) {
+		// Three columns: written when only chests were kept, its block not with it.
+		if ((parts.length != 3 && parts.length != 4) || !(parts[1].equals("0") || parts[1].equals("1"))) {
 			throw new IllegalStateException("Malformed chest line in " + file + ": " + line);
 		}
 
@@ -267,7 +284,8 @@ public final class ChestStore {
 			}
 		}
 
-		return new Chest(blocks, contents, parts[1].equals("1") || contents == null);
+		// Read back, none is clean: no fleet holds its column, it may have changed unseen since it was written.
+		return new Chest(blocks, parts.length == 4 ? parts[3] : "minecraft:chest", contents, true);
 	}
 
 	private BotInventory.Item parseItem(String slot, String line) {
@@ -321,7 +339,7 @@ public final class ChestStore {
 					}
 				}
 
-				writer.write(line.append('\n').toString());
+				writer.write(line.append('\t').append(chest.block).append('\n').toString());
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not write " + file, e);

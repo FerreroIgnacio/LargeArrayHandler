@@ -12,7 +12,8 @@ import net.mapmcbot.bot.BotStatus;
  * Runs the jobs on the bots and records their steps. A bot runs the steps of the job it was started
  * on in order: each is sent when the bot reports idle after the one before; an error in one stops the
  * bot there, its state showing it. Looping, it starts over after the last. Nothing is timed: the
- * bot's own reports drive it.
+ * bot's own reports drive it. A looping job that goes a whole lap with every step over as it was started
+ * (a deposit with nothing to leave) has nothing left to do: it ends there instead of starting over.
  *
  * A step the fleet does not run (a grab) is the mod's: its Resolver does it on the bot with
  * primitives of its own, and says when it is done or failed.
@@ -43,11 +44,14 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		final JobStore.Job job;
 		final int index;
 		final boolean loop;
+		/** How many steps in a row before this one were over as they were started. */
+		final int instant;
 
-		Run(JobStore.Job job, int index, boolean loop) {
+		Run(JobStore.Job job, int index, boolean loop, int instant) {
 			this.job = job;
 			this.index = index;
 			this.loop = loop;
+			this.instant = instant;
 		}
 	}
 
@@ -124,7 +128,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 			throw new IllegalStateException("the job has no steps to start " + bot + " on");
 		}
 
-		final Run run = new Run(job, 0, loop);
+		final Run run = new Run(job, 0, loop, 0);
 
 		if (running.putIfAbsent(bot, run) != null) {
 			throw new IllegalStateException(bot + " is already running a job");
@@ -156,13 +160,14 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		try {
 			if (resolver != null && resolver.handles(step)) {
 				resolving.add(bot);
+				final boolean[] starting = { true };
 				resolver.start(bot, step, new Listener() {
 					@Override
 					public void done() {
 						resolving.remove(bot);
 
 						if (running.get(bot) == run) {
-							next(bot, run);
+							next(bot, run, starting[0]);
 						}
 					}
 
@@ -172,6 +177,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 						running.remove(bot, run);
 					}
 				});
+				starting[0] = false;
 			} else {
 				bots.actionInternal(bot, step);
 			}
@@ -182,9 +188,17 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		}
 	}
 
-	private void next(String bot, Run run) {
+	/** The step after the run's; instant when the run's was over as it was started. */
+	private void next(String bot, Run run, boolean instant) {
 		final int size = run.job.size();
+		final int instants = instant ? run.instant + 1 : 0;
 		int next = run.index + 1;
+
+		// A whole lap over as it was started: the next would be the same, over and over.
+		if (instants >= size) {
+			running.remove(bot);
+			return;
+		}
 
 		if (next >= size && run.loop) {
 			next = 0;
@@ -193,7 +207,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		if (next >= size) {
 			running.remove(bot);
 		} else {
-			final Run after = new Run(run.job, next, run.loop);
+			final Run after = new Run(run.job, next, run.loop, instants);
 			running.put(bot, after);
 			send(bot, after);
 		}
@@ -210,7 +224,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		if (status.getKind() == BotStatus.Kind.ERROR) {
 			running.remove(bot);
 		} else if (status.getKind() == BotStatus.Kind.IDLE) {
-			next(bot, run);
+			next(bot, run, false);
 		}
 	}
 

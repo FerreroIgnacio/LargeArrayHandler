@@ -3,6 +3,7 @@ package net.mapmcbot.client;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -28,11 +29,37 @@ import net.minecraft.client.MinecraftClient;
  * again on each change while the bot has it open. A chest turns dirty when a fleet lets its column
  * go, or when more players have it open than the bots that opened it (a player is in it).
  *
+ * Two bots in one chest at once (open, or opening it) may come through different fleets, whose frames
+ * keep no order between them: one's window can show what the other did before the other's frame says
+ * so. Such a chest is not checked and stays dirty until a bot opens it with no other in it, every
+ * frame of the others in by then (each fleet's close comes after its own changes).
+ *
  * Where the chests are comes from every fleet, the mod's and the relays' alike (CHEST, COLUMN_GONE):
  * an index of the chests in the columns they hold, by column. Only chests inside an area are kept.
  */
 final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.WindowListener, BotRegistry.StateListener, BotRegistry.LidListener, BotRegistry.ChestListener {
+	/** The chests proper: two side by side are one, of 54 slots. */
 	static final Set<String> CHEST_BLOCKS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList("minecraft:chest", "minecraft:trapped_chest")));
+	/** Every block with an inventory kept, by name: the slots of its window (a single chest's). */
+	static final Map<String, Integer> CONTAINER_SLOTS;
+
+	static {
+		final Map<String, Integer> slots = new HashMap<String, Integer>();
+		slots.put("minecraft:chest", 27);
+		slots.put("minecraft:trapped_chest", 27);
+		slots.put("minecraft:hopper", 5);
+		slots.put("minecraft:dispenser", 9);
+		slots.put("minecraft:dropper", 9);
+		slots.put("minecraft:furnace", 3);
+		slots.put("minecraft:lit_furnace", 3);
+		slots.put("minecraft:brewing_stand", 5);
+
+		for (String color : new String[] {"white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "silver", "cyan", "purple", "blue", "brown", "green", "red", "black"}) {
+			slots.put("minecraft:" + color + "_shulker_box", 27);
+		}
+
+		CONTAINER_SLOTS = Collections.unmodifiableMap(slots);
+	}
 
 	private final BotRegistry bots;
 
@@ -43,6 +70,8 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 	private final Map<String, int[]> pending = new ConcurrentHashMap<String, int[]>();
 	/** The chest each bot has open. */
 	private final Map<String, ChestStore.Chest> open = new ConcurrentHashMap<String, ChestStore.Chest>();
+	/** The chests two bots were in at once, dirty until one is opened by a bot alone. */
+	private final Set<ChestStore.Chest> shared = ConcurrentHashMap.newKeySet();
 
 	ChestTracker(BotRegistry bots) {
 		this.bots = bots;
@@ -104,7 +133,7 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 			final ChestStore.Chest already = open.get(bot);
 
 			if (already != null) {
-				store.see(already, contents);
+				keep(store, bot, already, contents);
 			}
 
 			return;
@@ -122,7 +151,7 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 		final List<int[]> blocks = new ArrayList<int[]>();
 		blocks.add(clicked);
 
-		if (window.getContainerSlots() == 54) {
+		if (CHEST_BLOCKS.contains(block) && window.getContainerSlots() == 54) {
 			final int[] partner = partnerOf(server, clicked, block);
 
 			if (partner == null) {
@@ -130,17 +159,22 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 			}
 
 			blocks.add(partner);
-		} else if (window.getContainerSlots() != 27) {
-			throw new IllegalStateException(bot + " opened " + block + " at " + at(clicked) + " as a window of " + window.getContainerSlots() + " slots, not a chest's 27 or 54");
+		} else if (window.getContainerSlots() != CONTAINER_SLOTS.get(block)) {
+			throw new IllegalStateException(bot + " opened " + block + " at " + at(clicked) + " as a window of " + window.getContainerSlots() + " slots, not its " + CONTAINER_SLOTS.get(block) + (CHEST_BLOCKS.contains(block) ? " or 54" : ""));
 		}
 
 		if (!inAnArea(blocks)) {
 			return;
 		}
 
-		final ChestStore.Chest chest = store.chestOf(blocks);
+		final ChestStore.Chest chest = store.chestOf(blocks, block);
+		final boolean alone = othersIn(store, bot, chest) == 0;
 
-		if (!chest.isDirty()) {
+		if (alone) {
+			shared.remove(chest);
+		}
+
+		if (!chest.isDirty() && alone) {
 			final String difference = difference(chest.getContents(), contents);
 
 			if (difference != null) {
@@ -148,8 +182,40 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 			}
 		}
 
-		store.see(chest, contents);
 		open.put(bot, chest);
+		keep(store, bot, chest, contents);
+	}
+
+	/**
+	 * What the bot sees in the chest, kept: clean only with no other bot in it since it opened it alone,
+	 * and only a chest proper. The rest stay dirty: they change by themselves (a hopper, a furnace, a
+	 * dispenser) or show no one opening them (a shulker box has no lid that counts its viewers).
+	 */
+	private void keep(ChestStore store, String bot, ChestStore.Chest chest, List<BotInventory.Item> contents) {
+		store.see(chest, contents);
+
+		if (othersIn(store, bot, chest) > 0) {
+			shared.add(chest);
+		}
+
+		if (shared.contains(chest) || !CHEST_BLOCKS.contains(chest.getBlock())) {
+			store.markDirty(chest);
+		}
+	}
+
+	/** How many bots but this one have the chest open, or are opening it. */
+	private int othersIn(ChestStore store, String bot, ChestStore.Chest chest) {
+		int others = 0;
+
+		for (String other : bots.getBots()) {
+			final int[] clicked = pending.get(other);
+
+			if (!other.equals(bot) && (open.get(other) == chest || (clicked != null && store.at(clicked[0], clicked[1], clicked[2]) == chest))) {
+				others++;
+			}
+		}
+
+		return others;
 	}
 
 	@Override
@@ -199,7 +265,7 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 			return;
 		}
 
-		if (!CHEST_BLOCKS.contains(block)) {
+		if (!CONTAINER_SLOTS.containsKey(block)) {
 			throw new IllegalStateException(bot + " reported a chest at " + at + " that is " + block);
 		}
 
@@ -258,13 +324,13 @@ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.Wind
 
 				final List<int[]> blocks = new ArrayList<int[]>();
 				blocks.add(block);
-				final int[] partner = partnerOf(key.getServer(), block, chest.getValue());
+				final int[] partner = CHEST_BLOCKS.contains(chest.getValue()) ? partnerOf(key.getServer(), block, chest.getValue()) : null;
 
 				if (partner != null) {
 					blocks.add(partner);
 				}
 
-				store.chestOf(blocks);
+				store.chestOf(blocks, chest.getValue());
 			}
 		}
 	}

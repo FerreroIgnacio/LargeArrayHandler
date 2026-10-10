@@ -7,6 +7,7 @@
 const { Vec3 } = require('vec3')
 const { goals } = require('mineflayer-pathfinder')
 const nbt = require('prismarine-nbt')
+const { once } = require('events')
 
 const REACH_BLOCK = 4.5
 const REACH_ENTITY = 3
@@ -24,6 +25,9 @@ const BLOCK_WINDOWS = {
   chest: 'chest', trapped_chest: 'chest', ender_chest: 'chest', furnace: 'furnace', lit_furnace: 'furnace',
   crafting_table: 'crafting_table', enchanting_table: 'enchanting_table', anvil: 'anvil', brewing_stand: 'brewing_stand',
   dispenser: 'dispenser', dropper: 'dropper', hopper: 'hopper', beacon: 'beacon'
+}
+for (const color of ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray', 'silver', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black']) {
+  BLOCK_WINDOWS[`${color}_shulker_box`] = 'shulker_box'
 }
 const ENTITY_WINDOWS = { villager: 'villager', horse: 'horse', donkey: 'horse', mule: 'horse' }
 // A minecart's, by the kind its spawn says (objectData): 1 chest, 5 hopper; the rest open none.
@@ -92,7 +96,7 @@ class AreaGoal extends goals.Goal {
 // publish(kind, primitive, message): the state to the mod, kind idle | doing | error. walk(goal):
 // the bot's pathfinder takes the goal (see bot.js). trades(window): the villager window's trades, null
 // until the server lists them; selectTrade(window, trade): picks one (see bot.js merchant).
-module.exports = function actions ({ bot, name, log, publish, walk, blockStates, trades, selectTrade }) {
+module.exports = function actions ({ bot, name, log, publish, walk, blockStates, trades, selectTrade, rawClick }) {
   let current = null
 
   function windowType (window) {
@@ -503,11 +507,197 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
+  // What 1.12's server sends after a click it rejects: the transaction refused, then the whole window
+  // (window_items, which mineflayer takes) and the cursor (set_slot -1 -1, which it leaves aside: kept
+  // here on the open window). The server did the click on its own window all the same.
+  let rejections = 0
+  let resyncs = 0
+  let itemClass
+  bot._client.on('transaction', ({ accepted }) => {
+    if (!accepted) rejections++
+  })
+  bot._client.on('set_slot', ({ windowId, slot, item }) => {
+    if (windowId !== -1 || slot !== -1) return
+    slotWindow().selectedItem = (itemClass ??= require('prismarine-item')(bot.registry)).fromNotch(item)
+    resyncs++
+    bot.emit('windowResync')
+  })
+
+  // A click the server rejected, thrown once its window and cursor are in.
+  class Rejected extends Error {}
+
+  // A left (0) or right (1) click of mineflayer's on the slot; one the server rejects throws a Rejected
+  // once the server's window and cursor came, the window as the server has it.
+  async function clickSlot (slot, button) {
+    const rejected = rejections
+    const synced = resyncs
+    try {
+      await bot.clickWindow(slot, button, 0)
+    } catch (e) {
+      if (rejections === rejected) throw e
+      if (resyncs === synced) await once(bot, 'windowResync')
+      throw new Rejected(`the server rejected a click on slot ${slot}`)
+    }
+  }
+
+  // A shift click sent carrying an item no slot holds (127 of them): the server rejects it, its own move
+  // done all the same, and sends the whole window and the cursor. The window is then the server's,
+  // whatever mineflayer's copy (prismarine-windows) would have made of the move, which is not the
+  // server's for most windows; an accepted click the server never corrects.
+  const UNHELD = { blockId: 1, itemCount: 127, itemDamage: 0 }
+  async function shiftClick (window, slot, button = 0) {
+    const synced = resyncs
+    try {
+      await rawClick(window, slot, button, 1, UNHELD)
+    } catch (e) {
+      if (!e.rejected) throw e
+      if (resyncs === synced) await once(bot, 'windowResync')
+      return
+    }
+    throw new Error(`expected the server to reject the shift click on slot ${slot} carrying ${UNHELD.itemCount} of an item, it took it: the window is not the server's`)
+  }
+
+  // The armor slot (5 to 8) or the offhand (45) of the inventory window an item goes to, as the server
+  // sees it (MobEntity's slot for it); null for none.
+  function equipmentSlot (item) {
+    const n = bare(item.name)
+    if (n.endsWith('_helmet') || n === 'skull' || n === 'pumpkin') return 5
+    if (n.endsWith('_chestplate') || n === 'elytra') return 6
+    if (n.endsWith('_leggings')) return 7
+    if (n.endsWith('_boots')) return 8
+    if (n === 'shield') return 45
+    return null
+  }
+
+  // What one of 1.12's server's moves of a shift click does with the slot's stack (its window's
+  // transferSlot): [start, end, reverse], the slots it goes into (insertItem); ['one', slot], one of
+  // it onto that slot; 'stop', none. null when the server's choice hangs on what the mod does not know
+  // (a furnace's smeltables and fuels, a brewing stand's ingredients, a horse's kind) or the slot is a
+  // result (taking it crafts, trades or repairs): no shift click then.
+  function shiftStep (window, slots, src, item) {
+    const c = window.inventoryStart
+    const end = window.inventoryEnd
+    const hotbar = end - 9
+    const fromInventory = src >= c && src < end
+    // An inventory slot to the other part of it: the main inventory to the hotbar, the hotbar to the main.
+    const swap = src < hotbar ? [hotbar, end, false] : [c, hotbar, false]
+    switch (bare(windowType(window))) {
+      case 'chest': case 'container': case 'dispenser': case 'dropper': case 'hopper': case 'shulker_box':
+        return fromInventory ? [0, c, false] : [c, end, true]
+      case 'EntityHorse':
+        return fromInventory ? null : [c, end, true]
+      case 'crafting_table':
+        if (src === 0) return null
+        return fromInventory ? swap : [c, end, false]
+      case 'furnace':
+        if (src === 2) return [c, end, true]
+        return fromInventory ? null : [c, end, false]
+      case 'brewing_stand':
+        return fromInventory ? null : [c, end, true]
+      case 'enchanting_table':
+        if (!fromInventory) return [c, end, true]
+        if (bare(item.name) === 'dye' && item.metadata === 4) return [1, 2, true]
+        return slots[0] ? 'stop' : ['one', 0]
+      case 'beacon':
+        if (!fromInventory) return [c, end, true]
+        if (!slots[0] && item.count === 1 && ['iron_ingot', 'gold_ingot', 'emerald', 'diamond'].includes(bare(item.name))) return [0, 1, false]
+        return swap
+      case 'villager':
+      case 'anvil':
+        if (src === 2) return null
+        if (!fromInventory) return [c, end, false]
+        return bare(windowType(window)) === 'villager' ? swap : [0, 2, false]
+      case 'inventory': {
+        if (src === 0) return null
+        if (!fromInventory) return [c, end, false]
+        const to = equipmentSlot(item)
+        if (to !== null && !slots[to]) return [to, to + 1, false]
+        return swap
+      }
+      default:
+        return null
+    }
+  }
+
+  // How many of an item a slot of the window takes, as the server has it.
+  function slotLimit (window, slot) {
+    const type = bare(windowType(window))
+    if (type === 'inventory' && slot >= 5 && slot <= 8) return 1
+    if ((type === 'beacon' || type === 'enchanting_table') && slot === 0) return 1
+    if (type === 'brewing_stand' && slot <= 2) return 1
+    if (type === 'EntityHorse' && slot <= 1) return 1
+    return 64
+  }
+
+  // Where 1.12's server puts the stack of slot src shift-clicked, worked out on a copy of the window:
+  // its moves one after another while the slot keeps some of it and the last one moved any (onto
+  // the same item with room first, from start on, or end back reversed; then on the first empty slot
+  // that takes it, no more than the slot does). [slot, n] each; null when shiftStep cannot tell.
+  function shiftSpread (window, src) {
+    const slots = window.slots.map(it => it && Object.assign(Object.create(Object.getPrototypeOf(it)), it))
+    const spread = new Map()
+    const add = (slot, n) => spread.set(slot, (spread.get(slot) ?? 0) + n)
+    while (slots[src]) {
+      const item = slots[src]
+      const step = shiftStep(window, slots, src, item)
+      if (step === null) return null
+      if (step === 'stop') break
+      let moved = 0
+      if (step[0] === 'one') {
+        slots[step[1]] = Object.assign(Object.create(Object.getPrototypeOf(item)), item, { count: 1 })
+        moved = 1
+      } else {
+        const [start, stop, reverse] = step
+        const order = Array.from({ length: stop - start }, (_, i) => reverse ? stop - 1 - i : start + i)
+        if (item.stackSize > 1) {
+          for (const slot of order) {
+            const there = slots[slot]
+            if (moved === item.count) break
+            if (!there || slot === src || !item.constructor.equal(there, item, false)) continue
+            const n = Math.min(item.count - moved, item.stackSize - there.count)
+            if (n <= 0) continue
+            there.count += n
+            moved += n
+            add(slot, n)
+          }
+        }
+        // A shulker box holds no shulker box.
+        const takes = slot => !(bare(windowType(window)) === 'shulker_box' && slot < window.inventoryStart && bare(item.name).endsWith('shulker_box'))
+        const empty = moved < item.count ? order.find(slot => !slots[slot] && takes(slot)) : undefined
+        if (empty !== undefined) {
+          const n = Math.min(item.count - moved, slotLimit(window, empty))
+          slots[empty] = Object.assign(Object.create(Object.getPrototypeOf(item)), item, { count: n })
+          moved += n
+          add(empty, n)
+        }
+      }
+      if (step[0] === 'one') add(step[1], 1)
+      if (moved === 0) break
+      item.count -= moved
+      if (item.count === 0) slots[src] = null
+    }
+    return [...spread]
+  }
+
   // Moves the items a.item matches (see itemMatcher), or a.items (a list of them: any of them), onto the slots of a.targets, from every other slot of
   // the window (or only a.sources), as much as fits and up to a.count if given: onto the same item with room, or
-  // empty slots, in the order given. Targets filling up with sources left over is fine; moving nothing is not.
+  // empty slots, in the order given. Targets filling up with sources left over is fine, and so is moving
+  // nothing (no room on the targets, none of the items outside them): done with 0 moved, the window maybe
+  // changed by another player or bot since whoever sent it looked at it.
+  //
+  // A click the server rejects (another player or bot changed the window first) is no failure: what the
+  // cursor holds goes back where it came from and the moves go on from the window as the server has it.
+  // How many it moved is counted on the side that is the bot's own inventory (the targets, else the
+  // sources), no one else's clicks touching it. A source whose shift click puts its items on targets only, no more of
+  // them than still wanted, goes in one shift click (see shiftSpread), the window the server's after
+  // it. A rejection that leaves the window as one before did, since the last
+  // move that went through, is no change of anyone else's: it fails. The window closed under it (by the
+  // server: the bot moved off, the block broke) fails it there, the click on its way never answered.
   async function itemFill (action, a) {
     const window = slotWindow()
+    listen(action, bot, 'windowClose', closed => {
+      if (closed === window) fail(action, `the window was closed while moving items, ${describeItem(window.selectedItem)} on the cursor`)
+    })
     const specs = a.items === undefined ? [required(a.item, 'item')] : a.items
     if (!Array.isArray(specs) || specs.length === 0) throw new Error(`items must list one or more matches, got ${JSON.stringify(a.items)}`)
     const matchers = specs.map((spec, i) => itemMatcher(spec, a.items === undefined ? 'item' : `items[${i}]`))
@@ -520,23 +710,73 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     const targets = list(a.targets, 'targets')
     const limit = a.count ?? Infinity
     if (limit !== Infinity && (!Number.isInteger(limit) || limit <= 0)) throw new Error(`count must be a positive integer, got ${a.count}`)
-    const from = a.sources === undefined ? window.slots.map((_, i) => i) : list(a.sources, 'sources')
-    const sources = from.filter(s => !targets.includes(s) && wanted.test(window.slots[s]))
-    if (sources.length === 0) throw new Error(`expected ${name} outside the target slots, found none`)
+    const from = (a.sources === undefined ? window.slots.map((_, i) => i) : list(a.sources, 'sources')).filter(s => !targets.includes(s))
+    const sources = () => from.filter(s => wanted.test(window.slots[s]))
     if (window.selectedItem) throw new Error(`expected an empty cursor, found ${describeItem(window.selectedItem)}`)
 
-    let moved = 0
-    for (const src of sources) {
-      for (const tgt of targets) {
-        const item = window.slots[src]
-        if (!item || moved >= limit) break
-        const there = window.slots[tgt]
-        if (there && !sameItem(there, item)) continue
-        const room = item.stackSize - (there?.count ?? 0)
-        const n = Math.min(item.count, room, limit - moved)
-        if (n <= 0) continue
-        const before = there?.count ?? 0
-        if (n < Math.min(item.count, room)) {
+    const own = s => s >= window.inventoryStart && s < window.inventoryEnd
+    const bySources = !targets.every(own) && from.every(own)
+    const total = slots => slots.reduce((n, s) => n + (wanted.test(window.slots[s]) ? window.slots[s].count : 0), 0)
+    const first = bySources ? total(from) : total(targets)
+    const moved = () => bySources ? first - total(from) : total(targets) - first
+    // A shift click does the source's moves: all of its items onto targets, no more than still wanted.
+    const shiftDoes = src => {
+      const spread = shiftSpread(window, src)
+      return spread !== null && spread.length > 0 && spread.every(([slot]) => targets.includes(slot)) &&
+        spread.reduce((n, [, k]) => n + k, 0) <= limit - moved()
+    }
+    const state = () => window.slots.map(it => it ? `${it.type}:${it.metadata}:${it.count}` : '').join(',') + '|' + describeItem(window.selectedItem)
+
+    // The next move: from a source onto a target that takes it, no more than still wanted; null with none.
+    const nextMove = () => {
+      const left = limit - moved()
+      if (left <= 0) return null
+      for (const src of sources()) {
+        for (const tgt of targets) {
+          const item = window.slots[src]
+          const there = window.slots[tgt]
+          if (there && !sameItem(there, item)) continue
+          const room = item.stackSize - (there?.count ?? 0)
+          const n = Math.min(item.count, room, left)
+          if (n > 0) return { src, tgt, n, item }
+        }
+      }
+      return null
+    }
+
+    // What the cursor holds after a rejection, back where it came from (or any other slot it came from,
+    // or onto a target, being one of the items).
+    const putBack = async src => {
+      const item = window.selectedItem
+      const places = [...new Set([...(src === null ? [] : [src]), ...from, ...(wanted.test(item) ? targets : [])])]
+      for (const slot of places) {
+        const there = window.slots[slot]
+        if (!window.selectedItem) return
+        if (there && (!sameItem(there, window.selectedItem) || there.count >= there.stackSize)) continue
+        await clickSlot(slot, 0)
+        if (action.over) return
+      }
+      if (window.selectedItem) throw new Error(`expected room to put back ${describeItem(window.selectedItem)} after a rejected click, found none`)
+    }
+
+    let src = null
+    let rejected = 0
+    const seen = new Set()
+    while (!action.over) {
+      try {
+        if (window.selectedItem) await putBack(src)
+        if (action.over) return
+        const move = nextMove()
+        if (!move) break
+        const { tgt, n, item } = move
+        src = move.src
+        if (shiftDoes(src)) {
+          await shiftClick(window, src)
+          seen.clear()
+          continue
+        }
+        const before = window.slots[tgt]?.count ?? 0
+        if (n < Math.min(item.count, item.stackSize - before)) {
           // Part of the stack, the fewest clicks: the whole or half of it (right click) in the hand,
           // then one at a time back onto the source until n are left for the target, or n one at a
           // time onto the target and the rest back.
@@ -547,34 +787,43 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
           ]
           if (n <= half) ways.push({ button: 1, back: half - n }, { button: 1, onto: n })
           const way = ways.reduce((best, w) => (w.back ?? w.onto) < (best.back ?? best.onto) ? w : best)
-          await bot.clickWindow(src, way.button, 0)
+          await clickSlot(src, way.button)
           if (action.over) return
           const ones = way.back ?? way.onto
           for (let i = 0; i < ones; i++) {
-            await bot.clickWindow(way.back !== undefined ? src : tgt, 1, 0)
+            await clickSlot(way.back !== undefined ? src : tgt, 1)
             if (action.over) return
           }
-          await bot.clickWindow(way.back !== undefined ? tgt : src, 0, 0)
+          await clickSlot(way.back !== undefined ? tgt : src, 0)
         } else {
-          await bot.clickWindow(src, 0, 0)
+          await clickSlot(src, 0)
           if (action.over) return
-          await bot.clickWindow(tgt, 0, 0)
+          await clickSlot(tgt, 0)
           if (action.over) return
           // What does not fit goes back where it came from.
-          if (window.selectedItem) await bot.clickWindow(src, 0, 0)
+          if (window.selectedItem) await clickSlot(src, 0)
         }
         if (action.over) return
         if (window.selectedItem) throw new Error(`expected an empty cursor after moving ${full(item.name)} from slot ${src} to slot ${tgt}, found ${describeItem(window.selectedItem)}`)
+        // On the bot's own slots no one else's clicks add or take.
         const after = window.slots[tgt]
-        if (!after || !sameItem(after, item) || after.count < before + n) {
+        if (own(tgt) && (!after || !sameItem(after, item) || after.count < before + n)) {
           throw new Error(`expected at least ${before + n} x ${full(item.name)} on slot ${tgt} (${before} there, ${n} moved), found ${describeItem(after)}`)
         }
-        moved += n
+        seen.clear()
+      } catch (e) {
+        if (!(e instanceof Rejected)) throw e
+        if (action.over) return
+        const now = state()
+        if (seen.has(now)) throw new Error(`${e.message} on a window as it was at a rejection before, nothing else changing it (moving ${name})`)
+        seen.add(now)
+        rejected++
+        log(`item_fill: ${e.message}, the window changed under it: going on from the server's`)
       }
-      if (moved >= limit) break
     }
-    if (moved === 0) throw new Error(`expected room for ${name} on the target slots, found none`)
-    log(`item_fill moved ${moved} x ${name}`)
+    if (action.over) return
+    const why = moved() > 0 ? '' : sources().length === 0 ? `: no ${name} outside the target slots` : ': no room on the target slots'
+    log(`item_fill moved ${moved()} x ${name}${rejected ? ` (${rejected} clicks rejected)` : ''}${why}`)
     done(action)
   }
 
@@ -759,6 +1008,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   return {
     windowType,
     cancel,
+    shiftClick,
 
     // An order from the mod: a primitive, run to its end by the events that confirm it. A failure,
     // from the primitive or from what it threw, is the bot's error state, not the process's.

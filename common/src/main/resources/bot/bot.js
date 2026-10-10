@@ -65,6 +65,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // The villager window's trades as the server listed them, and the one picked shown in its result.
     trades: window => trades.id === window.id ? trades.recipes : null,
     selectTrade: (window, trade) => pickTrade(window, trade),
+    rawClick,
     blockStates
   })
 
@@ -107,8 +108,13 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     if (CHESTS.has(type)) out(protocol.chest(name, key, location, type))
   }
 
-  // The chests the mod keeps (see protocol.chest), as they show up or go.
-  const CHESTS = new Set(['minecraft:chest', 'minecraft:trapped_chest'])
+  // The blocks with an inventory the mod keeps (see protocol.chest), as they show up or go.
+  const SHULKER_COLORS = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray', 'silver', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black']
+  const CHESTS = new Set([
+    'minecraft:chest', 'minecraft:trapped_chest', 'minecraft:hopper', 'minecraft:dispenser', 'minecraft:dropper',
+    'minecraft:furnace', 'minecraft:lit_furnace', 'minecraft:brewing_stand',
+    ...SHULKER_COLORS.map(color => `minecraft:${color}_shulker_box`)
+  ])
   function reportChestChange (oldBlock, newBlock) {
     const { stateName, stateIdOf } = blockStates()
     const was = states.blockName(stateName(stateIdOf(oldBlock)))
@@ -317,7 +323,8 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   // clickWindow would send the slot's. Each under an action number of its own, counting down from
   // -1 (mineflayer's count up from 1): mineflayer answers their transactions as ones it did not
   // send, accepted, which the server takes as nothing. Done once the server confirms it; a click it
-  // rejects is fatal, as mineflayer's.
+  // rejects is fatal, as mineflayer's (its error rejected). Also the shift clicks, carrying item (see
+  // actions.js shiftClick).
   let rawAction = 0
   const rawPending = new Map()
   bot._client.on('transaction', ({ windowId, action, accepted }) => {
@@ -325,15 +332,15 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     if (!pending || pending.windowId !== windowId) return
     rawPending.delete(action)
     if (accepted) pending.resolve()
-    else pending.reject(new Error(`${name}: the server rejected click ${pending.what} on window ${windowId}`))
+    else pending.reject(Object.assign(new Error(`${name}: the server rejected click ${pending.what} on window ${windowId}`), { rejected: true }))
   })
-  function rawClick (window, slot, button, mode) {
+  function rawClick (window, slot, button, mode, item = { blockId: -1 }) {
     rawAction = rawAction === -32768 ? -1 : rawAction - 1
     const action = rawAction
     const done = new Promise((resolve, reject) => {
       rawPending.set(action, { windowId: window.id, what: `slot ${slot}, button ${button}, mode ${mode}`, resolve, reject })
     })
-    bot._client.write('window_click', { windowId: window.id, slot, mouseButton: button, action, mode, item: { blockId: -1 } })
+    bot._client.write('window_click', { windowId: window.id, slot, mouseButton: button, action, mode, item })
     return done
   }
 
@@ -433,15 +440,8 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       return
     }
     if (mode === 1) {
-      // 1.12's server answers a shift click with the stack it moved (empty only when nothing moved), and takes it
-      // as accepted only when the click carries that same stack; mineflayer's feature table says to send none.
-      const supports = bot.supportFeature
-      bot.supportFeature = f => f === 'quickMoveClickSendsEmptyItem' ? false : supports.call(bot, f)
-      try {
-        await bot.clickWindow(slot, button, mode)
-      } finally {
-        bot.supportFeature = supports
-      }
+      // Rejected on purpose, the window the server's after it (see actions.js shiftClick).
+      await act.shiftClick(window, slot, button)
       return
     }
     await bot.clickWindow(slot, button, mode)

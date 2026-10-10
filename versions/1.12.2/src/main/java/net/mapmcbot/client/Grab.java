@@ -1,6 +1,7 @@
 package net.mapmcbot.client;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -17,9 +18,12 @@ import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.BotStatus;
 import net.mapmcbot.bot.BotWindow;
 import net.mapmcbot.job.JobRunner;
+import net.minecraft.item.Item;
+import net.minecraft.util.Identifier;
 
 /**
- * A grab: the bot takes count of an item from the chests of an area, no primitive of the fleet but
+ * A grab: the bot takes count of an item from the chests of an area (every block with an inventory the
+ * mod keeps, see ChestTracker; a deposit leaves nothing in a furnace or a brewing stand), no primitive of the fleet but
  * the mod's, done with the fleet's: { action: grab, area: its id, item: a match (see ItemFilter),
  * count }. Chest by chest, as many as it takes: it walks next to one, opens it, item fills its
  * inventory from it (no more than is still wanted) and closes it, until it has them all.
@@ -29,8 +33,8 @@ import net.mapmcbot.job.JobRunner;
  * bot's state: nothing timed.
  *
  * The item is a list of matches (items: any of them counts; the old single item still reads), and with
- * full in place of count the grab takes (the deposit leaves) all it can: until the chests (or the room
- * in the inventory) are out, an error only if it did none.
+ * full in place of count the grab fills the inventory (the deposit empties it of the item): done when no
+ * slot has room left for it (none of it is left), an error if the chests are out before.
  *
  * A deposit ({ action: deposit, area, items, count }) is the grab the other way: the bot leaves count of
  * the item in the chests of the area, a chest with room (an empty slot) at a time; the chests known
@@ -50,10 +54,8 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		/** The matches, any of them counting; null for an index. */
 		final JsonArray items;
 		final int count;
-		/** All it can instead of count. */
+		/** The inventory filled (emptied, a deposit) instead of count. */
 		final boolean full;
-		/** A full grab found the inventory with no room left: it ends with the chest closed. */
-		boolean noRoom;
 		final int target;
 		final int had;
 		/** Whether it leaves the item in the chests instead of taking it from them. */
@@ -61,7 +63,10 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		final JobRunner.Listener listener;
 		final Set<ChestStore.Chest> visited = new HashSet<ChestStore.Chest>();
 		ChestStore.Chest chest;
-		Phase phase;
+		/** Set before the task is shown (status reads it on the render thread): walking to its first chest. */
+		volatile Phase phase = Phase.WALK;
+		/** The close_window went idle: the chest is left once the window's close comes too. */
+		boolean closeIdle;
 		/** The window as last seen while one was open, its inventory part what the bot has. */
 		BotWindow window;
 
@@ -76,6 +81,9 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			this.listener = listener;
 		}
 	}
+
+	/** The blocks a deposit leaves nothing in. */
+	private static final Set<String> NO_DEPOSIT = new HashSet<String>(Arrays.asList("minecraft:furnace", "minecraft:lit_furnace", "minecraft:brewing_stand"));
 
 	private final BotRegistry bots;
 	private final ChestTracker chests;
@@ -143,7 +151,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		if (task != null) {
-			return (task.deposit ? "deposit " : "grab ") + describe(task.items) + " " + (task.window == null ? 0 : Math.abs(held(task) - task.had)) + "/" + (task.full ? "all" : String.valueOf(task.count)) + ": " + task.phase.name().toLowerCase() + (task.chest == null ? "" : " " + task.chest);
+			return (task.deposit ? "deposit " : "grab ") + describe(task.items) + " " + (task.window == null ? 0 : Math.abs(held(task) - task.had)) + "/" + (task.full ? "full" : String.valueOf(task.count)) + ": " + task.phase.name().toLowerCase() + (task.chest == null ? "" : " " + task.chest);
 		}
 
 		return errors.containsKey(bot) ? "error " + errors.get(bot) : null;
@@ -227,8 +235,15 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			}
 		}
 
+		// Nothing (or not enough) to leave: the deposit is done, not failed.
 		if (deposit && had < Math.max(count, 1)) {
-			fail(bot, null, listener, "deposit: expected " + (full ? "some" : String.valueOf(count)) + " x " + describe(items) + " in " + bot + "'s inventory, found " + had);
+			listener.done();
+			return;
+		}
+
+		// Already full: the grab is done.
+		if (!deposit && full && !room(items, inventory.getSlots().subList(9, 45))) {
+			listener.done();
 			return;
 		}
 
@@ -253,22 +268,21 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			return;
 		}
 
-		// A full one that did something is done when the chests are out.
-		if (order.isEmpty() && task.full && task.window != null && held(task) != task.had) {
-			tasks.remove(bot);
-			task.listener.done();
+		if (order.isEmpty() && task.deposit) {
+			final int left = task.window == null ? task.count : held(task) - task.target;
+			fail(bot, task, task.listener, "deposit: no space in area " + task.area.getName() + " for " + (task.window == null && task.full ? task.had : left) + " x " + describe(task.items) + ": none of its chests has room");
 			return;
 		}
 
-		if (order.isEmpty() && task.deposit) {
-			final int left = task.window == null ? task.count : held(task) - task.target;
-			fail(bot, task, task.listener, "deposit: expected room for " + (task.full ? "some" : String.valueOf(left)) + " x " + describe(task.items) + " in area " + task.area.getName() + ", found none in its chests");
+		if (order.isEmpty() && task.full) {
+			final int got = task.window == null ? 0 : held(task) - task.had;
+			fail(bot, task, task.listener, "grab: expected the inventory filled with " + describe(task.items) + " from area " + task.area.getName() + ", found room left after its chests (" + got + " taken)");
 			return;
 		}
 
 		if (order.isEmpty()) {
 			final int got = task.window == null ? 0 : held(task) - task.had;
-			fail(bot, task, task.listener, "grab: expected " + (task.full ? "some" : String.valueOf(task.count)) + " x " + describe(task.items) + " in area " + task.area.getName() + ", found " + got + " in its chests");
+			fail(bot, task, task.listener, "grab: expected " + String.valueOf(task.count) + " x " + describe(task.items) + " in area " + task.area.getName() + ", found " + got + " in its chests");
 			return;
 		}
 
@@ -298,7 +312,12 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			}
 
 			// A deposit goes where there is room: a clean chest with an empty slot, or one that may have it.
+			// Not into a furnace or a brewing stand: their slots take only what they work on.
 			if (task.deposit) {
+				if (NO_DEPOSIT.contains(chest.getBlock())) {
+					continue;
+				}
+
 				if (chest.isDirty()) {
 					dirty.add(chest);
 				} else if (chest.getContents().contains(null)) {
@@ -385,6 +404,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 
 			case FILL: {
 				task.phase = Phase.CLOSE;
+				task.closeIdle = false;
 				final JsonObject a = new JsonObject();
 				a.addProperty("action", "close_window");
 				bots.actionInternal(bot, a.toString());
@@ -392,11 +412,10 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			}
 
 			case CLOSE:
-				if (task.items != null && (task.noRoom || (task.deposit ? held(task) <= task.target : held(task) >= task.target))) {
-					tasks.remove(bot);
-					task.listener.done();
-				} else {
-					nextChest(bot, task);
+				task.closeIdle = true;
+
+				if (bots.getWindow(bot) == null) {
+					closed(bot, task);
 				}
 
 				return;
@@ -410,7 +429,19 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 	public void onWindow(String bot, BotWindow window) {
 		final Task task = tasks.get(bot);
 
-		if (task == null || window == null) {
+		if (task == null) {
+			return;
+		}
+
+		// The close's frame may come after the close_window is over: the chest is left on both.
+		if (window == null) {
+			if (task.phase == Phase.CLOSE && task.closeIdle) {
+				closed(bot, task);
+			} else if (task.phase == Phase.WINDOW || task.phase == Phase.FILL) {
+				// Closed by the server before the grab closed it.
+				fail(bot, task, task.listener, name(task) + "the server closed " + task.chest + " while " + task.phase.name().toLowerCase());
+			}
+
 			return;
 		}
 
@@ -418,6 +449,18 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 
 		if (task.phase == Phase.WINDOW) {
 			fill(bot, task, window);
+		}
+	}
+
+	/** The chest closed (the primitive idle and the window gone): done, or on to the next. */
+	private void closed(String bot, Task task) {
+		task.closeIdle = false;
+
+		if (task.items != null && (task.deposit ? held(task) <= task.target : task.full ? !room(task) : held(task) >= task.target)) {
+			tasks.remove(bot);
+			task.listener.done();
+		} else {
+			nextChest(bot, task);
 		}
 	}
 
@@ -484,9 +527,13 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			return;
 		}
 
-		// With the inventory full the grab is done, not failed.
-		if (targets.size() == 0) {
-			task.noRoom = true;
+		// With the inventory full a full grab is done (on closing); short of count it fails.
+		if (!room(task)) {
+			if (!task.full) {
+				fail(bot, task, task.listener, "grab: expected room for " + wanted + " more x " + describe(task.items) + ", found the inventory full");
+				return;
+			}
+
 			task.phase = Phase.FILL;
 			onState(bot, BotStatus.IDLE);
 			return;
@@ -588,6 +635,33 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		return held;
+	}
+
+	/** Whether the bot's inventory, by the window last seen, has a slot with room for the item: empty, or a stack of it short of full. */
+	private static boolean room(Task task) {
+		final List<BotInventory.Item> slots = task.window.getSlots();
+		return room(task.items, slots.subList(task.window.getContainerSlots(), slots.size()));
+	}
+
+	private static boolean room(JsonArray items, List<BotInventory.Item> slots) {
+		for (BotInventory.Item item : slots) {
+			if (item == null || (matches(items, item) && item.getCount() < maxCount(item))) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** How many of the item a stack holds. */
+	private static int maxCount(BotInventory.Item item) {
+		final Item kind = Item.REGISTRY.get(new Identifier(item.getName()));
+
+		if (kind == null) {
+			throw new IllegalStateException("no item " + item.getName() + " in the registry");
+		}
+
+		return kind.getMaxCount();
 	}
 
 	private static boolean has(ChestStore.Chest chest, JsonArray item) {

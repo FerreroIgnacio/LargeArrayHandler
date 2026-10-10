@@ -373,8 +373,8 @@ public class AreaScreen extends Screen {
 			final int cellX = CHESTS_X + ((i - page * perPage) % columns()) * CELL_WIDTH;
 			final int cellY = LIST_TOP + ((i - page * perPage) / columns()) * CELL_HEIGHT;
 			final List<BotInventory.Item> contents = chest.getContents();
-			final int slots = contents != null ? contents.size() : chest.getBlocks().size() * 27;
-			final int rows = slots / 9;
+			final int slots = contents != null ? contents.size() : chest.getBlocks().size() * ChestTracker.CONTAINER_SLOTS.get(chest.getBlock());
+			final int rows = (slots + 8) / 9;
 			final int[] first = chest.getBlocks().get(0);
 			final int titleColor = contents == null ? 0xA00000 : chest.isDirty() ? 0xA07800 : 0x404040;
 			GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);

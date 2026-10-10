@@ -290,7 +290,8 @@ function chestLid (bot, pos, viewers) {
   return w.frame()
 }
 
-// A chest (type "minecraft:chest" or "minecraft:trapped_chest") is at pos (world) in the column, or
+// A block with an inventory (a chest, trapped chest, hopper, dispenser, dropper, furnace, brewing stand
+// or shulker box: its type, "minecraft:chest"...) is at pos (world) in the column, or
 // none is any more (type empty). Not a column frame: relays send it too, the mod keeps the chests.
 function chest (bot, key, pos, type) {
   const w = new Writer(TYPES.CHEST)
