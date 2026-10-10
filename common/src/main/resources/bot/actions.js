@@ -189,8 +189,30 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       arrived = true
       done(action)
     })
+    // mineflayer-pathfinder can end a walk on its last node with the goal not met there: it stops and
+    // waits with its goal set, searching no more and saying nothing (pathUpdated stays set). Told by
+    // the bot moving with a path walked and none left; searched again from there, and failed when it
+    // ends twice on the same spot.
+    let walking = false
+    let endedAt = null
     listen(action, bot, 'path_update', result => {
       if (result.status === 'noPath') fail(action, `expected a path to ${where}, found none from ${stood()}${result.reason ? ` (${result.reason})` : ''}`)
+      if (result.status === 'success' && result.path.length > 0) walking = true
+    })
+    listen(action, bot, 'path_reset', () => {
+      walking = false
+    })
+    listen(action, bot, 'move', () => {
+      if (!walking || bot.pathfinder.isMoving() || bot.pathfinder.goal !== goal) return
+      walking = false
+      const here = stood()
+      if (endedAt === here) {
+        fail(action, `expected to arrive at ${where}, the walk ended at ${here} short of it twice`)
+        return
+      }
+      endedAt = here
+      log(`goto: the walk ended at ${here} short of ${where}: searching again`)
+      bot.pathfinder.setGoal(goal)
     })
     listen(action, bot, 'path_stop', () => fail(action, `expected to arrive at ${where}, the walk was stopped at ${stood()}`))
     walk(goal)

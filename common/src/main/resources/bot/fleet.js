@@ -14,7 +14,8 @@
 // get to it (not pushed, say) it says why (UPDATE_FAILED), closes that connection and stays up.
 //
 // A relay never goes down: any error of its own goes to the mod (CRASH, kept there in
-// crash-relay<N>.log) and it goes on; a pool thread that dies takes only its bots with it.
+// crash-relay<N>.log) and it goes on; a pool thread that dies takes only its bots with it. What it
+// writes (its bots' lines too) goes to the mod as well once served (LOG, kept in fleet-relay<N>.log).
 // Usage: node fleet.js <mod port> <columns.bin>
 //        node fleet.js --relay <port to listen on> <columns.bin>
 const { execSync } = require('child_process')
@@ -457,6 +458,19 @@ const send = frame => {
   if (out) socket.write(out)
 }
 
+// A relay's output, its pool threads' with it (piped through this process's), goes to the mod too:
+// its terminal is on another machine. Only once the mod is served, after its WELCOME, which comes first.
+let served = null
+if (relay) {
+  for (const stream of [process.stdout, process.stderr]) {
+    const write = stream.write.bind(stream)
+    stream.write = (chunk, ...rest) => {
+      if (served && served === socket) send(protocol.log(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')))
+      return write(chunk, ...rest)
+    }
+  }
+}
+
 function onFrame (frame) {
   const message = protocol.decode(frame)
   switch (message.type) {
@@ -519,6 +533,7 @@ function serve (connection) {
   closing = false
   connection.setNoDelay(true)
   if (relay) send(protocol.welcome())
+  served = connection
   connection.on('error', err => {
     if (!relay) throw err
     // A relay outlives the mod: a connection that fails ends that session, said loudly, and it waits for the next.

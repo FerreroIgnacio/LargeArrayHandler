@@ -152,7 +152,11 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   // The mod draws the path being walked and its target; an empty PATH clears it.
   const goalOf = () => {
     const g = bot.pathfinder.goal
-    return g ? { x: g.x, y: g.y, z: g.z } : null
+    if (!g) return null
+    // GoalLookAtBlock keeps its block in pos; a goal with neither would be drawn at 0,0,0 (Buffer writes undefined as 0).
+    const at = g.pos || g
+    if (![at.x, at.y, at.z].every(Number.isFinite)) throw new Error(`goal ${g.constructor.name} has no position to draw`)
+    return { x: at.x, y: at.y, z: at.z }
   }
   // What the mod draws now: { target, coords: the nodes' blocks, x y z each }, null when nothing.
   // A PATH goes only when that changes: a search's partials are mostly the same path tick after

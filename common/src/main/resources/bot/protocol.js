@@ -25,6 +25,7 @@ const TYPES = {
   CHEST_LID: 30,
   CHEST: 31,
   COLUMN_GONE: 32,
+  LOG: 33,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
@@ -345,6 +346,14 @@ function crash (text) {
   return w.frame()
 }
 
+// What a relay wrote to its output, for the mod to keep (a chunk of lines). Only a relay sends it. No bot: an empty name.
+function log (text) {
+  const w = new Writer(TYPES.LOG)
+  w.str('')
+  w.bytes(Buffer.from(text, 'utf8'))
+  return w.frame()
+}
+
 // A relay's answer to the mod's HELLO: it runs the mod's scripts. No bot: an empty name.
 function welcome () {
   const w = new Writer(TYPES.WELCOME)
@@ -463,4 +472,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

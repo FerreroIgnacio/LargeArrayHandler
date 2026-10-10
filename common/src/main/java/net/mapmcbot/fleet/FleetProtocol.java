@@ -110,6 +110,8 @@ public final class FleetProtocol {
 	public static final int CHEST = 31;
 	/** bot name, the column's key (as CLAIM): the fleet let the column go. */
 	public static final int COLUMN_GONE = 32;
+	/** bot name (empty), the text: what a relay wrote to its output, a chunk of lines. Only relays send it, once served; {@link #relayText} reads it. */
+	public static final int LOG = 33;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -165,14 +167,14 @@ public final class FleetProtocol {
 		}
 	}
 
-	/** The text of an UPDATING or UPDATE_FAILED frame, laid out as a CRASH one. */
+	/** The text of an UPDATING, UPDATE_FAILED or LOG frame, laid out as a CRASH one. */
 	public static String relayText(byte[] frame) {
 		try {
 			final DataInputStream in = new DataInputStream(new ByteArrayInputStream(frame));
 			final int type = in.readUnsignedByte();
 
-			if (type != UPDATING && type != UPDATE_FAILED) {
-				throw new IllegalArgumentException("not an UPDATING or UPDATE_FAILED frame: type " + type);
+			if (type != UPDATING && type != UPDATE_FAILED && type != LOG) {
+				throw new IllegalArgumentException("not an UPDATING, UPDATE_FAILED or LOG frame: type " + type);
 			}
 
 			readString(in);

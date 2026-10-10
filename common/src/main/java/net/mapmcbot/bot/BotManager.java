@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 import net.mapmcbot.chunk.ChunkKey;
 import net.mapmcbot.chunk.ChunkListener;
@@ -76,6 +77,12 @@ public final class BotManager implements FleetChannel {
 	private volatile Process fleet;
 	private volatile OutputStream out;
 	private volatile Thread reader;
+	/** Told when the reader dies of an exception, which the frames after it never get past. */
+	private volatile Consumer<Throwable> readerFailure;
+
+	public void setReaderFailure(Consumer<Throwable> listener) {
+		this.readerFailure = listener;
+	}
 
 	/**
 	 * Every frame through the socket, one line each, in socket.log of the fleet's folder. Buffered and
@@ -311,7 +318,19 @@ public final class BotManager implements FleetChannel {
 		out = new BufferedOutputStream(socket.getOutputStream());
 		fleet = process;
 
-		reader = new Thread(() -> read(in), "mapmcbot-fleet-reader");
+		reader = new Thread(() -> {
+			try {
+				read(in);
+			} catch (RuntimeException e) {
+				final Consumer<Throwable> listener = readerFailure;
+
+				if (listener != null) {
+					listener.accept(e);
+				}
+
+				throw e;
+			}
+		}, "mapmcbot-fleet-reader");
 		reader.setDaemon(true);
 		reader.start();
 	}

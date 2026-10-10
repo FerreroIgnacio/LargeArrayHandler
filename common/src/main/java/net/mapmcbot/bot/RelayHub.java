@@ -420,6 +420,27 @@ public final class RelayHub {
 		}
 
 		/** The relay's errors, next to relays.txt and one after the other, for whoever debugs them: the relay's own terminal is on another machine. */
+		/** What the relay wrote, to the game log and, each line with its time, to fleet-relay<N>.log beside the mod's fleet.log of its own. */
+		private void keepLog(String text) {
+			final File log = new File(file.getAbsoluteFile().getParentFile(), "bot/fleet-relay" + rid + ".log");
+			final StringBuilder lines = new StringBuilder();
+
+			for (String line : text.split("\r?\n")) {
+				if (line.isEmpty()) {
+					continue;
+				}
+
+				System.out.println("[mapmcbot relay " + rid + "] " + line);
+				lines.append(java.time.LocalTime.now()).append(' ').append(line).append('\n');
+			}
+
+			try {
+				Files.write(log.toPath(), lines.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			} catch (IOException e) {
+				throw new UncheckedIOException("could not write " + log, e);
+			}
+		}
+
 		private void keepCrash(String text) {
 			final File crash = new File(file.getAbsoluteFile().getParentFile(), "crash-relay" + rid + ".log");
 
@@ -453,6 +474,11 @@ public final class RelayHub {
 				while ((frame = FleetProtocol.readFrame(in)) != null) {
 					if ((frame[0] & 0xFF) == FleetProtocol.CRASH) {
 						keepCrash(FleetProtocol.crashText(frame));
+						continue;
+					}
+
+					if ((frame[0] & 0xFF) == FleetProtocol.LOG) {
+						keepLog(FleetProtocol.relayText(frame));
 						continue;
 					}
 

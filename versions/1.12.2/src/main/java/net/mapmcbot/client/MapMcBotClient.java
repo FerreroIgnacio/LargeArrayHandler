@@ -428,6 +428,7 @@ public class MapMcBotClient implements ClientModInitializer {
 		if (bots == null) {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
 			final BotManager fleet = new BotManager(new File(directory, "bot"));
+			fleet.setReaderFailure(e -> MinecraftClient.getInstance().submit(() -> chat(MinecraftClient.getInstance(), "[MapMcBot] the fleet reader died, its bots' state is stale until restart: " + e.getMessage())));
 			relays = new RelayHub(new File(directory, "relays.txt"));
 			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
 			seedProfiles();
