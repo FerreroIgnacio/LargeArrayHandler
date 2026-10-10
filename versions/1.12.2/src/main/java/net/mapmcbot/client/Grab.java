@@ -484,16 +484,11 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			return;
 		}
 
-		// A full one that took something is done with the inventory full.
-		if (targets.size() == 0 && task.full && held(task) != task.had) {
+		// With the inventory full the grab is done, not failed.
+		if (targets.size() == 0) {
 			task.noRoom = true;
 			task.phase = Phase.FILL;
 			onState(bot, BotStatus.IDLE);
-			return;
-		}
-
-		if (targets.size() == 0) {
-			fail(bot, task, task.listener, "grab: expected room in the inventory for " + describe(task.items) + ", found none");
 			return;
 		}
 
