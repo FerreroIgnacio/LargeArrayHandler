@@ -45,11 +45,14 @@ public final class ChunkSnapshotStore {
 	private static final String SUFFIX = ".chunk";
 
 	private final File root;
+	/** Held by the sweep from reading a snapshot's version to deleting it, and by a save as it moves its file in: the sweep never deletes one saved after it read. */
+	private final Object swapLock = new Object();
 
 	/**
 	 * Outdated snapshots go on a thread of their own: with thousands of files the sweep would hold up
 	 * whoever opens the store (the game's thread). Saving meanwhile is safe: the sweep only deletes
-	 * snapshots of another format version, and only whole .chunk files, never the .tmp being written.
+	 * snapshots of another format version, and only whole .chunk files, never the .tmp being written;
+	 * a .chunk moved in while it looks at one waits for it (swapLock).
 	 */
 	public ChunkSnapshotStore(File root) {
 		if (!CREATED.compareAndSet(false, true)) {
@@ -164,13 +167,15 @@ public final class ChunkSnapshotStore {
 				FleetProtocol.writeData(out, data);
 			}
 
-			Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+			synchronized (swapLock) {
+				Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+			}
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not write " + file, e);
 		}
 	}
 
-	/** Null when the chunk has no snapshot. */
+	/** Null when the chunk has no snapshot, or only one of another format version the sweep has yet to delete. */
 	public Snapshot load(ChunkKey key) {
 		final File file = file(key);
 
@@ -179,7 +184,10 @@ public final class ChunkSnapshotStore {
 		}
 
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
-			readVersion(in, file);
+			if (readVersion(in, file) != FORMAT_VERSION) {
+				return null;
+			}
+
 			final Instant savedAt = Instant.ofEpochMilli(in.readLong());
 			final String mcVersion = FleetProtocol.readString(in);
 			final ChunkKey stored = new ChunkKey(FleetProtocol.readString(in), FleetProtocol.readString(in),
@@ -215,19 +223,21 @@ public final class ChunkSnapshotStore {
 		}
 
 		for (Path path : files) {
-			final int version;
+			synchronized (swapLock) {
+				final int version;
 
-			try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(path.toFile())))) {
-				version = readVersion(in, path.toFile());
-			} catch (IOException e) {
-				throw new UncheckedIOException("Could not read " + path, e);
-			}
-
-			if (version != FORMAT_VERSION) {
-				try {
-					Files.delete(path);
+				try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(path.toFile())))) {
+					version = readVersion(in, path.toFile());
 				} catch (IOException e) {
-					throw new UncheckedIOException("Could not delete outdated snapshot " + path, e);
+					throw new UncheckedIOException("Could not read " + path, e);
+				}
+
+				if (version != FORMAT_VERSION) {
+					try {
+						Files.delete(path);
+					} catch (IOException e) {
+						throw new UncheckedIOException("Could not delete outdated snapshot " + path, e);
+					}
 				}
 			}
 		}

@@ -573,7 +573,7 @@ function hello (connection, id) {
 }
 
 // The mod runs another commit than this relay: its checkout is reset to it by force, whatever it had
-// (npm install too when package.json changed), and this relay ends for its supervisor to start a new
+// (npm ci too when package-lock.json changed), and this relay ends for its supervisor to start a new
 // one on it, handed the same connection and the mod's commit to check once more.
 function update (connection, id, version) {
   if (!/^[0-9a-f]{40}$/.test(version)) {
@@ -583,12 +583,12 @@ function update (connection, id, version) {
   const text = `the mod runs commit ${version}, this relay ${VERSION}: git fetch, reset --hard and restart`
   console.log(text)
   send(protocol.updating(text))
-  const packageFile = path.join(__dirname, 'package.json')
-  const packageJson = fs.readFileSync(packageFile)
+  const lockFile = path.join(__dirname, 'package-lock.json')
+  const lock = fs.readFileSync(lockFile)
   try {
     execSync('git fetch', { cwd: __dirname, stdio: 'inherit' })
     execSync(`git reset --hard ${version}`, { cwd: __dirname, stdio: 'inherit' })
-    if (!fs.readFileSync(packageFile).equals(packageJson)) execSync('npm install --no-audit --no-fund', { cwd: __dirname, stdio: 'inherit' })
+    if (!fs.readFileSync(lockFile).equals(lock)) execSync('npm ci --no-audit --no-fund', { cwd: __dirname, stdio: 'inherit' })
   } catch (err) {
     refuse(connection, `the update failed: ${err.message}`)
     return

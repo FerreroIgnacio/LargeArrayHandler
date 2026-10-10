@@ -10,6 +10,8 @@ import java.io.OutputStreamWriter;
 import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -71,7 +73,7 @@ public final class AreaStore {
 	private Area parse(String line) {
 		final String[] parts = line.split("\t", -1);
 
-		if (parts.length != 9 && parts.length != 10) {
+		if (parts.length != 9) {
 			throw new IllegalStateException("Malformed area line in " + file + ": " + line);
 		}
 
@@ -91,15 +93,21 @@ public final class AreaStore {
 			throw new IllegalStateException("Could not create " + parent);
 		}
 
-		try (Writer writer = new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8)) {
-			for (int i = 0; i < areas.size(); i++) {
-				final Area area = areas.get(i);
+		// Written beside it and moved over it: a crash mid-write leaves the last whole file.
+		final File temporary = new File(file.getPath() + ".tmp");
 
-				writer.write(area.getId() + '\t' + escape(area.getName()) + '\t' + Integer.toHexString(area.getColor())
-						+ '\t' + area.getMinX() + '\t' + area.getMinY() + '\t' + area.getMinZ()
-						+ '\t' + area.getMaxX() + '\t' + area.getMaxY() + '\t' + area.getMaxZ() + '\n');
+		try {
+			try (Writer writer = new OutputStreamWriter(new FileOutputStream(temporary), StandardCharsets.UTF_8)) {
+				for (int i = 0; i < areas.size(); i++) {
+					final Area area = areas.get(i);
+
+					writer.write(area.getId() + '\t' + escape(area.getName()) + '\t' + Integer.toHexString(area.getColor())
+							+ '\t' + area.getMinX() + '\t' + area.getMinY() + '\t' + area.getMinZ()
+							+ '\t' + area.getMaxX() + '\t' + area.getMaxY() + '\t' + area.getMaxZ() + '\n');
+				}
 			}
 
+			Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 			dirty = false;
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not write " + file, e);

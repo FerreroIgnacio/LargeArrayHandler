@@ -1,0 +1,18 @@
+Errores conocidos sin arreglar (auditoría del repo). Los de diseño aceptados están en designWarnings.txt.
+
+1. Commit del mod con el árbol sucio: el build manda a los relays `git rev-parse HEAD`, que ignora los cambios sin commitear. Un mod compilado con cambios locales corre scripts que el relay no tiene: los dos dicen el mismo commit y corren código distinto, sin error. (common/build.gradle, RelayHub.commit)
+
+2. Clicks del mod y primitivas en paralelo: la cola de clicks del mod (bot.js, `clicks`) no se serializa con `act.run`, y las dos comparten los contadores globales `rejections`/`resyncs` (actions.js). Encima el server manda `set_slot -1 -1` en cada apertura de window (sendAllContents), que suma a `resyncs` sin rechazo. Un clickSlot/syncedClick puede seguir sin esperar su propio resync (lee la window vieja) o esperar `windowResync` para siempre.
+
+3. "Fallar fuerte" no llega a los hilos secundarios: una excepción en mapmcbot-relay-reader, mapmcbot-fleet-output o mapmcbot-snapshot-sweep imprime el stacktrace y mata solo ese hilo; el juego sigue en un estado inconsistente. No hay UncaughtExceptionHandler. En JS, la cadena `clicks` de bot.js queda rechazada para siempre tras el primer rechazo: cada click siguiente es otro unhandled rejection.
+
+4. Relay sin autenticación: relaySupervisor.js escucha en todas las interfaces. Cualquiera en la red puede hacerle `reset --hard` a cualquier commit del remoto (el hash se valida, el origen no) y mandar bots a cualquier host.
+
+5. Carrera en BotManager.shutdown: si el shutdown hook corre entre `fleet = process` y la asignación de `reader` en startFleet, `reader.join()` tira NPE.
+
+6. Relays y el lock de npm: el relay solo corre `npm ci` al actualizarse (fleet.js, update), si el lock cambió. Uno que arranca ya en el commit (pull a mano, instalación nueva) no compara su node_modules con el lock, como sí hace el mod (BotManager, .mapmcbot-lock.json). Además node_modules/ no está en .gitignore: en el checkout de un relay un `git add -A` lo commitea, y un npm corrido en common/src/main/resources/bot lo mete en el jar.
+
+7. Menores:
+   - RelayHub: dos javadocs seguidos sobre keepLog; el primero ("The relay's errors...") es de keepCrash.
+   - actions.js (move): un mensaje de error en castellano ("faltaron") entre los demás en inglés.
+   - BotManager.send: un frame a un bot ya ido (después de BOT_GONE) vuelve a crear su entrada en `traffic`, que no se borra más.

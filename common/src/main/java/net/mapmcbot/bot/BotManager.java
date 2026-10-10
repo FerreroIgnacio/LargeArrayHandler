@@ -21,6 +21,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -55,7 +56,7 @@ import net.mapmcbot.profile.ProfileReport;
 public final class BotManager implements FleetChannel {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "profiler.js", "protocol.js", "states.js", "relaySupervisor.js", "columnSerializer.js", "package.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "profiler.js", "protocol.js", "states.js", "relaySupervisor.js", "columnSerializer.js", "package.json", "package-lock.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
@@ -287,15 +288,21 @@ public final class BotManager implements FleetChannel {
 
 		extractScripts();
 
-		if (!new File(directory, "node_modules/mineflayer").isDirectory() || !new File(directory, "node_modules/mineflayer-pathfinder").isDirectory()
-				|| !new File(directory, "node_modules/@riaskov/mmap-io").isDirectory()) {
-			System.out.println("[mapmcbot] installing mineflayer in " + directory);
-			final int exit = new ProcessBuilder(WINDOWS ? "npm.cmd" : "npm", "install", "--no-audit", "--no-fund")
+		// node_modules is the lock's exactly (npm ci): installed again whenever the lock differs from the
+		// one it was last installed from, kept beside it once the install went through.
+		final File lock = new File(directory, "package-lock.json");
+		final File installed = new File(directory, "node_modules/.mapmcbot-lock.json");
+
+		if (!installed.isFile() || !Arrays.equals(Files.readAllBytes(lock.toPath()), Files.readAllBytes(installed.toPath()))) {
+			System.out.println("[mapmcbot] installing the bot's packages (npm ci) in " + directory);
+			final int exit = new ProcessBuilder(WINDOWS ? "npm.cmd" : "npm", "ci", "--no-audit", "--no-fund")
 					.directory(directory).inheritIO().start().waitFor();
 
 			if (exit != 0) {
-				throw new IOException("npm install failed (exit " + exit + ")");
+				throw new IOException("npm ci failed (exit " + exit + ")");
 			}
+
+			Files.copy(lock.toPath(), installed.toPath(), StandardCopyOption.REPLACE_EXISTING);
 		}
 
 		socketLog = new PrintWriter(new BufferedWriter(new OutputStreamWriter(new FileOutputStream(new File(directory, "socket.log"), false), StandardCharsets.UTF_8), 1 << 16));

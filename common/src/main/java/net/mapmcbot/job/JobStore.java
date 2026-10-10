@@ -10,6 +10,8 @@ import java.io.OutputStreamWriter;
 import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -203,17 +205,24 @@ public final class JobStore {
 			throw new IllegalStateException("Could not create " + parent);
 		}
 
-		try (Writer writer = new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8)) {
-			for (Job job : jobs) {
-				writer.write(NAME);
-				writer.write(job.name);
-				writer.write('\n');
+		// Written beside it and moved over it: a crash mid-write leaves the last whole file.
+		final File temporary = new File(file.getPath() + ".tmp");
 
-				for (String step : job.steps) {
-					writer.write(step);
+		try {
+			try (Writer writer = new OutputStreamWriter(new FileOutputStream(temporary), StandardCharsets.UTF_8)) {
+				for (Job job : jobs) {
+					writer.write(NAME);
+					writer.write(job.name);
 					writer.write('\n');
+
+					for (String step : job.steps) {
+						writer.write(step);
+						writer.write('\n');
+					}
 				}
 			}
+
+			Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not write " + file, e);
 		}
