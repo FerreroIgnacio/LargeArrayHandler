@@ -21,6 +21,7 @@ import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.BotStatus;
 import net.mapmcbot.bot.BotWindow;
 import net.mapmcbot.job.JobRunner;
+import net.mapmcbot.job.JobStore;
 import net.minecraft.client.render.DiffuseLighting;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -96,6 +97,7 @@ public class BotScreen extends HandledScreen {
 			{"Trade", "#trade %s %d"},
 			{"Stop", "#stop %s"},
 			{"Grab", null},
+			{"Deposit", null},
 			{"Index", null},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
@@ -125,17 +127,31 @@ public class BotScreen extends HandledScreen {
 	private static final int CANCEL_ID = 101;
 	private static final int START_JOB_ID = 102;
 	private static final int STOP_JOB_ID = 103;
-	/** The row of the job's Start and Stop under the primitives' buttons. */
+	private static final int LOOP_JOB_ID = 104;
+	/** The row of the job's Loop, Start and Stop under the primitives' buttons. */
 	private static final int JOB_ROW = 22;
-	private static final int JOB_BUTTON_WIDTH = (3 * BUTTON_WIDTH + 2) / 2;
 
-	/** The job panel at the right edge: its width, a step card's height, the little buttons on a card, the record button's height. */
+	/**
+	 * The job panel at the right edge: its width, its header (the arrows and the name, then the job's
+	 * place and its delete), a step card's height, its number's badge, the little buttons on a card,
+	 * the record button's height.
+	 */
 	private static final int JOB_WIDTH = 150;
+	private static final int ARROW_WIDTH = 16;
+	private static final int HEADER_HEIGHT = 18;
+	private static final int DELETE_WIDTH = 40;
 	private static final int STEP_HEIGHT = 26;
+	private static final int BADGE_WIDTH = 16;
 	private static final int STEP_BUTTON = 10;
 	private static final int RECORD_HEIGHT = 20;
+	private static final int JOB_BACKGROUND = 0x90000000;
+	private static final int BADGE = 0xFF20242B;
+	private static final int DIVIDER = 0x40FFFFFF;
 	private static final int STEP_RUNNING = 0xE0284A30;
+	private static final int BADGE_RUNNING = 0xFF3C8C4A;
 	private static final int RECORDING = 0xE0803030;
+	private static final int RECORD_DOT = 0xFFE04040;
+	private static final int DANGER = 0xFFFF6060;
 
 	/**
 	 * What a click on a slot does instead of reaching the bot: move's origin then its destination, or a
@@ -143,7 +159,7 @@ public class BotScreen extends HandledScreen {
 	 * wait's item, the slot holding the item it waits for; or the hotbar slot to take into its hand.
 	 */
 	private enum Pick {
-		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, INDEX
+		NONE, MOVE_FROM, MOVE_TO, WAIT, WAIT_ITEM, HOTBAR, FILL_ITEM, FILL_TARGETS, GRAB_ITEM, GRAB, DEPOSIT_ITEM, DEPOSIT, INDEX
 	}
 
 	private Pick pick = Pick.NONE;
@@ -167,8 +183,13 @@ public class BotScreen extends HandledScreen {
 	private ButtonWidget cancelButton;
 	private ButtonWidget startJobButton;
 	private ButtonWidget stopJobButton;
+	private ButtonWidget loopJobButton;
+	/** The shown job's name, edited in place. */
+	private TextFieldWidget jobName;
 	/** The first step card shown in the job panel. */
 	private int jobScroll;
+	/** Whether Delete was pressed and the next click on it deletes the job; any other click takes it back. */
+	private boolean deleting;
 
 	/** Each bot's wait sent, its slots lit until it ends: kept between openings. */
 	private static final Map<String, Sent> sent = new HashMap<String, Sent>();
@@ -273,8 +294,12 @@ public class BotScreen extends HandledScreen {
 		grabCount.setMaxLength(5);
 		grabCount.setText(countText);
 		grabAreaButton = new ButtonWidget(0, 0, 0, 2 * BUTTON_WIDTH + 1, 20, "");
-		startJobButton = new ButtonWidget(START_JOB_ID, 0, 0, JOB_BUTTON_WIDTH, 20, "Start job");
-		stopJobButton = new ButtonWidget(STOP_JOB_ID, 0, 0, JOB_BUTTON_WIDTH, 20, "Stop job");
+		loopJobButton = new ButtonWidget(LOOP_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Loop job");
+		startJobButton = new ButtonWidget(START_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Start job");
+		stopJobButton = new ButtonWidget(STOP_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Stop job");
+		jobName = new TextFieldWidget(4, textRenderer, 0, 0, JOB_WIDTH - 2 * ARROW_WIDTH - 6, HEADER_HEIGHT - 2);
+		jobName.setMaxLength(48);
+		jobName.setText(MapMcBotClient.job().getSelected().getName());
 
 		final List<String> names = names();
 
@@ -289,8 +314,8 @@ public class BotScreen extends HandledScreen {
 	private void launch(int index) {
 		if (ACTIONS[index][1] == null) {
 			final String label = ACTIONS[index][0];
-			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Index") ? Pick.INDEX : Pick.WAIT;
-			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS) || (start == Pick.GRAB_ITEM && pick == Pick.GRAB);
+			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : Pick.WAIT;
+			final boolean again = pick == start || (start == Pick.MOVE_FROM && pick == Pick.MOVE_TO) || (start == Pick.FILL_ITEM && pick == Pick.FILL_TARGETS) || (start == Pick.GRAB_ITEM && pick == Pick.GRAB) || (start == Pick.DEPOSIT_ITEM && pick == Pick.DEPOSIT);
 			resetPick();
 
 			// The same button again leaves the pick.
@@ -504,15 +529,21 @@ public class BotScreen extends HandledScreen {
 		tradeField.y = tradeButton.y + 1;
 		tradeField.render();
 
-		// Start and Stop job under them, the one lit being the one that can be pressed.
+		// Loop, Start and Stop job under them, the ones lit being the ones that can be pressed.
 		final JobRunner job = MapMcBotClient.job();
 		final boolean running = job.isRunning(selected);
-		startJobButton.x = x;
-		startJobButton.y = top + ACTION_ROWS * 21 + 1;
-		startJobButton.active = !running && job.getJob().size() > 0;
+		final boolean startable = !running && job.getSelected().size() > 0;
+		loopJobButton.x = x;
+		loopJobButton.y = top + ACTION_ROWS * 21 + 1;
+		loopJobButton.active = startable;
+		loopJobButton.message = running && job.isLooping(selected) ? "Looping" : "Loop job";
+		loopJobButton.method_891(client, mouseX, mouseY, tickDelta);
+		startJobButton.x = x + BUTTON_WIDTH + 1;
+		startJobButton.y = loopJobButton.y;
+		startJobButton.active = startable;
 		startJobButton.method_891(client, mouseX, mouseY, tickDelta);
-		stopJobButton.x = x + JOB_BUTTON_WIDTH + 2;
-		stopJobButton.y = startJobButton.y;
+		stopJobButton.x = x + 2 * (BUTTON_WIDTH + 1);
+		stopJobButton.y = loopJobButton.y;
 		stopJobButton.active = running;
 		stopJobButton.method_891(client, mouseX, mouseY, tickDelta);
 
@@ -528,9 +559,14 @@ public class BotScreen extends HandledScreen {
 		return width - MARGIN - JOB_WIDTH;
 	}
 
-	/** The room the steps' cards have, between the title and the record button. */
+	/** The second line of the header: the job's place among them and its delete. */
+	private int jobInfoTop() {
+		return MARGIN + HEADER_HEIGHT + 4;
+	}
+
+	/** The room the steps' cards have, between the header and the record button. */
 	private int stepsTop() {
-		return MARGIN + 14;
+		return jobInfoTop() + 15;
 	}
 
 	private int recordTop() {
@@ -558,59 +594,153 @@ public class BotScreen extends HandledScreen {
 		return new String[] {step.get("action").getAsString(), args.toString()};
 	}
 
-	/** The job, right of everything: a card for each step, the one the selected bot is on lit, and the record button under them. */
+	private static boolean over(int mouseX, int mouseY, int left, int top, int w, int h) {
+		return mouseX >= left && mouseX < left + w && mouseY >= top && mouseY < top + h;
+	}
+
+	/** Shows the job, its name in the field and its steps from the first. */
+	private void showJob(JobStore.Job shown) {
+		MapMcBotClient.job().select(shown);
+		jobName.setText(shown.getName());
+		jobName.setFocused(false);
+		jobScroll = 0;
+	}
+
+	/**
+	 * The jobs, right of everything: the shown one's name between the arrows to the others, its place
+	 * and Delete, a card for each step (the one the selected bot is on lit) and the record button.
+	 */
 	private void drawJobPanel(int mouseX, int mouseY) {
 		final JobRunner job = MapMcBotClient.job();
-		final List<String> steps = job.getJob().getSteps();
+		final JobStore jobs = job.getJobs();
+		final JobStore.Job shown = job.getSelected();
+		final int index = jobs.indexOf(shown);
+		final List<String> steps = shown.getSteps();
 		final int left = jobLeft();
-		final int onStep = selected == null ? -1 : job.stepOf(selected);
-		textRenderer.drawWithShadow("Job (" + steps.size() + " steps)", left, MARGIN, TEXT);
+		final int onStep = selected == null || job.jobOf(selected) != shown ? -1 : job.stepOf(selected);
+		fill(left - 4, MARGIN - 4, left + JOB_WIDTH + 4, height - MARGIN + 4, JOB_BACKGROUND);
+
+		// The header: the arrows, the one past the last making a new job, and the name between them.
+		drawJobArrow(left, "<", index > 0, mouseX, mouseY);
+		drawJobArrow(left + JOB_WIDTH - ARROW_WIDTH, index < jobs.count() - 1 ? ">" : "+", true, mouseX, mouseY);
+		jobName.x = left + ARROW_WIDTH + 3;
+		jobName.y = MARGIN + 1;
+		jobName.render();
+
+		final int info = jobInfoTop();
+		textRenderer.drawWithShadow("Job " + (index + 1) + "/" + jobs.count() + "  ·  " + steps.size() + (steps.size() == 1 ? " step" : " steps"), left + 2, info + 2, DIM);
+		final int deleteLeft = left + JOB_WIDTH - DELETE_WIDTH;
+		final boolean overDelete = over(mouseX, mouseY, deleteLeft, info, DELETE_WIDTH, 12);
+		fill(deleteLeft, info, left + JOB_WIDTH, info + 12, deleting ? RECORDING : overDelete ? CARD_SELECTED : CARD);
+		drawCenteredString(textRenderer, deleting ? "Sure?" : "Delete", deleteLeft + DELETE_WIDTH / 2, info + 2, deleting || overDelete ? DANGER : DIM);
+		fill(left, stepsTop() - 4, left + JOB_WIDTH, stepsTop() - 3, DIVIDER);
+
 		jobScroll = Math.max(0, Math.min(jobScroll, steps.size() - visibleSteps()));
 		String tooltip = null;
+
+		if (steps.isEmpty()) {
+			drawCenteredString(textRenderer, "No steps yet", left + JOB_WIDTH / 2, stepsTop() + 16, DIM);
+			drawCenteredString(textRenderer, "Record one below", left + JOB_WIDTH / 2, stepsTop() + 28, DIM);
+		}
 
 		for (int i = jobScroll; i < steps.size() && i < jobScroll + visibleSteps(); i++) {
 			final int top = stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2);
 			final String[] text = describe(steps.get(i));
-			fill(left, top, left + JOB_WIDTH, top + STEP_HEIGHT, i == onStep ? STEP_RUNNING : CARD);
-			textRenderer.drawWithShadow(textRenderer.trimToWidth((i + 1) + ". " + text[0], JOB_WIDTH - 4 - STEP_BUTTON - 4), left + 4, top + 3, TEXT);
-			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[1], JOB_WIDTH - 8), left + 4, top + 14, DIM);
-			drawStepButton(left, top, 0, "^", mouseX, mouseY);
-			drawStepButton(left, top, 1, "v", mouseX, mouseY);
-			drawStepButton(left, top, 2, "x", mouseX, mouseY);
+			final boolean overCard = over(mouseX, mouseY, left, top, JOB_WIDTH, STEP_HEIGHT);
+			fill(left, top, left + JOB_WIDTH, top + STEP_HEIGHT, i == onStep ? STEP_RUNNING : overCard ? CARD_SELECTED : CARD);
+			fill(left, top, left + BADGE_WIDTH, top + STEP_HEIGHT, i == onStep ? BADGE_RUNNING : BADGE);
+			drawCenteredString(textRenderer, String.valueOf(i + 1), left + BADGE_WIDTH / 2, top + (STEP_HEIGHT - 8) / 2, i == onStep ? TEXT : DIM);
 
-			if (mouseX >= left && mouseX < left + JOB_WIDTH - STEP_BUTTON - 4 && mouseY >= top && mouseY < top + STEP_HEIGHT) {
-				tooltip = text[0] + " " + text[1];
+			// The little buttons only on the card under the mouse, the title having the card's width otherwise.
+			final int textWidth = JOB_WIDTH - BADGE_WIDTH - 8;
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[0], textWidth - (overCard ? 3 * (STEP_BUTTON + 1) + 2 : 0)), left + BADGE_WIDTH + 4, top + 3, TEXT);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(text[1], textWidth), left + BADGE_WIDTH + 4, top + 14, DIM);
+
+			if (overCard) {
+				drawStepButton(left, top, 0, "^", mouseX, mouseY);
+				drawStepButton(left, top, 1, "v", mouseX, mouseY);
+				drawStepButton(left, top, 2, "x", mouseX, mouseY);
+
+				if (stepButtonAt(left, top, mouseX, mouseY) < 0) {
+					tooltip = text[0] + " " + text[1];
+				}
 			}
 		}
 
+		// A scroll bar at the right edge while not every step fits.
+		if (steps.size() > visibleSteps()) {
+			final int trackTop = stepsTop();
+			final int trackHeight = visibleSteps() * (STEP_HEIGHT + 2) - 2;
+			final int thumbHeight = Math.max(8, trackHeight * visibleSteps() / steps.size());
+			final int thumbTop = trackTop + (trackHeight - thumbHeight) * jobScroll / (steps.size() - visibleSteps());
+			fill(left + JOB_WIDTH + 1, trackTop, left + JOB_WIDTH + 3, trackTop + trackHeight, DIVIDER);
+			fill(left + JOB_WIDTH + 1, thumbTop, left + JOB_WIDTH + 3, thumbTop + thumbHeight, DIM);
+		}
+
+		// Record, its dot white while armed.
 		final boolean armed = job.isArmed();
-		fill(left, recordTop(), left + JOB_WIDTH, recordTop() + RECORD_HEIGHT, armed ? RECORDING : overRecord(mouseX, mouseY) ? CARD_SELECTED : CARD);
-		drawCenteredString(textRenderer, armed ? "Recording: do a primitive" : "Record step", left + JOB_WIDTH / 2, recordTop() + 6, TEXT);
+		final int recordTop = recordTop();
+		fill(left, recordTop, left + JOB_WIDTH, recordTop + RECORD_HEIGHT, armed ? RECORDING : overRecord(mouseX, mouseY) ? CARD_SELECTED : CARD);
+		fill(left + 8, recordTop + 7, left + 14, recordTop + 13, armed ? TEXT : RECORD_DOT);
+
+		drawCenteredString(textRenderer, armed ? "Recording: do a primitive" : "Record step", left + JOB_WIDTH / 2 + 6, recordTop + 6, TEXT);
 
 		if (tooltip != null) {
 			renderTooltip(tooltip, mouseX, mouseY);
 		}
 	}
 
-	/** One of a card's three little buttons (up, down, delete), stacked at its right edge. */
+	/** An arrow of the header, dim when it leads nowhere. */
+	private void drawJobArrow(int left, String label, boolean active, int mouseX, int mouseY) {
+		final boolean overArrow = active && over(mouseX, mouseY, left, MARGIN, ARROW_WIDTH, HEADER_HEIGHT);
+		fill(left, MARGIN, left + ARROW_WIDTH, MARGIN + HEADER_HEIGHT, overArrow ? CARD_SELECTED : CARD);
+		drawCenteredString(textRenderer, label, left + ARROW_WIDTH / 2, MARGIN + 5, active ? TEXT : DIM);
+	}
+
+	/** The left edge of a card's little button: up, down and delete in a row at its top right. */
+	private static int stepButtonLeft(int left, int index) {
+		return left + JOB_WIDTH - 2 - (3 - index) * (STEP_BUTTON + 1) + 1;
+	}
+
+	/** The card's little button under the mouse, -1 for none. */
+	private static int stepButtonAt(int left, int top, int mouseX, int mouseY) {
+		for (int index = 0; index < 3; index++) {
+			if (over(mouseX, mouseY, stepButtonLeft(left, index), top + 2, STEP_BUTTON, STEP_BUTTON)) {
+				return index;
+			}
+		}
+
+		return -1;
+	}
+
 	private void drawStepButton(int left, int top, int index, String label, int mouseX, int mouseY) {
-		final int bx = left + JOB_WIDTH - STEP_BUTTON - 2;
-		final int by = top + 2 + index * (STEP_BUTTON + 1);
-		final boolean over = mouseX >= bx && mouseX < bx + STEP_BUTTON && mouseY >= by && mouseY < by + STEP_BUTTON;
-		fill(bx, by, bx + STEP_BUTTON, by + STEP_BUTTON, over ? CARD_SELECTED : 0xFF000000 | 0x20242B);
-		drawCenteredString(textRenderer, label, bx + STEP_BUTTON / 2, by + 1, TEXT);
+		final int bx = stepButtonLeft(left, index);
+		final int by = top + 2;
+		final boolean overButton = over(mouseX, mouseY, bx, by, STEP_BUTTON, STEP_BUTTON);
+		fill(bx, by, bx + STEP_BUTTON, by + STEP_BUTTON, overButton ? CARD_SELECTED : BADGE);
+		drawCenteredString(textRenderer, label, bx + STEP_BUTTON / 2, by + 1, index == 2 && overButton ? DANGER : TEXT);
 	}
 
 	private boolean overRecord(int mouseX, int mouseY) {
-		return mouseX >= jobLeft() && mouseX < jobLeft() + JOB_WIDTH && mouseY >= recordTop() && mouseY < recordTop() + RECORD_HEIGHT;
+		return over(mouseX, mouseY, jobLeft(), recordTop(), JOB_WIDTH, RECORD_HEIGHT);
 	}
 
-	/** A click on the job panel: the record button or a card's little buttons; whether it was on the panel. */
+	/** A click on the job panel: the header, the record button or a card's little buttons; whether it was on the panel. */
 	private boolean clickJobPanel(int mouseX, int mouseY, int button) {
 		final int left = jobLeft();
+		final boolean confirming = deleting;
+		deleting = false;
 
-		if (mouseX < left || mouseX >= left + JOB_WIDTH) {
+		if (mouseX < left - 4 || mouseX >= left + JOB_WIDTH + 4) {
 			return false;
+		}
+
+		// The other fields let go of the keys: the name may be taking them.
+		tradeField.setFocused(false);
+		grabCount.setFocused(false);
+
+		for (Wait wait : waits) {
+			wait.min.setFocused(false);
 		}
 
 		if (button != 0) {
@@ -618,33 +748,54 @@ public class BotScreen extends HandledScreen {
 		}
 
 		final JobRunner job = MapMcBotClient.job();
+		final JobStore jobs = job.getJobs();
+		final JobStore.Job shown = job.getSelected();
+		final int index = jobs.indexOf(shown);
+
+		if (over(mouseX, mouseY, left, MARGIN, ARROW_WIDTH, HEADER_HEIGHT)) {
+			if (index > 0) {
+				showJob(jobs.get(index - 1));
+			}
+
+			return true;
+		}
+
+		if (over(mouseX, mouseY, left + JOB_WIDTH - ARROW_WIDTH, MARGIN, ARROW_WIDTH, HEADER_HEIGHT)) {
+			showJob(index < jobs.count() - 1 ? jobs.get(index + 1) : jobs.create());
+			return true;
+		}
+
+		// Delete asks for a second click; the job before takes its place.
+		if (over(mouseX, mouseY, left + JOB_WIDTH - DELETE_WIDTH, jobInfoTop(), DELETE_WIDTH, 12)) {
+			if (confirming) {
+				jobs.remove(shown);
+				showJob(jobs.indexOf(shown) >= 0 ? shown : jobs.get(Math.max(0, index - 1)));
+			} else {
+				deleting = true;
+			}
+
+			return true;
+		}
 
 		if (overRecord(mouseX, mouseY)) {
 			job.setArmed(!job.isArmed());
 			return true;
 		}
 
-		final int size = job.getJob().size();
+		final int size = shown.size();
 
 		for (int i = jobScroll; i < size && i < jobScroll + visibleSteps(); i++) {
-			final int top = stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2);
-			final int bx = left + JOB_WIDTH - STEP_BUTTON - 2;
+			final int which = stepButtonAt(left, stepsTop() + (i - jobScroll) * (STEP_HEIGHT + 2), mouseX, mouseY);
 
-			if (mouseX < bx || mouseX >= bx + STEP_BUTTON) {
-				continue;
+			if (which == 0) {
+				shown.move(i, -1);
+			} else if (which == 1) {
+				shown.move(i, 1);
+			} else if (which == 2) {
+				shown.remove(i);
 			}
 
-			final int which = (mouseY - top - 2) / (STEP_BUTTON + 1);
-
-			if (mouseY >= top + 2 && which >= 0 && which <= 2 && (mouseY - top - 2) % (STEP_BUTTON + 1) < STEP_BUTTON) {
-				if (which == 0) {
-					job.getJob().move(i, -1);
-				} else if (which == 1) {
-					job.getJob().move(i, 1);
-				} else {
-					job.getJob().remove(i);
-				}
-
+			if (which >= 0) {
 				return true;
 			}
 		}
@@ -786,6 +937,8 @@ public class BotScreen extends HandledScreen {
 				: pick == Pick.FILL_TARGETS ? "ItemFill: click the slots to fill"
 				: pick == Pick.GRAB_ITEM ? "Grab: click a slot holding the item to grab"
 				: pick == Pick.GRAB ? "Grab: the area to take it from and how many"
+				: pick == Pick.DEPOSIT_ITEM ? "Deposit: click a slot holding the item to deposit"
+				: pick == Pick.DEPOSIT ? "Deposit: the area to leave it in and how many"
 				: pick == Pick.INDEX ? "Index: the area whose chests to look in"
 				: "Wait: click the slots to wait on, an item to change it";
 		textRenderer.drawWithShadow(prompt, x, top, TEXT);
@@ -834,7 +987,7 @@ public class BotScreen extends HandledScreen {
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
-		if (pick == Pick.GRAB) {
+		if (pick == Pick.GRAB || pick == Pick.DEPOSIT) {
 			textRenderer.drawWithShadow(grabFilter.reference.getName() + " (" + grabFilter.label() + ")", x, rowY + 2, DIM);
 			rowY += 12;
 			grabAreaButton.x = x;
@@ -863,7 +1016,7 @@ public class BotScreen extends HandledScreen {
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
-		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS || pick == Pick.GRAB || pick == Pick.INDEX ? x + BUTTON_WIDTH + 1 : x;
+		cancelButton.x = pick == Pick.WAIT || pick == Pick.WAIT_ITEM || pick == Pick.FILL_TARGETS || pick == Pick.GRAB || pick == Pick.DEPOSIT || pick == Pick.INDEX ? x + BUTTON_WIDTH + 1 : x;
 		cancelButton.y = rowY + 2;
 		cancelButton.method_891(client, mouseX, mouseY, 0);
 
@@ -951,6 +1104,7 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
+			case DEPOSIT_ITEM:
 			case GRAB_ITEM: {
 				final BotInventory.Item there = itemOn(slot);
 
@@ -966,11 +1120,12 @@ public class BotScreen extends HandledScreen {
 					grabArea = nextArea(null);
 				}
 
-				pick = Pick.GRAB;
+				pick = pick == Pick.DEPOSIT_ITEM ? Pick.DEPOSIT : Pick.GRAB;
 				return;
 			}
 
 			case GRAB:
+			case DEPOSIT:
 			case INDEX:
 				return;
 
@@ -1080,10 +1235,10 @@ public class BotScreen extends HandledScreen {
 		bots.action(selected, a.toString());
 	}
 
-	/** The grab started on the selected bot, as an order from outside: recorded when armed. */
+	/** The grab or deposit started on the selected bot, as an order from outside: recorded when armed. */
 	private void startGrab() {
 		final JsonObject a = new JsonObject();
-		a.addProperty("action", "grab");
+		a.addProperty("action", pick == Pick.DEPOSIT ? "deposit" : "grab");
 		a.addProperty("area", grabArea);
 		a.add("item", grabFilter.toJson());
 		a.addProperty("count", Integer.parseInt(grabCount.getText()));
@@ -1158,6 +1313,7 @@ public class BotScreen extends HandledScreen {
 	public void tick() {
 		super.tick();
 		tradeField.tick();
+		jobName.tick();
 
 		for (Wait wait : waits) {
 			wait.min.tick();
@@ -1684,6 +1840,8 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
+		jobName.method_920(mouseX, mouseY, button);
+
 		if (clickJobPanel(mouseX, mouseY, button)) {
 			return;
 		}
@@ -1722,9 +1880,15 @@ public class BotScreen extends HandledScreen {
 					}
 				}
 
+				if (loopJobButton.active && loopJobButton.isMouseOver(client, mouseX, mouseY)) {
+					resetPick();
+					MapMcBotClient.job().start(selected, true);
+					return;
+				}
+
 				if (startJobButton.active && startJobButton.isMouseOver(client, mouseX, mouseY)) {
 					resetPick();
-					MapMcBotClient.job().start(selected);
+					MapMcBotClient.job().start(selected, false);
 					return;
 				}
 
@@ -1750,7 +1914,7 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
-			if (button == 0 && pick == Pick.GRAB && startButton.active && startButton.isMouseOver(client, mouseX, mouseY)) {
+			if (button == 0 && (pick == Pick.GRAB || pick == Pick.DEPOSIT) && startButton.active && startButton.isMouseOver(client, mouseX, mouseY)) {
 				startGrab();
 				return;
 			}
@@ -1764,12 +1928,12 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
-			if (button == 0 && (pick == Pick.GRAB || pick == Pick.INDEX) && grabAreaButton.isMouseOver(client, mouseX, mouseY)) {
+			if (button == 0 && (pick == Pick.GRAB || pick == Pick.DEPOSIT || pick == Pick.INDEX) && grabAreaButton.isMouseOver(client, mouseX, mouseY)) {
 				grabArea = nextArea(grabArea);
 				return;
 			}
 
-			if (pick == Pick.GRAB) {
+			if (pick == Pick.GRAB || pick == Pick.DEPOSIT) {
 				grabCount.method_920(mouseX, mouseY, button);
 			}
 
@@ -1843,6 +2007,22 @@ public class BotScreen extends HandledScreen {
 	protected void keyPressed(char character, int keyCode) {
 		// A focused field takes every key but escape, B and E among them.
 		if (keyCode != 1) {
+			// The job's name, saved as it is typed; enter lets it go.
+			if (jobName.isFocused()) {
+				if (keyCode == 28 || keyCode == 156) {
+					jobName.setFocused(false);
+				} else {
+					jobName.keyPressed(character, keyCode);
+					final JobStore.Job shown = MapMcBotClient.job().getSelected();
+
+					if (!jobName.getText().equals(shown.getName())) {
+						shown.setName(jobName.getText());
+					}
+				}
+
+				return;
+			}
+
 			// Digits only, and the keys that edit (backspace, the arrows), which type no character.
 			if (tradeField.isFocused()) {
 				if (Character.isDigit(character) || character < ' ') {
@@ -1852,7 +2032,7 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
-			if (pick == Pick.GRAB && grabCount.isFocused()) {
+			if ((pick == Pick.GRAB || pick == Pick.DEPOSIT) && grabCount.isFocused()) {
 				if (Character.isDigit(character) || character < ' ') {
 					grabCount.keyPressed(character, keyCode);
 				}

@@ -28,6 +28,10 @@ import net.mapmcbot.job.JobRunner;
  * the rest; none left and still short, it fails. Each part is sent as the one before ends, by the
  * bot's state: nothing timed.
  *
+ * A deposit ({ action: deposit, area, item, count }) is the grab the other way: the bot leaves count of
+ * the item in the chests of the area, a chest with room (an empty slot) at a time; the chests known
+ * clean with room go first, then the dirty ones. None left and still holding some, it fails.
+ *
  * An index ({ action: index, area }) is the same walk without taking anything: the bot opens each
  * dirty chest of the area (the never seen too) and closes it, the tracker keeping what it saw, until
  * every chest of the area is clean.
@@ -44,6 +48,8 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		final int count;
 		final int target;
 		final int had;
+		/** Whether it leaves the item in the chests instead of taking it from them. */
+		final boolean deposit;
 		final JobRunner.Listener listener;
 		final Set<ChestStore.Chest> visited = new HashSet<ChestStore.Chest>();
 		ChestStore.Chest chest;
@@ -51,12 +57,13 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		/** The window as last seen while one was open, its inventory part what the bot has. */
 		BotWindow window;
 
-		Task(Area area, JsonObject item, int count, int had, JobRunner.Listener listener) {
+		Task(Area area, JsonObject item, int count, int had, boolean deposit, JobRunner.Listener listener) {
 			this.area = area;
 			this.item = item;
 			this.count = count;
 			this.had = had;
-			this.target = had + count;
+			this.deposit = deposit;
+			this.target = deposit ? had - count : had + count;
 			this.listener = listener;
 		}
 	}
@@ -115,7 +122,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 	@Override
 	public boolean handles(String json) {
 		final String action = new JsonParser().parse(json).getAsJsonObject().get("action").getAsString();
-		return action.equals("grab") || action.equals("index");
+		return action.equals("grab") || action.equals("deposit") || action.equals("index");
 	}
 
 	/** What the bot's grab is doing, or why it failed; null with none. */
@@ -127,7 +134,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		if (task != null) {
-			return "grab " + ItemSpec.describe(task.item) + " " + (task.window == null ? 0 : held(task) - task.had) + "/" + task.count + ": " + task.phase.name().toLowerCase() + (task.chest == null ? "" : " " + task.chest);
+			return (task.deposit ? "deposit " : "grab ") + ItemSpec.describe(task.item) + " " + (task.window == null ? 0 : Math.abs(held(task) - task.had)) + "/" + task.count + ": " + task.phase.name().toLowerCase() + (task.chest == null ? "" : " " + task.chest);
 		}
 
 		return errors.containsKey(bot) ? "error " + errors.get(bot) : null;
@@ -158,7 +165,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 				return;
 			}
 
-			final Task task = new Task(area, null, 0, 0, listener);
+			final Task task = new Task(area, null, 0, 0, false, listener);
 
 			if (tasks.putIfAbsent(bot, task) != null) {
 				throw new IllegalStateException(bot + " is already grabbing or indexing");
@@ -169,21 +176,23 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			return;
 		}
 
+		final boolean deposit = a.get("action").getAsString().equals("deposit");
+		final String name = deposit ? "deposit: " : "grab: ";
 		final int count = a.get("count").getAsInt();
 
 		if (count <= 0) {
-			throw new IllegalArgumentException("grab needs a positive count, got " + count);
+			throw new IllegalArgumentException(name + "needs a positive count, got " + count);
 		}
 
 		final BotInventory inventory = bots.getInventory(bot);
 
 		if (inventory == null) {
-			fail(bot, null, listener, "grab: no inventory of " + bot + " yet");
+			fail(bot, null, listener, name + "no inventory of " + bot + " yet");
 			return;
 		}
 
 		if (bots.getWindow(bot) != null) {
-			fail(bot, null, listener, "grab: expected no window open, found " + bots.getWindow(bot).getType());
+			fail(bot, null, listener, name + "expected no window open, found " + bots.getWindow(bot).getType());
 			return;
 		}
 
@@ -196,7 +205,12 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			}
 		}
 
-		final Task task = new Task(area, a.getAsJsonObject("item"), count, had, listener);
+		if (deposit && had < count) {
+			fail(bot, null, listener, "deposit: expected " + count + " x " + ItemSpec.describe(a.getAsJsonObject("item")) + " in " + bot + "'s inventory, found " + had);
+			return;
+		}
+
+		final Task task = new Task(area, a.getAsJsonObject("item"), count, had, deposit, listener);
 
 		if (tasks.putIfAbsent(bot, task) != null) {
 			throw new IllegalStateException(bot + " is already grabbing");
@@ -214,6 +228,12 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		if (order.isEmpty() && task.item == null) {
 			tasks.remove(bot);
 			task.listener.done();
+			return;
+		}
+
+		if (order.isEmpty() && task.deposit) {
+			final int left = task.window == null ? task.count : held(task) - task.target;
+			fail(bot, task, task.listener, "deposit: expected room for " + left + " x " + ItemSpec.describe(task.item) + " in area " + task.area.getName() + ", found none in its chests");
 			return;
 		}
 
@@ -243,6 +263,17 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			if (task.item == null) {
 				if (chest.isDirty()) {
 					dirty.add(chest);
+				}
+
+				continue;
+			}
+
+			// A deposit goes where there is room: a clean chest with an empty slot, or one that may have it.
+			if (task.deposit) {
+				if (chest.isDirty()) {
+					dirty.add(chest);
+				} else if (chest.getContents().contains(null)) {
+					withIt.add(chest);
 				}
 
 				continue;
@@ -290,7 +321,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		}
 
 		if (status.getKind() == BotStatus.Kind.ERROR) {
-			fail(bot, task, task.listener, (task.item == null ? "index: " : "grab: ") + status.getPrimitive() + ": " + status.getMessage());
+			fail(bot, task, task.listener, name(task) + status.getPrimitive() + ": " + status.getMessage());
 			return;
 		}
 
@@ -332,7 +363,7 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 			}
 
 			case CLOSE:
-				if (task.item != null && held(task) >= task.target) {
+				if (task.item != null && (task.deposit ? held(task) <= task.target : held(task) >= task.target)) {
 					tasks.remove(bot);
 					task.listener.done();
 				} else {
@@ -387,6 +418,12 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 
 		final int own = window.getContainerSlots();
 		final List<BotInventory.Item> slots = window.getSlots();
+
+		if (task.deposit) {
+			deposit(bot, task, window);
+			return;
+		}
+
 		final JsonArray sources = new JsonArray();
 
 		for (int i = 0; i < own; i++) {
@@ -431,6 +468,58 @@ final class Grab implements JobRunner.Resolver, BotRegistry.StateListener, BotRe
 		a.add("targets", targets);
 		a.addProperty("count", wanted);
 		bots.actionInternal(bot, a.toString());
+	}
+
+	/** The inventory's items the chest has room for, into it, no more than still to leave; with no room or none to leave, closed. */
+	private void deposit(String bot, Task task, BotWindow window) {
+		final int own = window.getContainerSlots();
+		final List<BotInventory.Item> slots = window.getSlots();
+		final JsonArray sources = new JsonArray();
+
+		for (int i = own; i < slots.size(); i++) {
+			if (ItemSpec.matches(task.item, slots.get(i))) {
+				sources.add(i);
+			}
+		}
+
+		// The stacks of it the chest has first, then its empty slots; a chest with no empty slot is passed by.
+		final JsonArray targets = new JsonArray();
+		boolean empty = false;
+
+		for (int i = 0; i < own; i++) {
+			if (ItemSpec.matches(task.item, slots.get(i))) {
+				targets.add(i);
+			}
+		}
+
+		for (int i = 0; i < own; i++) {
+			if (slots.get(i) == null) {
+				targets.add(i);
+				empty = true;
+			}
+		}
+
+		final int wanted = held(task) - task.target;
+
+		if (!empty || sources.size() == 0 || wanted <= 0) {
+			task.phase = Phase.FILL;
+			onState(bot, BotStatus.IDLE);
+			return;
+		}
+
+		task.phase = Phase.FILL;
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", "item_fill");
+		a.add("item", task.item);
+		a.add("sources", sources);
+		a.add("targets", targets);
+		a.addProperty("count", wanted);
+		bots.actionInternal(bot, a.toString());
+	}
+
+	/** The task's name as its failures start: "index: ", "deposit: " or "grab: ". */
+	private static String name(Task task) {
+		return task.item == null ? "index: " : task.deposit ? "deposit: " : "grab: ";
 	}
 
 	/** How many of the item the bot has, by the window last seen. */
