@@ -14,57 +14,139 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The one job, global to every bot: its steps in order, each a primitive as the JSON the fleet takes
- * (see FleetProtocol#ACTION), one per line of the file. Written the moment it changes.
+ * The jobs, global to every bot, in order: each a name and its steps, each a primitive as the JSON the
+ * fleet takes (see FleetProtocol#ACTION). In the file a job is a line "# name" then its steps, one per
+ * line; steps before any name (the file of the single job there was) are a first job of their own.
+ * Written the moment anything changes. There is always at least one job.
  *
  * Thread-safe: the UI edits it, the runner reads it from the channel's thread.
  */
 public final class JobStore {
+	private static final String NAME = "# ";
+
+	/** A job: its name and its steps. Locked by its store. */
+	public final class Job {
+		private String name;
+		private final List<String> steps = new ArrayList<String>();
+
+		private Job(String name) {
+			this.name = name;
+		}
+
+		public String getName() {
+			synchronized (JobStore.this) {
+				return name;
+			}
+		}
+
+		public void setName(String value) {
+			if (value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+				throw new IllegalArgumentException("a job's name is one line: " + value);
+			}
+
+			synchronized (JobStore.this) {
+				name = value;
+				save();
+			}
+		}
+
+		/** A copy of the steps. */
+		public List<String> getSteps() {
+			synchronized (JobStore.this) {
+				return new ArrayList<String>(steps);
+			}
+		}
+
+		public int size() {
+			synchronized (JobStore.this) {
+				return steps.size();
+			}
+		}
+
+		public String get(int index) {
+			synchronized (JobStore.this) {
+				return steps.get(index);
+			}
+		}
+
+		public void add(String json) {
+			if (json.indexOf('\n') >= 0 || json.indexOf('\r') >= 0) {
+				throw new IllegalArgumentException("a step is one line of JSON: " + json);
+			}
+
+			synchronized (JobStore.this) {
+				steps.add(json);
+				save();
+			}
+		}
+
+		public void remove(int index) {
+			synchronized (JobStore.this) {
+				steps.remove(index);
+				save();
+			}
+		}
+
+		/** Moves the step at index by delta places; the ends stay where they are. */
+		public void move(int index, int delta) {
+			synchronized (JobStore.this) {
+				final int to = index + delta;
+
+				if (to < 0 || to >= steps.size()) {
+					return;
+				}
+
+				steps.add(to, steps.remove(index));
+				save();
+			}
+		}
+	}
+
 	private final File file;
-	private final List<String> steps = new ArrayList<String>();
+	private final List<Job> jobs = new ArrayList<Job>();
 
 	public JobStore(File file) {
 		this.file = file;
 		load();
+
+		if (jobs.isEmpty()) {
+			jobs.add(new Job(defaultName(1)));
+		}
 	}
 
-	/** A copy of the steps. */
-	public synchronized List<String> getSteps() {
-		return new ArrayList<String>(steps);
+	public synchronized int count() {
+		return jobs.size();
 	}
 
-	public synchronized int size() {
-		return steps.size();
+	public synchronized Job get(int index) {
+		return jobs.get(index);
 	}
 
-	public synchronized String get(int index) {
-		return steps.get(index);
+	public synchronized int indexOf(Job job) {
+		return jobs.indexOf(job);
 	}
 
-	public synchronized void add(String json) {
-		if (json.indexOf('\n') >= 0 || json.indexOf('\r') >= 0) {
-			throw new IllegalArgumentException("a step is one line of JSON: " + json);
+	/** A new empty job at the end, named by its place. */
+	public synchronized Job create() {
+		final Job job = new Job(defaultName(jobs.size() + 1));
+		jobs.add(job);
+		save();
+		return job;
+	}
+
+	/** Removes the job; the last one left is emptied instead. */
+	public synchronized void remove(Job job) {
+		if (jobs.size() == 1 && jobs.get(0) == job) {
+			job.steps.clear();
+		} else {
+			jobs.remove(job);
 		}
 
-		steps.add(json);
 		save();
 	}
 
-	public synchronized void remove(int index) {
-		steps.remove(index);
-		save();
-	}
-
-	/** Moves the step at index by delta places; the ends stay where they are. */
-	public synchronized void move(int index, int delta) {
-		final int to = index + delta;
-
-		if (to < 0 || to >= steps.size()) {
-			return;
-		}
-
-		steps.add(to, steps.remove(index));
-		save();
+	private static String defaultName(int number) {
+		return "Job " + number;
 	}
 
 	private void load() {
@@ -73,10 +155,21 @@ public final class JobStore {
 		}
 
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+			Job job = null;
 			String line;
 
 			while ((line = reader.readLine()) != null) {
-				steps.add(line);
+				if (line.startsWith(NAME)) {
+					job = new Job(line.substring(NAME.length()));
+					jobs.add(job);
+				} else {
+					if (job == null) {
+						job = new Job(defaultName(1));
+						jobs.add(job);
+					}
+
+					job.steps.add(line);
+				}
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not read " + file, e);
@@ -91,9 +184,15 @@ public final class JobStore {
 		}
 
 		try (Writer writer = new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8)) {
-			for (String step : steps) {
-				writer.write(step);
+			for (Job job : jobs) {
+				writer.write(NAME);
+				writer.write(job.name);
 				writer.write('\n');
+
+				for (String step : job.steps) {
+					writer.write(step);
+					writer.write('\n');
+				}
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException("Could not write " + file, e);

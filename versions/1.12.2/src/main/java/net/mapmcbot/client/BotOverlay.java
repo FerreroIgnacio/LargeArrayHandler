@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import net.mapmcbot.area.ChestStore;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.profile.ProfileRegistry;
 import net.mapmcbot.profile.ProfileReport;
@@ -84,24 +85,36 @@ public final class BotOverlay {
 		final double cores = report.value(scope, "cpu.count");
 		// ms rates are % of one core: over the server's cores, a share of all of it.
 		final double cpu = (report.rate(scope, "cpu.user") + report.rate(scope, "cpu.system")) / cores;
-		final String[] lines = {
-			"rid=" + rid + (rid == 0 ? " (main)" : "") + "  bots " + MapMcBotClient.bots().countOn(rid),
-			"CPU " + (Double.isNaN(cpu) ? "--" : String.format(Locale.ROOT, "%.1f%%", cpu)),
-			"RAM " + bytes(report.value(scope, "mem.system.used")) + " / " + bytes(report.value(scope, "mem.system.total")),
-			"relay " + bytes(report.value(scope, "mem.rss"))
-		};
+		final double machine = 100 * report.rate(scope, "cpu.system.busy") / report.rate(scope, "cpu.system.all");
+		final List<String> lines = new ArrayList<String>();
+		lines.add("rid=" + rid + (rid == 0 ? " (main)" : "") + "  bots " + MapMcBotClient.bots().countOn(rid));
+		lines.add("CPU " + (Double.isNaN(cpu) ? "--" : String.format(Locale.ROOT, "%.1f%%", cpu))
+			+ " / " + (Double.isNaN(machine) ? "--" : String.format(Locale.ROOT, "%.1f%%", machine)) + " total");
+		lines.add("RAM " + bytes(report.value(scope, "mem.system.used")) + " / " + bytes(report.value(scope, "mem.system.total")));
+		lines.add("columns " + bytes(report.value(scope, "mem.columns")));
 
-		final int height = CARD_PADDING * 2 + lines.length * line - 2;
+		if (rid == 0) {
+			final ChestStore chests = MapMcBotClient.chests();
+			lines.add("chests " + (chests == null ? "--" : bytes(chests.memoryBytes())));
+		}
+
+		lines.add("relay " + bytes(report.value(scope, "mem.rss")));
+
+		final int height = CARD_PADDING * 2 + lines.size() * line - 2;
 		DrawableHelper.fill(x, y, x + CARD_WIDTH, y + height, CARD_BACKGROUND);
 
-		for (int i = 0; i < lines.length; i++) {
-			client.textRenderer.drawWithShadow(lines[i], x + CARD_PADDING, y + CARD_PADDING + i * line, i == 0 ? 0xFFFFFF : i == lines.length - 1 ? DIM : 0xE6E8EB);
+		for (int i = 0; i < lines.size(); i++) {
+			client.textRenderer.drawWithShadow(lines.get(i), x + CARD_PADDING, y + CARD_PADDING + i * line, i == 0 ? 0xFFFFFF : i == lines.size() - 1 ? DIM : 0xE6E8EB);
 		}
 
 		return height;
 	}
 
 	private static String bytes(double value) {
+		if (value < 1L << 20) {
+			return String.format(Locale.ROOT, "%.0f KB", value / (1L << 10));
+		}
+
 		return value >= 1L << 30 ? String.format(Locale.ROOT, "%.1f GB", value / (1L << 30)) : String.format(Locale.ROOT, "%.0f MB", value / (1L << 20));
 	}
 }

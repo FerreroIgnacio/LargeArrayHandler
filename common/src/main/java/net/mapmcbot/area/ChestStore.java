@@ -101,6 +101,28 @@ public final class ChestStore {
 	}
 
 	/** Every chest known, each once. */
+	/** A rough count of the bytes the chests take: their blocks and every item (name, nbt) plus object overhead. */
+	public synchronized long memoryBytes() {
+		long bytes = 0;
+
+		for (Chest chest : new LinkedHashSet<Chest>(byBlock.values())) {
+			bytes += 48 + chest.blocks.size() * 40L;
+
+			if (chest.contents != null) {
+				bytes += 24 + chest.contents.size() * 8L;
+
+				for (BotInventory.Item item : chest.contents) {
+					if (item != null) {
+						bytes += 48 + item.getName().length() * 2L + (item.getNbt() == null ? 0 : 16 + item.getNbt().length);
+					}
+				}
+			}
+		}
+
+		// The block -> chest map: an entry and its key string per block.
+		return bytes + byBlock.size() * 80L;
+	}
+
 	public synchronized List<Chest> all() {
 		return new ArrayList<Chest>(new LinkedHashSet<Chest>(byBlock.values()));
 	}

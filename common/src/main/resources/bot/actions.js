@@ -503,13 +503,16 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
-  // Moves the items a.item matches (see itemMatcher) onto the slots of a.targets, from every other slot of
+  // Moves the items a.item matches (see itemMatcher), or a.items (a list of them: any of them), onto the slots of a.targets, from every other slot of
   // the window (or only a.sources), as much as fits and up to a.count if given: onto the same item with room, or
   // empty slots, in the order given. Targets filling up with sources left over is fine; moving nothing is not.
   async function itemFill (action, a) {
     const window = slotWindow()
-    const wanted = itemMatcher(required(a.item, 'item'), 'item')
-    const name = wanted.describe()
+    const specs = a.items === undefined ? [required(a.item, 'item')] : a.items
+    if (!Array.isArray(specs) || specs.length === 0) throw new Error(`items must list one or more matches, got ${JSON.stringify(a.items)}`)
+    const matchers = specs.map((spec, i) => itemMatcher(spec, a.items === undefined ? 'item' : `items[${i}]`))
+    const wanted = { test: item => matchers.some(m => m.test(item)) }
+    const name = matchers.map(m => m.describe()).join(' or ')
     const list = (value, what) => {
       if (!Array.isArray(value) || value.length === 0) throw new Error(`${what} must list one or more slots`)
       return [...new Set(value.map((s, i) => slotOf(window, s, `${what}[${i}]`)))]

@@ -9,6 +9,7 @@ import net.mapmcbot.area.ChestStore;
 import net.mapmcbot.bot.BotInventory;
 import net.minecraft.client.render.DiffuseLighting;
 import net.minecraft.item.ItemStack;
+import net.minecraft.util.Identifier;
 import com.mojang.blaze3d.platform.GlStateManager;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
@@ -22,8 +23,9 @@ import org.lwjgl.input.Mouse;
  * Edits go into the area as they are typed, so its box in the world follows along. Coordinates
  * only commit once they all parse, so a half-typed minus sign does not collapse the area.
  *
- * Right of the editor, the chests of the selected area as last seen, a page at a time: each framed
- * green while known exactly (clean), yellow while it may have changed since (dirty).
+ * Right of the editor, the chests of the selected area as last seen, a page at a time, each drawn as the
+ * game's own chest screen: its title dark while known exactly (clean), yellow while it may have changed
+ * since (dirty), red while never seen.
  */
 public class AreaScreen extends Screen {
 	private static final int BUTTON_ADD = 1;
@@ -55,12 +57,13 @@ public class AreaScreen extends Screen {
 
 	private static final int CHESTS_X = LIST_WIDTH + 16 + 176;
 	private static final int SLOT = 18;
-	/** A chest's cell: its title, six rows (a double chest's), and the gap after it. */
-	private static final int CELL_WIDTH = 9 * SLOT + 8;
-	private static final int CELL_HEIGHT = 12 + 6 * SLOT + 8;
+	private static final Identifier CHEST_TEXTURE = new Identifier("textures/gui/container/generic_54.png");
+	/** A chest's cell, drawn as the game's own chest screen: its width, title strip, border below the rows, and the gap after it. */
+	private static final int CELL_WIDTH = 176 + 4;
+	private static final int TITLE_HEIGHT = 17;
+	private static final int BORDER_HEIGHT = 6;
+	private static final int CELL_HEIGHT = TITLE_HEIGHT + 6 * SLOT + BORDER_HEIGHT + 4;
 	private static final int PAGER_HEIGHT = 20;
-	private static final int CLEAN = 0xFF40C040;
-	private static final int DIRTY = 0xFFE0C020;
 
 	@Override
 	public void init() {
@@ -371,18 +374,23 @@ public class AreaScreen extends Screen {
 			final int cellY = LIST_TOP + ((i - page * perPage) / columns()) * CELL_HEIGHT;
 			final List<BotInventory.Item> contents = chest.getContents();
 			final int slots = contents != null ? contents.size() : chest.getBlocks().size() * 27;
-			final int bottom = cellY + 12 + (slots / 9) * SLOT;
-			final int frame = chest.isDirty() ? DIRTY : CLEAN;
+			final int rows = slots / 9;
 			final int[] first = chest.getBlocks().get(0);
-			textRenderer.draw(first[0] + "," + first[1] + "," + first[2] + (contents == null ? "  never seen" : chest.isDirty() ? "  dirty" : ""), cellX + 1, cellY + 1, chest.isDirty() ? DIRTY : COLOR_TEXT);
-			fill(cellX - 1, cellY + 10, cellX + 9 * SLOT + 1, bottom + 1, frame);
-			fill(cellX, cellY + 11, cellX + 9 * SLOT, bottom, 0xFF8B8B8B);
+			final int titleColor = contents == null ? 0xA00000 : chest.isDirty() ? 0xA07800 : 0x404040;
+			GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
+			client.getTextureManager().bindTexture(CHEST_TEXTURE);
+			drawTexture(cellX, cellY, 0, 0, 176, TITLE_HEIGHT);
+
+			for (int row = 0; row < rows; row++) {
+				drawTexture(cellX, cellY + TITLE_HEIGHT + row * SLOT, 0, TITLE_HEIGHT, 176, SLOT);
+			}
+
+			drawTexture(cellX, cellY + TITLE_HEIGHT + rows * SLOT, 0, 216, 176, BORDER_HEIGHT);
+			textRenderer.draw(first[0] + "," + first[1] + "," + first[2] + (contents == null ? "  never seen" : chest.isDirty() ? "  dirty" : ""), cellX + 8, cellY + 6, titleColor);
 
 			for (int slot = 0; slot < slots; slot++) {
-				final int slotX = cellX + (slot % 9) * SLOT + 1;
-				final int slotY = cellY + 12 + (slot / 9) * SLOT;
-				fill(slotX, slotY, slotX + 16, slotY + 16, 0xFF373737);
-
+				final int slotX = cellX + 8 + (slot % 9) * SLOT;
+				final int slotY = cellY + TITLE_HEIGHT + 1 + (slot / 9) * SLOT;
 				final BotInventory.Item item = contents == null ? null : contents.get(slot);
 
 				if (item != null) {
@@ -390,6 +398,7 @@ public class AreaScreen extends Screen {
 					drawItem(stack, slotX, slotY);
 
 					if (mouseX >= slotX && mouseX < slotX + 16 && mouseY >= slotY && mouseY < slotY + 16) {
+						fill(slotX, slotY, slotX + 16, slotY + 16, 0x80FFFFFF);
 						hovered = stack;
 					}
 				}

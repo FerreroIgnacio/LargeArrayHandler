@@ -7,9 +7,11 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -103,6 +105,8 @@ public class BotScreen extends HandledScreen {
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
 	private static final int BUTTON_WIDTH = 58;
+	/** The area button of a grab, a deposit and an index: narrower than two buttons, for the full box beside it. */
+	private static final int AREA_WIDTH = 2 * BUTTON_WIDTH - 33;
 	/** Trade's button, the only one sharing its place: the trade's number field takes the rest. */
 	private static final int TRADE_BUTTON = 10;
 	private static final int TRADE_WIDTH = 34;
@@ -167,8 +171,13 @@ public class BotScreen extends HandledScreen {
 	/** The items an item fill moves and the slots it fills with them. */
 	private ItemFilter fillFilter;
 	private final List<Integer> fillTargets = new ArrayList<Integer>();
-	/** The item a grab takes, the area it takes it from (by id) and how many. */
-	private ItemFilter grabFilter;
+	/** The items a grab or deposit means, each with the slot it was picked on (parallel lists), the area (by id) and how many, or all (full). */
+	private final List<ItemFilter> grabFilters = new ArrayList<ItemFilter>();
+	private final List<Integer> grabSlots = new ArrayList<Integer>();
+	private boolean grabFull;
+	/** Where the full box was drawn, for the click. */
+	private int fullBoxX;
+	private int fullBoxY;
 	private String grabArea;
 	private TextFieldWidget grabCount;
 	private ButtonWidget grabAreaButton;
@@ -293,7 +302,7 @@ public class BotScreen extends HandledScreen {
 		grabCount = new TextFieldWidget(3, textRenderer, 0, 0, 40, 18);
 		grabCount.setMaxLength(5);
 		grabCount.setText(countText);
-		grabAreaButton = new ButtonWidget(0, 0, 0, 2 * BUTTON_WIDTH + 1, 20, "");
+		grabAreaButton = new ButtonWidget(0, 0, 0, AREA_WIDTH, 20, "");
 		loopJobButton = new ButtonWidget(LOOP_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Loop job");
 		startJobButton = new ButtonWidget(START_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Start job");
 		stopJobButton = new ButtonWidget(STOP_JOB_ID, 0, 0, BUTTON_WIDTH, 20, "Stop job");
@@ -808,9 +817,22 @@ public class BotScreen extends HandledScreen {
 		super.handleMouse();
 		final int wheel = Mouse.getDWheel();
 
-		if (wheel != 0) {
+		if (wheel == 0) {
+			return;
+		}
+
+		// Over the job's steps they scroll; anywhere else the wheel goes to the bot above or under the selected one.
+		if (Mouse.getEventX() * width / client.width >= jobLeft() - 4) {
 			// Clamped by the next frame's draw.
 			jobScroll += wheel > 0 ? -1 : 1;
+			return;
+		}
+
+		final List<String> names = names();
+		final int next = names.indexOf(selected) + (wheel > 0 ? -1 : 1);
+
+		if (selected != null && next >= 0 && next < names.size()) {
+			select(names.get(next));
 		}
 	}
 
@@ -935,10 +957,10 @@ public class BotScreen extends HandledScreen {
 				: pick == Pick.HOTBAR ? "Hotbar: click the hotbar slot to hold"
 				: pick == Pick.FILL_ITEM ? "ItemFill: click a slot holding the item to fill with"
 				: pick == Pick.FILL_TARGETS ? "ItemFill: click the slots to fill"
-				: pick == Pick.GRAB_ITEM ? "Grab: click a slot holding the item to grab"
-				: pick == Pick.GRAB ? "Grab: the area to take it from and how many"
-				: pick == Pick.DEPOSIT_ITEM ? "Deposit: click a slot holding the item to deposit"
-				: pick == Pick.DEPOSIT ? "Deposit: the area to leave it in and how many"
+				: pick == Pick.GRAB_ITEM ? "Grab: click or drag over the slots holding the items to grab"
+				: pick == Pick.GRAB ? "Grab: the slots, the area to take them from and how many"
+				: pick == Pick.DEPOSIT_ITEM ? "Deposit: click or drag over the slots holding the items to deposit"
+				: pick == Pick.DEPOSIT ? "Deposit: the slots, the area to leave them in and how many"
 				: pick == Pick.INDEX ? "Index: the area whose chests to look in"
 				: "Wait: click the slots to wait on, an item to change it";
 		textRenderer.drawWithShadow(prompt, x, top, TEXT);
@@ -988,19 +1010,46 @@ public class BotScreen extends HandledScreen {
 		}
 
 		if (pick == Pick.GRAB || pick == Pick.DEPOSIT) {
-			textRenderer.drawWithShadow(grabFilter.reference.getName() + " (" + grabFilter.label() + ")", x, rowY + 2, DIM);
-			rowY += 12;
+			// The items picked, each framed as a slot, lit while its match is the one in the panel.
+			for (int i = 0; i < grabFilters.size(); i++) {
+				final ItemFilter filter = grabFilters.get(i);
+				final int iconX = x + (i % GRAB_ICONS) * 18;
+				final int iconY = rowY + 2 + (i / GRAB_ICONS) * 18;
+				fill(iconX - 1, iconY - 1, iconX + 17, iconY + 17, filter == editing ? WAIT_ITEM | 0xFF000000 : 0xFF8B8B8B);
+				fill(iconX, iconY, iconX + 16, iconY + 16, 0xFF373737);
+				final ItemStack stack = stackOf(filter.reference);
+				drawItem(stack, iconX, iconY);
+
+				if (mouseX >= iconX && mouseX < iconX + 16 && mouseY >= iconY && mouseY < iconY + 16) {
+					hovered = stack;
+				}
+			}
+
+			rowY += grabIconsHeight();
 			grabAreaButton.x = x;
 			grabAreaButton.y = rowY + 2;
 			grabAreaButton.message = "Area: " + areaName(grabArea);
 			grabAreaButton.method_891(client, mouseX, mouseY, 0);
-			grabCount.x = x + 2 * BUTTON_WIDTH + 4;
+			// Full: all it can, in place of how many.
+			fullBoxX = x + AREA_WIDTH + 4;
+			fullBoxY = rowY + 7;
+			fill(fullBoxX, fullBoxY, fullBoxX + 10, fullBoxY + 10, 0xFF8B8B8B);
+			fill(fullBoxX + 1, fullBoxY + 1, fullBoxX + 9, fullBoxY + 9, grabFull ? 0xFF55CC55 : 0xFF373737);
+			textRenderer.drawWithShadow("Full", fullBoxX + 13, fullBoxY + 1, TEXT);
+			grabCount.x = fullBoxX + 13 + textRenderer.getStringWidth("Full") + 4;
 			grabCount.y = rowY + 3;
-			grabCount.render();
+
+			if (grabFull) {
+				fill(grabCount.x, grabCount.y, grabCount.x + 40, grabCount.y + 18, 0xFF555555);
+				textRenderer.drawWithShadow(grabCount.getText(), grabCount.x + 4, grabCount.y + 5, DIM);
+			} else {
+				grabCount.render();
+			}
+
 			rowY += 22;
 			startButton.x = x;
 			startButton.y = rowY + 2;
-			startButton.active = grabArea != null && !grabCount.getText().isEmpty() && Integer.parseInt(grabCount.getText()) > 0;
+			startButton.active = grabArea != null && (grabFull || (!grabCount.getText().isEmpty() && Integer.parseInt(grabCount.getText()) > 0));
 			startButton.method_891(client, mouseX, mouseY, 0);
 		}
 
@@ -1054,7 +1103,8 @@ public class BotScreen extends HandledScreen {
 		pick = Pick.NONE;
 		moveFrom = -1;
 		fillFilter = null;
-		grabFilter = null;
+		grabFilters.clear();
+		grabSlots.clear();
 		editing = null;
 		fillTargets.clear();
 		fillDrag = null;
@@ -1104,28 +1154,15 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
+			// Slots clicked or dragged over are the items to match, any of them; the same slot again takes it off.
 			case DEPOSIT_ITEM:
-			case GRAB_ITEM: {
-				final BotInventory.Item there = itemOn(slot);
-
-				// An empty slot names no item: the pick goes on.
-				if (there == null) {
-					return;
-				}
-
-				grabFilter = new ItemFilter(there);
-				editing = grabFilter;
-
-				if (areaName(grabArea) == null) {
-					grabArea = nextArea(null);
-				}
-
-				pick = pick == Pick.DEPOSIT_ITEM ? Pick.DEPOSIT : Pick.GRAB;
-				return;
-			}
-
-			case GRAB:
+			case GRAB_ITEM:
 			case DEPOSIT:
+			case GRAB:
+				fillDrag = !grabSlots.contains(slot);
+				dragOver(slot);
+				return;
+
 			case INDEX:
 				return;
 
@@ -1182,6 +1219,11 @@ public class BotScreen extends HandledScreen {
 
 	/** The slot dragged over, selected or deselected as the drag began. */
 	private void dragOver(int slot) {
+		if (pick == Pick.GRAB_ITEM || pick == Pick.GRAB || pick == Pick.DEPOSIT_ITEM || pick == Pick.DEPOSIT) {
+			dragOverGrab(slot);
+			return;
+		}
+
 		final boolean in = fillTargets.contains(slot);
 
 		if (fillDrag && !in) {
@@ -1189,6 +1231,47 @@ public class BotScreen extends HandledScreen {
 		} else if (!fillDrag && in) {
 			fillTargets.remove(Integer.valueOf(slot));
 		}
+	}
+
+	/** The slot dragged over for a grab or deposit, its item added to the matches or taken off as the drag began; with none left, back to picking the first. */
+	private void dragOverGrab(int slot) {
+		final int at = grabSlots.indexOf(slot);
+
+		if (fillDrag && at < 0) {
+			final BotInventory.Item there = itemOn(slot);
+
+			// An empty slot names no item.
+			if (there == null) {
+				return;
+			}
+
+			final ItemFilter filter = new ItemFilter(there);
+			grabSlots.add(slot);
+			grabFilters.add(filter);
+			editing = filter;
+
+			if (areaName(grabArea) == null) {
+				grabArea = nextArea(null);
+			}
+		} else if (!fillDrag && at >= 0) {
+			if (editing == grabFilters.get(at)) {
+				editing = null;
+			}
+
+			grabSlots.remove(at);
+			grabFilters.remove(at);
+		}
+
+		final boolean deposit = pick == Pick.DEPOSIT_ITEM || pick == Pick.DEPOSIT;
+		pick = grabSlots.isEmpty() ? (deposit ? Pick.DEPOSIT_ITEM : Pick.GRAB_ITEM) : (deposit ? Pick.DEPOSIT : Pick.GRAB);
+	}
+
+	/** How many items a row of the grab's picked ones holds. */
+	private static final int GRAB_ICONS = 9;
+
+	/** The height the picked items take in the grab's panel. */
+	private int grabIconsHeight() {
+		return Math.max(1, (grabFilters.size() + GRAB_ICONS - 1) / GRAB_ICONS) * 18 + 4;
 	}
 
 	/** The bot's item on the slot of what the screen shows, null for none. */
@@ -1240,8 +1323,24 @@ public class BotScreen extends HandledScreen {
 		final JsonObject a = new JsonObject();
 		a.addProperty("action", pick == Pick.DEPOSIT ? "deposit" : "grab");
 		a.addProperty("area", grabArea);
-		a.add("item", grabFilter.toJson());
-		a.addProperty("count", Integer.parseInt(grabCount.getText()));
+		final JsonArray items = new JsonArray();
+		final Set<String> seen = new HashSet<String>();
+
+		// The same match from two slots once.
+		for (ItemFilter filter : grabFilters) {
+			if (seen.add(filter.toJson().toString())) {
+				items.add(filter.toJson());
+			}
+		}
+
+		a.add("items", items);
+
+		if (grabFull) {
+			a.addProperty("full", true);
+		} else {
+			a.addProperty("count", Integer.parseInt(grabCount.getText()));
+		}
+
 		resetPick();
 		order(a);
 	}
@@ -1791,6 +1890,10 @@ public class BotScreen extends HandledScreen {
 			fillSlot(slot, MOVE_TO);
 		}
 
+		for (int slot : grabSlots) {
+			fillSlot(slot, WAIT_ITEM);
+		}
+
 		// The wait sent, on the slots of the window it was sent on.
 		final Sent waiting = sent.get(selected);
 
@@ -1933,7 +2036,26 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
-			if (pick == Pick.GRAB || pick == Pick.DEPOSIT) {
+			if (button == 0 && (pick == Pick.GRAB || pick == Pick.DEPOSIT)) {
+				// The full box (and its label), and an item's icon: its match in the panel, or out of it.
+				if (mouseX >= fullBoxX && mouseX < fullBoxX + 13 + textRenderer.getStringWidth("Full") && mouseY >= fullBoxY && mouseY < fullBoxY + 10) {
+					grabFull = !grabFull;
+					grabCount.setFocused(false);
+					return;
+				}
+
+				for (int i = 0; i < grabFilters.size(); i++) {
+					final int iconX = x + (i % GRAB_ICONS) * 18;
+					final int iconY = rowTop(0) + 2 + (i / GRAB_ICONS) * 18;
+
+					if (mouseX >= iconX && mouseX < iconX + 16 && mouseY >= iconY && mouseY < iconY + 16) {
+						editing = editing == grabFilters.get(i) ? null : grabFilters.get(i);
+						return;
+					}
+				}
+			}
+
+			if ((pick == Pick.GRAB || pick == Pick.DEPOSIT) && !grabFull) {
 				grabCount.method_920(mouseX, mouseY, button);
 			}
 
@@ -2032,7 +2154,7 @@ public class BotScreen extends HandledScreen {
 				return;
 			}
 
-			if ((pick == Pick.GRAB || pick == Pick.DEPOSIT) && grabCount.isFocused()) {
+			if ((pick == Pick.GRAB || pick == Pick.DEPOSIT) && !grabFull && grabCount.isFocused()) {
 				if (Character.isDigit(character) || character < ' ') {
 					grabCount.keyPressed(character, keyCode);
 				}

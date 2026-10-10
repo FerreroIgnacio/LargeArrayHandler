@@ -369,6 +369,11 @@ function takeProfile (id, reason) {
   const workers = [...threads.map(t => t.worker), ...serializers]
   const cpu = process.cpuUsage()
   const memory = process.memoryUsage()
+  const machine = os.cpus().reduce((sum, { times }) => {
+    sum.all += times.user + times.nice + times.sys + times.idle + times.irq
+    sum.busy += times.user + times.nice + times.sys + times.irq
+    return sum
+  }, { busy: 0, all: 0 })
   const rows = [
     // The whole process: every thread, libuv's and V8's own included.
     ['node', 'cpu.user', 'ms', cpu.user / 1000],
@@ -380,6 +385,11 @@ function takeProfile (id, reason) {
     ['node', 'cpu.count', '#', os.cpus().length],
     ['node', 'mem.system.used', 'B', os.totalmem() - os.freemem()],
     ['node', 'mem.system.total', 'B', os.totalmem()],
+    // Every core's time, busy and whole: the machine's load, not only this process's.
+    ['node', 'cpu.system.busy', 'ms', machine.busy],
+    ['node', 'cpu.system.all', 'ms', machine.all],
+    // The slots of columns.bin in use: what the shared columns take.
+    ['node', 'mem.columns', 'B', (SLOTS - freeSlots.length) * SIZE],
     ['node', 'threads', '#', 1 + workers.length],
     ...prof.rows([
       ['node.thread:fleet', 'columns', '#', columns.size],

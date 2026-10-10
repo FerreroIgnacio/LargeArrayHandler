@@ -152,7 +152,18 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   // A PATH goes only when that changes: a search's partials are mostly the same path tick after
   // tick, and comparing them costs less than putting one in a frame.
   let drawn = null
+  // The nodes of the last path and how many the bot has walked past: the mod draws only the rest.
+  let walking = null
+  let consumed = 0
   function drawPath (target, nodes) {
+    if (walking && walking.target.x === target.x && walking.target.y === target.y && walking.target.z === target.z &&
+        walking.nodes.length === nodes.length &&
+        walking.nodes.every((n, i) => Math.floor(n.x) === Math.floor(nodes[i].x) && Math.floor(n.y) === Math.floor(nodes[i].y) && Math.floor(n.z) === Math.floor(nodes[i].z))) return
+    walking = { target, nodes }
+    consumed = 0
+    sendPath(target, nodes)
+  }
+  function sendPath (target, nodes) {
     const coords = new Int32Array(nodes.length * 3)
     nodes.forEach((n, i) => {
       coords[i * 3] = Math.floor(n.x)
@@ -164,7 +175,24 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     drawn = { target, coords }
     out(protocol.path(name, target, nodes))
   }
+  // Each tick: nodes the bot stands within a block of (or past, the closest ahead) are consumed.
+  bot.on('physicsTick', () => {
+    if (!walking || !drawn) return
+    const p = bot.entity.position
+    const { target, nodes } = walking
+    let best = consumed
+    let bestD = Infinity
+    for (let i = consumed; i < Math.min(nodes.length, consumed + 6); i++) {
+      const n = nodes[i]
+      const d = (n.x + 0.5 - p.x) ** 2 + (n.y - p.y) ** 2 + (n.z + 0.5 - p.z) ** 2
+      if (d < bestD) { bestD = d; best = i }
+    }
+    if (bestD > 2.25 || best === consumed) return
+    consumed = best
+    if (consumed < nodes.length) sendPath(target, nodes.slice(consumed))
+  })
   function clearPath () {
+    walking = null
     if (!drawn) return
     drawn = null
     out(protocol.path(name, null))
@@ -192,7 +220,18 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     const p = bot.entity.position
     return `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
   }
-  const spot = g => g ? `${g.x},${g.y},${g.z}` : 'none'
+  const spot = g => g ? `${g.x ?? g.pos?.x},${g.y ?? g.pos?.y},${g.z ?? g.pos?.z}` : 'none'
+  // The blocks around the feet (y-1, y, y+1 for each of the 3x3 columns), for a stuck bot's log.
+  const around = () => {
+    const p = bot.entity.position.floored()
+    const rows = []
+    for (let dy = -1; dy <= 2; dy++) {
+      const row = []
+      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) row.push(bot.blockAt(p.offset(dx, dy, dz))?.name ?? '?')
+      rows.push(`y${dy >= 0 ? '+' : ''}${dy}: ${row.join(' ')}`)
+    }
+    return rows.join(' | ')
+  }
   bot.on('goal_reached', goal => {
     setSearching(false)
     log(`goal reached at ${at()} (goal ${spot(goal)})`)
@@ -206,6 +245,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   bot.on('path_reset', reason => {
     setSearching(true)
     log(`path reset (${reason}) at ${at()} (goal ${spot(goalOf())})`)
+    if (reason === 'stuck') log(`stuck around (x-1..x+1 per z-1..z+1): ${around()}; vel ${bot.entity.velocity.toString()} onGround ${bot.entity.onGround}`)
     clearPath()
   })
 
